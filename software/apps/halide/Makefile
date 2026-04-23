@@ -40,7 +40,7 @@ $(BINARIES):  $(BIN_DIR)/%: %/$(PIPELINE) %/main.c.o $(RUNTIME) $(LINKER_SCRIPT)
 
 # Build Halide application
 %.bin: %.cpp
-	$(CXX) $< -g -I $(HALIDE_INCLUDE) -L$(HALIDE_LIB) $(DEFINES) -lHalide -lpthread -ldl -std=c++17 -o $@
+	$(CXX) $< -g -I $(HALIDE_INCLUDE) -L$(HALIDE_LIB) -L/usr/lib/x86_64-linux-gnu -Wl,-rpath-link,/usr/lib/x86_64-linux-gnu $(DEFINES) -lHalide -lz -lpthread -ldl -std=c++17 -o $@
 
 # Run Halide cross-compilation
 %.riscv.o: %.bin

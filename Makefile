@@ -86,7 +86,7 @@ tc-llvm:
 		-DLLVM_ENABLE_LIBPFM=OFF \
 		-DCMAKE_BUILD_TYPE=Release \
 		../llvm && \
-	make -j6 all && \
+	make -j2 all && \
 	make install
 
 # Halide
@@ -101,6 +101,8 @@ halide:
 		-DCMAKE_C_COMPILER=$(CC) \
 		-DWITH_PYTHON_BINDINGS=OFF \
 		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_EXE_LINKER_FLAGS="-L/usr/lib/x86_64-linux-gnu -Wl,-rpath-link,/usr/lib/x86_64-linux-gnu" \
+		-DCMAKE_SHARED_LINKER_FLAGS="-L/usr/lib/x86_64-linux-gnu -Wl,-rpath-link,/usr/lib/x86_64-linux-gnu" \
 		.. && \
 	make -j4 all && \
 	make install
