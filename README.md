@@ -193,9 +193,10 @@ We also provide Synopsys Spyglass linting scripts in the `hardware/spyglass`. Ru
 
 ## Hardware Configurations
 
-MemPool's core-count is parametrizable. In `./config`, the `config.mk` file includes other configuration files, which represent specific parametrizations of MemPool. We currently support three parametrizations:
+MemPool's core-count is parametrizable. In `./config`, the `config.mk` file includes other configuration files, which represent specific parametrizations of MemPool. We currently support four parametrizations:
 - `terapool`: 1024 cores, organized into 128 tiles with eight cores each
 - `mempool`: 256 cores, organized into 64 tiles with four cores each (default)
+- `tensorpool`: 256 cores augmented with 16 RedMulE tensor-engine tiles for matrix-multiplication acceleration; the RedMulE IP is included as a submodule at `hardware/deps/redmule`
 - `minpool`: 16 cores, organized into 4 tiles with four cores each
 
 The software and the hardware for different MemPool configurations can be compiled specifying the desired configuration on the command line. For example, to compile and simulate the `hello_world` app for TeraPool:
