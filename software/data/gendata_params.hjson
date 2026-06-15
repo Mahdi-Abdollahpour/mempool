@@ -204,6 +204,23 @@
     ]
   },
 
+  "conv1d_f16": {
+    "type": "float16",
+    "defines": [
+      ("matrix_L", 1)
+      ("matrix_Wi", 8)
+      ("matrix_Ci", 8)
+      ("matrix_Co", 8)
+      ("matrix_Wf", 3)
+    ]
+    "arrays": [
+      ("__fp16", "l2_Y")
+      ("__fp16", "l2_X")
+      ("__fp16", "l2_F")
+      ("__fp16", "l2_b")
+    ]
+  },
+
   "dotp_f32": {
     "type": "float32",
     "defines": [
@@ -225,6 +242,21 @@
       ("int32_t", "l2_X")
       ("int32_t", "l2_Y")
       ("int32_t", "l2_Z")
+    ]
+  },
+
+  "gemm_f16": {
+    "type": "float16",
+    "defines": [
+      ("matrix_M", 128)
+      ("matrix_N", 128)
+      ("matrix_P", 128)
+    ]
+    "arrays": [
+      ("__fp16", "l2_X")
+      ("__fp16", "l2_W")
+      ("__fp16", "l2_Y")
+      ("__fp16", "l2_Z")
     ]
   },
 
@@ -257,9 +289,9 @@
   "matmul_f16": {
     "type": "float16",
     "defines": [
-      ("matrix_M", 32)
-      ("matrix_N", 32)
-      ("matrix_P", 32)
+      ("matrix_M", 64)
+      ("matrix_N", 64)
+      ("matrix_P", 64)
     ]
     "arrays": [
       ("__fp16", "l2_A")
