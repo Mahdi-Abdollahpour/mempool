@@ -1,0 +1,18 @@
+{
+    "_comment": "Hardware config. PE_peak and GEMM_peak are in TFLOPS. PE_utilization is a fraction (0..1) derating everything on the PE path: non-GEMM ops on every pool, plus GEMMs on a pool with no tensor engine (Terapool), where a GEMM is a PE matmul. TE_utilization is a fraction (0..1) derating GEMM_peak, and applies ONLY to pools that have a tensor engine (TensorPool's RedMulE) -- it does not affect Terapool at all. Transfer time = bytes/(bandwidth*1e6) ms, with the bandwidth picked per link: bandwidth_c2c_gbs for a cluster-to-cluster data_out hand-off (on-chip), bandwidth_lpddr_gbs for cluster <-> LPDDR traffic (cluster 0's data_in read and the last cluster's data_out write). Omit or 0 a bandwidth to make that link cost no time. frequency is the clock frequency in Hz.",
+    "PE_peak": {
+        "Terapool":   3.7,
+        "TensorPool": 1.0
+    },
+    "GEMM_peak": {
+        "Terapool":   1.1,
+        "TensorPool": 6.62
+    },
+    "_comment_pipeline_clusters": "pipeline_clusters is the TOTAL number of physical clusters the pipeline occupies, and it is HARD: the optimizer gets no say in the count. The CEViT attention core (Q*K^T, softmax, (Q*K^T)*V) materialises the [heads, tokens, tokens] score matrix, whose L1 footprint does not fit one cluster, so it always runs as ONE head-parallel stage spread over HEAD_PARALLEL_CLUSTERS (4, a constant in cevit_pipeline.py) clusters, one head each; every other stage is one cluster. The stage count is therefore pipeline_clusters - HEAD_PARALLEL_CLUSTERS + 1, and the optimizer only places those cuts, exactly. The minimum is 6 (3 stages: the attention core plus what must sit before and after it); too small a value is an error naming the feasible range. Only cevit_pipeline.py reads this.",
+    "PE_utilization": 0.28,
+    "TE_utilization": 0.4,
+    "pipeline_clusters": 7,
+    "bandwidth_c2c_gbs": 63,
+    "bandwidth_lpddr_gbs": 5.6,
+    "frequency": 1000000000
+}

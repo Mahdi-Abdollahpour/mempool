@@ -93,8 +93,8 @@ void layernorm_parallel_2x4_f16vec(const __fp16 *__restrict__ A,
         "vfsub.h  %[x0], %[x0], %[y0];"
         "vfsub.h  %[x1], %[x1], %[y1];"
         // Compute the square root of Var: std = sqrt(var)
-        // "vfsqrt.h      %[vSumSq0], %[x0];"
-        // "vfsqrt.h      %[vSumSq1], %[x1];"
+        "vfsqrt.h      %[vSumSq0], %[x0];"
+        "vfsqrt.h      %[vSumSq1], %[x1];"
         : [vSum0] "+&r"(vSumMean0), [vSum1] "+&r"(vSumMean1),
           [vSumSq0] "+&r"(vSumSq0), [vSumSq1] "+&r"(vSumSq1), [x0] "+&r"(x0),
           [x1] "+&r"(x1), [y0] "+&r"(y0), [y1] "+&r"(y1)
