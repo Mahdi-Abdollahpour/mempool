@@ -1,0 +1,26 @@
+{
+    "_comment": "Hardware config for celere_pipeline.py. Peaks in TFLOPS, utilisations in 0..1, bandwidths in GB/s, frequency in Hz.",
+
+    "PE_peak": {
+        "Terapool":   3.7,
+        "TensorPool": 1.0
+    },
+    "GEMM_peak": {
+        "Terapool":   1.1,
+        "TensorPool": 6.62
+    },
+
+    "_comment_util": "PE_utilization derates the PE path (non-GEMM everywhere, plus GEMMs on a pool with no tensor engine). TE_utilization derates GEMM_peak on pools that have one (TensorPool's RedMulE) and does not affect Terapool.",
+    "PE_utilization": 0.28,
+    "TE_utilization": 0.4,
+
+    "_comment_links": "bandwidth_c2c_gbs is the on-chip cluster-to-cluster link. bandwidth_lpddr_gbs is PER CHANNEL; an off-chip leg is charged at bandwidth_lpddr_gbs * lpddr_channels capped by bandwidth_c2c_gbs, since the bytes still cross the on-chip network. With these values the cap binds.",
+    "bandwidth_c2c_gbs": 63,
+    "bandwidth_lpddr_gbs": 63.5,
+    "lpddr_channels": 8,
+
+    "_comment_clusters": "Cross-check only: the sum of the stage widths in STAGES. The partition itself is in celere_pipeline.py, not here.",
+    "pipeline_clusters": 30,
+
+    "frequency": 1000000000
+}

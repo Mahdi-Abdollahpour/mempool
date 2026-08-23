@@ -1,0 +1,214 @@
+,N_repetitions,,Kernel,,i_1,i_2,i_3,i_4,num tensors,o_1,o_2,o_3,o_4,num tensors,MACs,FLOPs,Weights,Data in,Data out,,Weights (Bytes),Data in (Bytes),Data out (Bytes),% FLOPs
+Front end (antenna domain),1,X  :  BLOCK INPUT: received pilot grid,,"BLOCK INPUT: received pilot grid [streams x Rx, subcarriers, symbols, re/im]. CP removal and the OFDM FFT are outside this ledger.",,,,,,,,,,,,,,,,,,,,
+,1,PAT  :  RA unpack + patchify,reshape,"Index re-map.
+IN  X (row 2), J=1   OUT  PAT, O=1 -> rows 5, 7 and 41
+Three factorizations composed into one index map: the flat antenna index ra = p*U_v*U_h + c*U_v + r splits, pol moving to the batch axis; the antenna plane factors into g_v x g_h tiles -> o_3; the subcarrier axis groups span_prbs*P pilots -> o_2. Padding to Fp is implicit in the addresses; no pad token is created.",64,"3,288",2,2,1,1,137,16,384,1,0,0,0,"841,728","841,728",,0,"1,683,456","1,683,456",0.0%
+,,,,,,,,,,,,,,,,,,,,,,,,
+Column summary,1,WIN  :  Window-pool spans,pool,"Mean-reduce over a strided sub-range of i_2 (1 FLOP per INPUT element).
+IN  PAT (row 3), J=1   OUT  WIN, O=1 -> rows 7 and 41
+out[w, b, :] = (1/W) * SUM_{s in window w} in[s, b, :]. Reduces i_2 only; every (i_3, i_4) lane independent. The divisor is ALWAYS W, the short final window included: celere.py pools a zero-PADDED span block, so the last window carries (1/W)*SUM over its 5 live spans. That fixed divisor is what makes skipping the 7 pad rows here exact rather than approximate (the masked-mean variant is the open D10 flag, and is NOT what the code does).",1,137,16,384,1,1,12,16,384,1,0,841728,0,841728,73728,,0,1683456,147456,0.0001308690794
+,,,,,,,,,,,,,,,,,,,,,,,,
+Stems,1,"EMB  :  Dense i_4 -> o_4 (patch_embed, all measured tokens)",dense,"GEMM, one weight matrix over a concatenated row stream.
+IN  PAT (row 3) and WIN (row 5) concatenated on i_2, J=1   OUT  EMB, O=1 -> row 8
+out[t, n] = SUM_c in[t, c]*W[c, n] + b[n]. Contracts i_4; token rows independent.",1,149,16,384,1,1,149,16,256,1,234356736,469323776,98560,915456,610304,,197120,1830912,1220608,0.07296890507
+,1,EMB  :  Add token-type vector (broadcast),add,"Broadcast add of a small table (1 FLOP per element).
+IN  EMB (row 7), J=1, plus the learned table e_type -- a broadcast operand, counted in Weights, not in J or Data in   OUT  EMB, O=1, same buffer -> row 9
+out[t, :] += e_type[type(t)], type selecting patch vs summary rows. The table stays in registers; no expansion is materialized.",1,149,16,256,1,1,149,16,256,1,0,"610,304",512,"610,304","610,304",,"1,024","1,220,608","1,220,608",0.0%
+,1,Z  :  Scatter: assemble lattice + spell,reshape,"Scatter into the lattice.
+IN  EMB (row 8) + e_spell, J=1   OUT  Z, O=1 -> rows 11 and 29
+Writes the token stream into the canonical WINDOW-MAJOR lattice: o_2 ordered [w0 spans | w0 summary | w1 ... | spell], o_3 the box axis; e_spell broadcast along o_3. o_2 = L_m carries no pad rows.",1,149,16,256,1,1,150,16,256,1,0,0,256,"610,304","614,400",,512,"1,220,608","1,228,800",0.0%
+,,,,,,,,,,,,,,,,,,,,,,,,
+QKV Proj,2,ZN  :  Normalize on dim i_4,layernorm,"Row-wise standardize + affine (9 FLOPs per element).
+IN  Z (row 9 at the first site, row 31 at the second), J=1   OUT  ZN, O=1 -> row 12
+out[t, c] = g[c]*(in[t, c] - mean(in[t, :]))/std(in[t, :]) + be[c]. Reduces i_4 per token. One (g, be) pair per weight set.",1,150,16,256,1,1,150,16,256,1,0,11059200,1024,614400,614400,,2048,1228800,1228800,0.001719447759
+,2,"QKV  :  Dense i_4 -> 3*i_4 (W_qkv, no bias)",dense,"GEMM, no bias (FLOPs = 2*MACs).
+IN  ZN (row 11), J=1   OUT  QKV, O=1 -> row 13
+Widens i_4 to o_4 = 3*i_4, laying q | k | v out as three contiguous blocks. One weight set per projection site, all listed here.",1,150,16,256,1,1,150,16,768,1,"943,718,400","1,887,436,800","393,216","614,400","1,843,200",,"786,432","1,228,800","3,686,400",29.3%
+,2,"Q, K, V  :  Split dim i_4 into 3 (Q, K, V)",split&reshape,"Zero-copy slice; no kernel.
+IN  QKV (row 12), J=1   OUT  Q, K, V, O=3 (three views of ONE buffer) -> all three to row 15, Q and K again to row 22
+Three contiguous sub-ranges at stride o_4. Q and K stay frozen until the next projection; only V evolves.",1,150,16,768,1,16,150,256,,3,0,0,0,"1,843,200","1,843,200",,0,"3,686,400","3,686,400",0.0%
+,,,,,,,,,,,,,,,,,,,,,,,,
+Dual-global spectral attention (spec_global || spec_coarse),2,"QG, KG, UG  :  Gather: fold columns into sequences",reshape,"Strided gather.
+IN  Q, K, V (row 13), J=3   OUT  QG, KG, UG, O=3 -> QG and KG to row 16, UG to row 20
+Per box column, collect the whole span axis [spans | window rows | spell] into one sequence of length o_3 = L_m, then split i_4 into o_2 = H heads of o_4 = d_head; o_1 folds batch and box. ONE gather feeds every pass below. QG and KG are overwritten in place by row 16; UG is untouched.",16,150,256,,3,16,2,150,128,3,0,0,0,1843200,1843200,,0,3686400,3686400,0
+,2,"QG, KG  :  Rotate (Q,K) feature pairs by position (in place)",rope,"Pairwise rotation of adjacent feature components (3 FLOPs per element of QG and KG). ONE table, no branch: the kernel runs over the WHOLE i_3.
+IN  QG, KG (row 15), J=2, plus one (cos, sin) table -- a derived constant, counted neither in J nor in Weights   OUT  QG, KG, O=2, same buffers -> row 17
+Each adjacent feature pair is turned by R(theta_p * pos(t)). The two position families are composed AT TABLE-BUILD TIME, not in the kernel: rows [0, n_span) take span centres (i+0.5)*span_prbs, rows [n_span, n_span+n_win) take window centres (i+0.5)*pool_prbs -- one PRB ruler, one ladder (the ladder is the parameter listed here) -- and the spell row takes the IDENTITY rotation (cos=1, sin=0), which is exactly what celere.py does by rotating only its real prefix. So the table is [L_m, d_head] and the row-range logic disappears: every position, real or null, is data. 2*150*128 = 38,400 constants, 75 KiB at FP16, built once per BANDWIDTH from the ladder (not per forward, so it is not a row here) and shared by both stages and both heads -- rope_head_mix is off, so the head axis broadcasts. Every axis independent.
+IN PLACE: row 17 reads only the rotated copies and the local pass re-folds Q, K from row 13, so each pair is written back over its own input -- no second buffer.",16,2,150,128,2,16,2,150,128,2,0,"7,372,800",64,"1,228,800","1,228,800",,128,"2,457,600","2,457,600",0.1%
+,2,SC  :  Batched matmul QK^T (single fused block),matmul,"Batched matmul, second operand transposed; ONE score block for both scales.
+IN  QG, KG (row 16), J=2   OUT  SC, O=1 -> row 18
+out[a, h, m, n] = (1/sqrt(d_head)) * SUM_c QG[a, h, m, c]*KG[a, h, n, c]. Contracts i_4 = d_head; o_3 = o_4 = i_3, the whole sequence. The cross-scale entries are computed here and killed at row 18.",16,2,150,128,2,16,2,150,150,1,"184,320,000","368,640,000",0,"1,228,800","720,000",,0,"2,457,600","1,440,000",5.7%
+,2,SC  :  Add static block mask + key bias,add,"Broadcast add of a static [i_3, i_4] table (1 FLOP per element); makes row 17 block-diagonal.
+IN  SC (row 17) + MASK, J=1 (MASK is a broadcast operand, not a listed tensor)   OUT  SC, O=1, same buffer -> row 19
+MASK[m, n] = 0 on retained pairs, -inf elsewhere. Retained: physical rows -> {physical, spell}; summary rows -> {summary, spell}; spell row -> {physical, spell}. The bandwidth key mask folds into the same table. MASK is static per bandwidth and folds into the softmax prologue.",16,2,150,150,1,16,2,150,150,1,0,"1,440,000",,"720,000","720,000",,0,"1,440,000","1,440,000",0.0%
+,2,AW  :  Softmax on dim i_4,softmax,"Row-normalize (4 FLOPs per element).
+IN  SC (row 18), J=1   OUT  AW, O=1 -> row 20
+out[.., m, :] = exp(in - max_n)/SUM_n exp(...). Reduces i_4; the -inf entries vanish, so each row normalizes over its own block.",16,2,150,150,1,16,2,150,150,1,0,"5,760,000",0,"720,000","720,000",,0,"1,440,000","1,440,000",0.1%
+,2,U  :  Batched matmul A x V (whole sequence written),matmul,"Batched matmul.
+IN  AW (row 19) and UG (row 15), J=2 -- they differ in shape, so Data in is their sum, not twice the listed one   OUT  U, O=1 -> row 23; its spell rows are also read by row 30
+out[a, h, m, c] = SUM_n AW[a, h, m, n]*UG[a, h, n, c]. Contracts i_4 = the key axis. Writes the whole sequence at once. The local pass rewrites only span and summary rows, so the spell rows of U live until row 30.",16,2,150,150,2,16,2,150,128,1,"184,320,000","368,640,000",0,"1,334,400","614,400",,0,"2,668,800","1,228,800",5.7%
+,,,,,,,,,,,,,,,,,,,,,,,,
+Local spectral attention (spec_local) + Skip,2,"QF, KF  :  Fold: Q,K per (window, column)",reshape,"Strided fold.
+IN  Q, K (row 13), J=2   OUT  QF, KF, O=2 -> row 24
+Per (window, box column), that window's spans plus its own summary, o_3 = L_l. n_span is not a multiple of W, so TWO STATIC FOLDS: n_full sequences of L_l and one of L_rem -- static shapes, no ragged tensor, no pad slot. Window-major order makes each sequence contiguous. A permutation, so in-elements = out-elements; shape columns show the dominant fold, the data columns count both.",16,149,256,,2,16,149,256,,2,0,0,0,"1,220,608","1,220,608",,0,"2,441,216","2,441,216",0.0%
+,2,"UF  :  Fold: V, strided view of row 20",reshape,"Strided view.
+IN  U (row 20), J=1   OUT  UF, O=1 -> row 27
+U is already one buffer in window-major order, which places each window's spans beside its summary, so this operand is a contiguous strided view absorbed into the pass's load.",16,149,256,,1,16,149,256,,1,0,0,0,"610,304","610,304",,0,"1,220,608","1,220,608",0.0%
+,2,SCL  :  Batched matmul QK^T,matmul,"Batched matmul, second operand transposed.
+IN  QF, KF (row 22), J=2   OUT  SCL, O=1 -> row 25
+Same contraction as row 17, over both static folds: n_full*L_l^2 + L_rem^2 logits per (column, head).",176,2,13,128,2,176,2,13,13,1,"15,523,840","31,047,680",0,"1,220,608","60,640",,0,"2,441,216","121,280",0.5%
+,2,SCL  :  Add learned relative bias (pb_fine),add,"Broadcast add of ONE fused table (1 FLOP per logit).
+IN  SCL (row 24) + pb_fine, J=1   OUT  SCL, O=1, same buffer -> row 26
+out[h, m, n] += pb_fine[h, m-n+W-1], the signed span offset inside the window. The summary row and column take no bias, and the bandwidth key mask folds into the same table -- one add covers both, exactly as row 18 does for the global block.",176,2,13,13,1,176,2,13,13,1,0,"121,280",46,"60,640","60,640",,92,"121,280","121,280",0.0%
+,2,AWL  :  Softmax on dim i_4,softmax,"Row-normalize (4 FLOPs per element).
+IN  SCL (row 25), J=1   OUT  AWL, O=1 -> row 27",176,2,13,13,1,176,2,13,13,1,0,"485,120",0,"60,640","60,640",,0,"121,280","121,280",0.0%
+,2,UL  :  Batched matmul A x V,matmul,"Batched matmul.
+IN  AWL (row 26) and UF (row 23), J=2 -- they differ in shape, so Data in is their sum, not twice the listed one   OUT  UL, O=1 -> row 28
+out[a, h, m, c] = SUM_n AWL[a, h, m, n]*UF[a, h, n, c]. Writes the spans and the window summary from one AWL and one UF.",176,2,13,13,2,176,2,13,128,1,15523840,31047680,0,670944,610304,,0,1341888,1220608,0.004827190376
+,2,UD  :  Merge heads into i_4 (fold layout kept),reshape,"Reshape.
+IN  UL (row 27), J=1   OUT  UD, O=1 -> row 30
+Permute i_2 = H into the feature axis and unfold the folded batch. Cluster-local, independent over o_1. Shape columns show the dominant fold; the data columns count both. The box-axis regroup rides row 29; the span-major restore rides row 40.",176,2,13,128,1,16,149,256,,1,0,0,0,"610,304","610,304",,0,"1,220,608","1,220,608",0.0%
+,2,"ZR  :  Residual load: Z, lattice -> fold",reshape,"Residual-operand load, regroup included.
+IN  Z (row 9 at the first site, row 31 at the second), J=1   OUT  ZR, O=1 -> row 31
+Applies the lattice -> fold regroup while loading, so it overlaps the GEMM of row 30. At the second site the source is already fold-ordered and the regroup degenerates to a copy.",1,150,16,256,1,"2,400",1,1,256,1,0,0,0,"614,400","614,400",,0,"1,228,800","1,228,800",0.0%
+,2,WO  :  Dense i_4 -> o_4 (W_o),dense,"GEMM.
+IN  UD (row 28) for the span and summary tokens, plus the spell rows still held in U (row 20), J=2 -- the listed i_1 is the two sources summed   OUT  WO, O=1 -> row 31
+Contracts i_4; token rows independent, so the two sources are consecutive ranges of one launch, not a copy.","2,400",1,1,256,2,"2,400",1,1,256,1,"314,572,800","630,374,400","131,584","1,228,800","614,400",,"263,168","2,457,600","1,228,800",9.8%
+,2,Z  :  Element-wise add of 2 tensors,add,"Element-wise add of two tensors of equal shape (1 FLOP per element).
+IN  WO (row 30) and ZR (row 29), J=2   OUT  Z, O=1 -> rows 11 and 29 on the second execution, then rows 33 and 38
+Z lives in fold order from here: every consumer is a last-dim op or an order-blind gather, so no reshape follows.","2,400",1,1,256,2,"2,400",1,1,256,1,0,"1,228,800",0,"1,228,800","614,400",,0,"2,457,600","1,228,800",0.0%
+,,,,,,,,,,,,,,,,,,,,,,,,
+"FFN (observation carriers)
+last read of: Z",1,ZO  :  Gather observation carriers,reshape,"Gather with selection.
+IN  Z (row 31), J=1   OUT  ZO, O=1 -> rows 34 and 38
+Drops the spell rows -- the probe has no FFN scope -- leaving o_2 = n_obs. The dropped count is the in/out difference in the data columns.","2,400",1,1,256,1,1,"2,384",1,256,1,0,0,0,"614,400","610,304",,0,"1,228,800","1,220,608",0.0%
+,1,ZON  :  Normalize on dim i_4,layernorm,"Row-wise standardize + affine (9 FLOPs per element).
+IN  ZO (row 33), J=1   OUT  ZON, O=1 -> row 35.  Same form as row 11.",1,"2,384",1,256,1,1,"2,384",1,256,1,0,"5,492,736",512,"610,304","610,304",,"1,024","1,220,608","1,220,608",0.1%
+,1,H1  :  Dense i_4 -> ffn_dim,dense,"GEMM.
+  IN  ZON (row 34), J=1   OUT  H1, O=1 -> row 36.  Contracts i_4.",1,2384,1,256,1,1,2384,1,512,1,312475648,626171904,131584,610304,1220608,,263168,1220608,2441216,0.09735513212
+,1,H1  :  Element-wise nonlinearity,gelu,"Element-wise nonlinearity (5 FLOPs per element).
+IN  H1 (row 35), J=1   OUT  H1, O=1, same buffer -> row 37",1,"2,384",1,512,1,1,"2,384",1,512,1,0,"6,103,040",0,"1,220,608","1,220,608",,0,"2,441,216","2,441,216",0.1%
+,1,H2  :  Dense ffn_dim -> o_4,dense,"GEMM.
+  IN  H1 (row 36), J=1   OUT  H2, O=1 -> row 38.  Contracts i_4.",1,"2,384",1,512,1,1,"2,384",1,256,1,"312,475,648","625,561,600","131,328","1,220,608","610,304",,"262,656","2,441,216","1,220,608",9.7%
+,1,ZF  :  Element-wise add of 2 tensors,add,"Element-wise add (1 FLOP per element).
+IN  H2 (row 37) and ZO (row 33), J=2   OUT  ZF, O=1 -> row 40",1,2384,1,256,2,1,2384,1,256,1,0,610304,0,1220608,610304,,0,2441216,1220608,0.00009488804301
+,,,,,,,,,,,,,,,,,,,,,,,,
+"Output: decode + context + head
+",1,ZS  :  Fold -> span-major restore,reshape,"Permutation.
+IN  ZF (row 38), J=1   OUT  ZS, O=1 -> row 42
+Restores lattice order: [physical | summary] on o_2, boxes on o_3. This permutation has NO independent axis, which is why it is an index map rather than a kernel. Once per forward.",1,"2,384",1,256,1,1,149,16,256,1,0,0,0,"610,304","610,304",,0,"1,220,608","1,220,608",0.0%
+,1,"BSE  :  Residual load: R3 base, two regions -> one tensor",reshape,"Concatenation of two source regions.
+IN  PAT (row 3) and WIN (row 5), J=2 -- the listed i_2 is the two regions summed, not two tensors of that size   OUT  BSE, O=1 -> row 43
+Concatenated on o_2 in the order row 40 delivers ZS, so row 43 needs no alignment; runs together with row 40.",1,149,16,384,2,1,149,16,384,1,0,0,0,"915,456","915,456",,0,"1,830,912","1,830,912",0.0%
+,1,"DEC  :  Dense i_4 -> o_4 (out_proj, both families)",dense,"GEMM, one weight matrix over a concatenated row stream.
+IN  ZS (row 40), J=1   OUT  DEC, O=1 -> row 43
+One decode map for both families (summary_out_proj off). Mirrors row 7: same token set, transposed widths, identical MAC count.",1,149,16,256,1,1,149,16,384,1,"234,356,736","469,628,928","98,688","610,304","915,456",,"197,376","1,220,608","1,830,912",7.3%
+,1,YP  :  Element-wise add of 2 tensors (R3),add,"Element-wise add of two tensors of equal shape (1 FLOP per element).
+IN  DEC (row 42) and BSE (row 41), J=2   OUT  YP, O=1 -> row 44
+One add for both families: a correction to the measured payload on physical rows, to the pooled payload on summary rows.",1,149,16,384,2,1,149,16,384,1,0,"915,456",0,"1,830,912","915,456",,0,"3,661,824","1,830,912",0.0%
+,1,BLK  :  Ungroup i_4 into per-PRB blocks + crop,reshape,"Reshape + crop.
+IN  YP (row 43), J=1   OUT  BLK, O=1 -> row 45
+i_4 = out_width factors as span_prbs * n_bins * ups_in, so every payload row -- physical or summary -- ungroups into span_prbs*n_bins per-PRB blocks; one map serves both. The physical segment is then cropped from the padded PRB count to the allocated one, dropping a contiguous tail; the summary segment keeps its unique blocks. In-elements exceed out-elements by the crop.",1,149,16,384,1,1,1188,16,48,1,0,0,0,915456,912384,,0,1830912,1824768,0
+,1,"HD  :  Dense i_4 -> o_4 (W_x (+) W_col, ONE launch)",dense,"GEMM, ONE launch over two row-blocks with two weight tiles.
+IN  BLK (row 44), J=1   OUT  HD, O=1 -> row 46
+W_x (with bias) on the physical block, W_col (bias-free) on the summary block. Both tiles share (i_4, o_4), so the concatenated row stream is one launch; it is NOT one weight matrix. The summary block is computed on its UNIQUE rows only -- replication happens at row 46.",1,"1,188",16,48,1,1,"1,188",16,64,1,"58,392,576","117,903,360","6,208","912,384","1,216,512",,"12,416","1,824,768","2,433,024",1.8%
+,1,HP  :  Strided broadcast-add of a small tensor into a big one,add,"Strided broadcast-add: a SMALL tensor into a BIG one, no second big operand (1 FLOP per element of the big tensor).
+IN  HD (row 45): its physical block is the big operand, its summary block the small one, J=2   OUT  HP, O=1 -> row 47
+INDEX RULE: the big row axis factors as (prb, ant), the small one as (window, prb mod span_prbs, ant), and
+    w(p) = ( floor(prb/pool_prbs)*span_prbs + prb mod span_prbs )*n_bins + ant
+keeps (prb mod span_prbs) and ant exact, replacing the span index by the window id. The repeat sits OUTSIDE the span, so a window's span_prbs source rows alternate every n_bins big rows and each is reused W times at stride span_prbs*n_bins: one pass over the big tensor still suffices, over a source window of span_prbs*n_bins rows that advances once every W*span_prbs*n_bins rows. Loads = big + small, stores = big. The final window's run is short by the crop. Independent axes: the big row axis and ant.",1,"1,092",16,64,2,1,"1,092",16,64,1,0,"1,118,208",0,"1,216,512","1,118,208",,0,"2,433,024","2,236,416",0.0%
+,1,HP  :  Element-wise nonlinearity,gelu,"Element-wise nonlinearity (5 FLOPs per element).
+IN  HP (row 46), J=1   OUT  HP, O=1, same buffer -> row 48",1,"1,092",16,64,1,1,"1,092",16,64,1,0,"5,591,040",0,"1,118,208","1,118,208",,0,"2,236,416","2,236,416",0.1%
+,1,Y  :  Dense i_4 -> o_4 (W_head),dense,"GEMM; the largest single matmul in the model.
+IN  HP (row 47), J=1   OUT  Y, O=1 -- BLOCK OUTPUT
+Expands i_4 = head_hidden to o_4 = ups_out = P*S*2: the measured symbols to all S, the pilots to all P subcarriers. Runs at every (PRB, antenna) position, which is why a small weight matrix carries a large share of model MACs.",1,"1,092",16,64,1,1,"1,092",16,336,1,"375,717,888","757,306,368","21,840","1,118,208","5,870,592",,"43,680","2,236,416","11,741,184",11.8%
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"TOTAL  (one forward: Bt streams, full RA antenna cube, all F, all S)",,,,,,,,,,,,,"3,185,754,112","6,431,832,512","1,015,422","36,237,344","36,449,312",,"2,030,844",,,100.0%
+,,Total MACs / forward  (GEMM + attention matmul only -- compute_costs.py convention),,,,,,,,,,,,,,"3,185,754,112",,,,,,,,
+,,"Total FLOPs / forward  (incl. LN, softmax, GELU, RoPE, adds, pool, logit biases, mask)",,,,,,,,,,,,,,"6,431,832,512",,,,,,,,
+,,   of which GEMM / attention matmul  ->  tensor engines (TEs),,,,,,,,,,,,,,"6,383,082,496",99.2%,,,,,,,
+,,"   of which element-wise  ->  PEs   (no FFT row: spatial_fft=False, the transforms are the identity)",,,,,,,,,,,,,,"48,750,016",0.8%,,,,,,,
+,,FLOPs per antenna element   ( / (Bt*RA) ),,,,,,,,,,,,,,"100,497,383",,,,,,,,
+,,"MACs cross-check: exact closed form in the derived cells -- must equal Total MACs. B' was 1 in the previous revision, which hid a family of missing B' factors: the local-attention term of this closed form, the folded-row counts of rows 24-28 and the token counts of rows 29-33, all of which read n_box_a or L_m*n_box_a where they need B' times those. Restored here, so the ledger now tracks n_pol. Active-token convention: projections on L_m*n_box_a (no pad cells), local attention over the two static folds (n_full*L_l^2 + L_rem^2), head on the CROPPED N_prb grid plus the unique window blocks.",,,,,,,,,,,,,,"3,185,754,112",,,,,,,,
+,,"Total weights (params)  --  bandwidth-INDEPENDENT;  == count_params() == _param_count() = 1,015,422 measured on a real build",,,,,,,,,,,,,,"1,015,422",,,,,,,,
+,,Weights @ FP16  (Bytes),,,,,,,,,,,,,,"2,030,844",,,,,,,,
+,,"Data movement per forward  (N_repetitions applied; the Data in / Data out columns above are PER SINGLE EXECUTION, so the row-52 sums are not a per-forward figure)",,,,,,,,,,,,,,,,53910592,51673152,,,107821184,103346304,
+,,"Parameters   (blue = editable knobs, at the config of record;  bold = derived)",,,,,,,,,,,,,,,,,,,,,,
+,1,Streams folded  Bt = B*T  (per-forward scope),,,,,,,,,,,,,,,,,,,,,,
+,273,Allocated PRBs  N_prb  (273 = full 100 MHz @ 30 kHz SCS),,,,,,,,,,,,,,,,,,,,,,
+,12,Subcarriers per PRB  P  (comb-1 DMRS: pil_per_prb = P),,,,,,,,,,,,,,,,,,,,,,
+,14,OFDM symbols  S  (= n_syms_out: the head emits all S),,,,,,,,,,,,,,,,,,,,,,
+,2,"Pilot symbols  S2  (DMRS type A, pos 2 + additional pos 1)",,,,,,,,,,,,,,,,,,,,,,
+,2,Spectral patch span  span_prbs  [PRB],,,,,,,,,,,,,,,,,,,,,,
+,24,Summary window  pool_prbs  [PRB],,,,,,,,,,,,,,,,,,,,,,
+,4,UPA rows  U_v,,,,,,,,,,,,,,,,,,,,,,
+,16,UPA columns  U_h,,,,,,,,,,,,,,,,,,,,,,
+,2,"Antennas per spatial patch, v  g_v   (spatial_fft OFF: ANTENNA tiles, not beams)",,,,,,,,,,,,,,,,,,,,,,
+,2,"Antennas per spatial patch, h  g_h",,,,,,,,,,,,,,,,,,,,,,
+,1,Polarizations  n_pol  (always a batch axis),,,,,,,,,,,,,,,,,,,,,,
+,256,Token width  d_model,,,,,,,,,,,,,,,,,,,,,,
+,2,Attention heads  H,,,,,,,,,,,,,,,,,,,,,,
+,512,FFN hidden width  ffn_dim,,,,,,,,,,,,,,,,,,,,,,
+,2,Weight sets  n_wsets = 1 + max(project index) = 2  (UNTIED re-projection),,,,,,,,,,,,,,,,,,,,,,
+,1,Spell rows  spell_rows  (learned spectral probes),,,,,,,,,,,,,,,,,,,,,,
+,0,Spall columns  spall_cols = 0  ->  NO learned spatial probe column,,,,,,,,,,,,,,,,,,,,,,
+,0,"Row summaries  row_summaries = False  ->  n_rowsum = 0, no rowsum column",,,,,,,,,,,,,,,,,,,,,,
+,64,Head hidden width  head_hidden,,,,,,,,,,,,,,,,,,,,,,
+,64,Rx elements  RA = n_pol*U_v*U_h,,,,,,,,,,,,,,,,,,,,,,
+,3276,Subcarriers  F = P*N_prb,,,,,,,,,,,,,,,,,,,,,,
+,3288,Padded subcarriers  Fp = F + (-F mod span*P),,,,,,,,,,,,,,,,,,,,,,
+,274,Padded PRBs  Np = Fp/P,,,,,,,,,,,,,,,,,,,,,,
+,3288,Pilot subcarriers  Fpil = Fp  (comb-1),,,,,,,,,,,,,,,,,,,,,,
+,24,Pilots per span  = span*P,,,,,,,,,,,,,,,,,,,,,,
+,12,Spans per window  W = pool_prbs/span_prbs,,,,,,,,,,,,,,,,,,,,,,
+,137,Spectral patches  n_span = Np/span,,,,,,,,,,,,,,,,,,,,,,
+,12,Windows  n_win = ceil(n_span/W),,,,,,,,,,,,,,,,,,,,,,
+,144,Padded spans  n_span_p = n_win*W,,,,,,,,,,,,,,,,,,,,,,
+,7,Inert pad rows  n_pad = n_span_p - n_span,,,,,,,,,,,,,,,,,,,,,,
+,157,Span axis  n_span_a = n_span_p + n_win + spell   [ physical | pads | windows | spell ],,,,,,,,,,,,,,,,,,,,,,
+,2,"Antenna tiles, v  n_bv = U_v/g_v",,,,,,,,,,,,,,,,,,,,,,
+,8,"Antenna tiles, h  n_bh = U_h/g_h",,,,,,,,,,,,,,,,,,,,,,
+,16,Spatial patches  n_box = n_bv*n_bh,,,,,,,,,,,,,,,,,,,,,,
+,4,Antennas per patch  = g_v*g_h,,,,,,,,,,,,,,,,,,,,,,
+,16,Box axis  n_box_a = n_box + n_rowsum + spall_cols  =  n_box   (NO extra column),,,,,,,,,,,,,,,,,,,,,,
+,2512,Lattice tokens  T_lat = n_span_a*n_box_a  (projection stream),,,,,,,,,,,,,,,,,,,,,,
+,2384,Observation carriers  n_obs = (n_span + n_win)*n_box  (embed / FFN / decode),,,,,,,,,,,,,,,,,,,,,,
+,128,Head width  d_head = d/H,,,,,,,,,,,,,,,,,,,,,,
+,1,Core batch  B' = Bt*n_pol,,,,,,,,,,,,,,,,,,,,,,
+,384,Patch payload  out_width = pspan*n_bins*S2*2,,,,,,,,,,,,,,,,,,,,,,
+,48,Head input  ups_in = P*S2*2,,,,,,,,,,,,,,,,,,,,,,
+,336,Head output  ups_out = P*S*2,,,,,,,,,,,,,,,,,,,,,,
+,138,Global pass length  L_g = n_span + spell  (pads statically sliced out),,,,,,,,,,,,,,,,,,,,,,
+,13,Coarse pass length  L_c = n_win + spell,,,,,,,,,,,,,,,,,,,,,,
+,13,Local pass length  L_l = W + 1  (spans + own summary; spell NOT in this pass),,,,,,,,,,,,,,,,,,,,,,
+,16,Global/coarse folded rows  = B'*n_box_a,,,,,,,,,,,,,,,,,,,,,,
+,192,Local folded rows  = B'*n_win*n_box_a,,,,,,,,,,,,,,,,,,,,,,
+,149,phy tok + sumry tok,,,,,,,,,,,,,,,,,,,,,,
+,150,"Merged dual-global length  L_m = n_span + n_win + spell (one gather, block-diagonal scores; spell shared)",,,,,,,,,,,,,,,,,,,,,,
+,11,Full local folds  n_full = floor(n_span/W)  (two-fold compile: pads never enter the lattice),,,,,,,,,,,,,,,,,,,,,,
+,6,Remainder fold length  L_rem = n_span - n_full*W + 1  (leftover spans + their summary),,,,,,,,,,,,,,,,,,,,,,
+,,"Row colour = where the op runs (column D says WHAT it does, the colour says WHERE):",,,,,,,,,,,,,,,,,,,,,,
+,,   GEMM / attention matmul  ->  tensor engines (TEs),,,,,,,,,,,,,,,,,,,,,,
+,,   element-wise (LN / softmax / GELU / RoPE / add / pool / mask)  ->  PEs,,,,,,,,,,,,,,,,,,,,,,
+,,"   reshape in-stage (addressing only, zero FLOPs): the operands never leave the cluster",,,,,,,,,,,,,,,,,,,,,,
+,,"   reshape carried by a move (stage-entry gathers, residual loads, restores): the same op, done while the operand is moved, so it overlaps the move",,,,,,,,,,,,,,,,,,,,,,
+,,"Config of record:  CELERE(d_model=256, ffn_dim=512, schedule=[(attn,spec_global,all), (attn,spec_coarse,all), (attn,spec_local,all), (project,all,1), (attn,spec_global,all), (attn,spec_coarse,all), (attn,spec_local,all)], spectral_mode='dual_global', pos_spectral=('rope','bucket'), spall_cols=0, row_summaries=False, token_type_enc=True, spatial_fft=False, rope_decay_prb=None), fed prb_mask; every other argument at the celere.py signature default (n_pol=2, span_prbs=2, pool_prbs=24, spell_rows=1, n_spill=0, col_summaries=True, col_head=True, summary_ffn='obs', summary_out_proj=False, head_hidden=64, H=2, snr_gate off, res_boundary='add', res_pass off, learnable_rope=True, rope_bank=False). Total parameters 1,015,422 -- MEASURED from a real build (count_params() == _param_count() == the Weights column sum), and equal to the model size recorded for this config in celere_multiuser_handoff.md.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"What this config REMOVES, relative to the full CELERE-L lattice:  (1) spatial_fft=False -- the beamspace analysis and synthesis are the IDENTITY, so there is NO DFT anywhere: spatial patches are 2x2 tiles of physically ADJACENT antennas, not beam bins, and the profile has no FFT rows and no FFT column in the totals. (2) The schedule has NO spatial attention pass, so the box columns are independent streams through the encoder and no spatial rope ladder is allocated (schedule-driven allocation: weights exist only where a consuming pass does). (3) spall_cols=0 -- no learned spatial probe column, hence no inert spell x spall corner and no spall-column masks in any pass. (4) row_summaries=False -- no rowsum column, no tile-pooled row payload, no grand mean, no row context stream and no W_row. Together (3)+(4) give n_box_a = n_box = 16 exactly. (5) rope_decay_prb=None -- the fixed -m_h|dPRB| decay bias is absent from every pass.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"What it ADDS:  (1) ('project','all',1) asks for weight-set index 1, so n_wsets = 2 -- the two stages get their OWN W_qkv and W_o and their own LayerNorm (an UNTIED re-projection: +262,400 params over the shared form). (2) pos_spectral=('rope','bucket') is the SCALE-SPLIT hybrid: global and coarse keep the physical delay ladder, while the LOCAL pass takes a learned additive relative bias (pb_fine, [H, 2W-1] = 46 params, zeros-init) INSTEAD of rotation -- in the code, cos = sin = None on that path, which is why the local pass has no rope row at all. (3) token_type_enc=True adds e_type [2, d] (zeros-init) in the PE slot, typing physical patches vs measured summaries. (4) prb_mask is fed, so kb_span / kb_win are mask-derived (not the static pad constant) and the final estimate is multiplied by the mask.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"System:  128 Rx (4x16 dual-pol UPA, DeepEcho packing), spatial patches of 2x2 adjacent antennas -> n_box=16. N_prb=273 (100 MHz @ 30 kHz SCS) -> F=3276 -> Fp=3288 pilot subcarriers (comb-1, half a span -- 12 subcarriers, 1 PRB -- of pad), 274 padded PRBs, n_span=137 spectral patches, n_win=12 windows of 24 PRB (7 inert pad spans). Augmented lattice 157 x 16 = 2,512 tokens PER POLARIZATION (pol is a batch axis, B' = Bt*n_pol = 2, so one forward runs the lattice twice): 2,384 observation carriers + 7x16 pad cells + the spell row. Parameters are bandwidth-independent; compute scales with N_prb through the lattice.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"Scope:  one forward pass, starting from the received grid [Bt*RA, F, S, 2] (CP removal and the OFDM FFT are not counted). Projections (LN, W_qkv, W_o) run on the ACTIVE stream L_m*n_box_a, NOT on T_lat: the n_pad*n_box_a pad cells are dropped, which is exact and not an approximation -- pads are -1e9 key-masked in the only pass that folds them, and no downstream row reads a pad query, so a pad token in celere.py cannot reach an output; patch_embed, the FFN and out_proj touch exactly the n_obs observation carriers -- the stem and decode token sets are the same set, by construction. The spell probe carries no payload: it embeds as a raw d-vector and has NO output path. N_repetitions (col B) is INCLUDED in the MACs/FLOPs columns (the 3-pass block runs twice); Weights and Data in/out are per single execution, and weights are listed once on their owning row (both W_qkv sets and both W_o sets on their rows; both stage-LNs on the LN row; the span rope ladder on the global pass, shared with coarse).  WEIGHT-SET ORDER (celere.py, and not derivable from the widths): stage 1 opens with W_qkv[0] and CLOSES with W_o[1]; stage 2 opens with W_qkv[1] and closes with W_o[0] -- the two W_o run in the reverse order to the two W_qkv, which an RTL weight map has to honour.  RECONCILIATION with the code: celere.py itself costs 6,487,048,192 MACs at this configuration -- pads in every projection, W_col on the replicated PRB grid, the head on the padded 274-PRB grid, and the two global scales as separate passes. This ledger is the hardware form and is 1.8 % cheaper: the +17.1 % of the merged 150^2 score block is repaid several times by the pad drop, the W_col hoist and the early crop.  DEVIATION, recorded and NOT repaired: the merged block is exact on the physical x physical and window x window sub-blocks and INEXACT at the spell endpoints, for two reasons structural to the fusion -- (1) the in-place rotation forms the spell column and row from ROTATED operands where D4 (null-pair rule) reads the raw q and the raw k in both directions, and (2) one shared value buffer gives the coarse rows the PRE-pass spell value where the schedule feeds them the value the global block has just written. Measured on random operands, the pass output moves by ~29 % on the spans, ~36 % on the summaries and ~141 % on the spell. The repair (a raw re-score of the 286-logit spell strip, plus a rank-1 accumulate on the summary rows) would cost 4,882,432 MACs, 0.08 % -- it is left OUT of this ledger by ruling, so hardware built to this ledger runs a different function from the celere.py checkpoint and the model must be RETRAINED under the fused semantics before a trained checkpoint transfers.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"Conventions (as celere_cmplx / compute_costs.py):  FLOPs = 2*MACs per GEMM; Dense adds its bias (+out_width per token) EXCEPT W_qkv and W_col (bias-free in celere.py, so FLOPs = 2*MACs exactly there); LayerNorm 9, softmax 4, GELU 5, residual add 1 FLOP/elem; RoPE 3 FLOPs/elem on q and k, real positions only; every logit-side broadcast add (key biases, pb_fine) 1 FLOP/elem per application -- these are counted because the graph executes them, even where the mask values are all zero at full allocation; 1/sqrt(d_head) folded into QK^T; avg-pool 1 FLOP per INPUT element. The MACs column counts GEMM + attention matmuls only (the compute_costs.py convention); the FLOPs column counts everything. Weights at FP16 (2 Bytes).",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"Encoder & schedule (SoC rewrite):  block = [G||C][L+Skip] x 2 stages; execution [LN + W_qkv (set 0)][merged dual-global: one gather, one 2-family rope, 138^2 + 13^2 scores inside one 150^2 block, shared output buffer][LOCAL + head-merge (in-stage reshape) + W_o + add, z by the r29 residual transfer (lattice->fold in the descriptors)][LN + W_qkv (set 1)][merged dual-global][LOCAL + Skip] || blank row = stage boundary || [r33 FFN entry: gather obs, drop pads + spell][FFN] || [OUTPUT STAGE, rows 40-49 contiguous: r40+r41 entry transfers (z restored fold->span-major; R3 base assembled), one shared-decoder GEMM, ONE R3 add, ONE in-stage re-pack (r44: both families ungrouped together, physical cropped to 273 PRB, windows kept as 96 unique blocks -- the repeat moved past the dense), ONE 48->64 launch (W_x (+) W_col row-blocks), accumulate by index-reuse read, gelu, head, output mask]. Mid-stream layout = FOLD order; span-major exists only in the stems and from r40 onward. No spatial pass.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"RED dim = independent INPUT axis: the op neither reduces nor contracts over it and does not mix it with another axis, so a stage may be cluster-split along it with no cross-cluster traffic. Output dims are never marked.",,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,"Reading a row:  column E describes the TENSOR OPERATION and nothing else, and it is written to survive a knob change -- it names dims by their column ids (inputs i_1..i_4, outputs o_1..o_4), tensor COUNTS by their column ids (J for inputs, O for outputs: J=3 means three tensors sharing the listed input dims, and the data columns S/T already multiply by them), parameters by symbol, provenance by ROW NUMBER, and each output by the row(s) that READ it -- never by a literal extent. Read the extents off columns F..J and K..O for the config of record. P/Q/R give MACs, FLOPs and unique weights; S/T the element counts (x2 for Bytes at FP16). Design rationale lives in the notes above, not in E.",,,,,,,,,,,,,,,,,,,,,,
+,,"Tensor names and liveness:  every tensor has an ALL-CAPS name. Column C reads  NAME : operation  -- the bold name(s) are what the row PRODUCES, and only the names are bold. A name repeated from the row above means the same buffer is rewritten in place. Column A marks, on the row performing a tensor's LAST READ, 'last read of: ...' -- after that row the buffer is free, so which dead buffer a new output is placed in follows from these markers and is left to the allocator rather than written out. Names are per forward pass; rows executed twice re-define their outputs each time. Note SC / AW (and SCL / AWL) for the score table and the attention weights: S is already the OFDM symbol count and A reads as an article. Long-lived tensors: PAT and WIN (born rows 3 and 5, read again by the R3 base load at row 41) and Z (born row 9, last read row 38).",,,,,,,,,,,,,,,,,,,,,,
+,,"Reading a row:  column E describes the TENSOR OPERATION and nothing else, and it is written to survive a knob change -- it names dims by their column ids (inputs i_1..i_4 with j tensors, outputs o_1..o_4), parameters by symbol, and provenance by ROW NUMBER, never by a literal extent. Read the extents off columns F..J and K..O for the config of record. P/Q/R give MACs, FLOPs and unique weights; S/T the element counts (x2 for Bytes at FP16). Design rationale lives in the notes above, not in E.",,,,,,,,,,,,,,,,,,,,,,

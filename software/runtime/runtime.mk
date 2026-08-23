@@ -130,6 +130,10 @@ ifeq ($(XDIVSQRT), 1)
 DEFINES += -D__XDIVSQRT
 endif
 
+# Per-application defines from the command line, e.g.
+#   make <app> APP_DEFINES="-DDOUBLE_BUF=1 -DTILE_M=368"
+DEFINES += $(APP_DEFINES)
+
 ###############################################################################
 # Compiler Flags                                                              #
 ###############################################################################
