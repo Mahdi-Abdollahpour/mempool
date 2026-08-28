@@ -265,9 +265,9 @@
   "gemm_f16": {
     "type": "float16",
     "defines": [
-      ("matrix_M", 64)
-      ("matrix_N", 64)
-      ("matrix_P", 64)
+      ("matrix_M", 688)
+      ("matrix_N", 128)
+      ("matrix_P", 84)
     ]
     "arrays": [
       ("__fp16", "l2_X")
@@ -570,6 +570,69 @@
     ]
   },
 
+  // The four layout kernels, at the shapes the CELERE and CEViT pipeline apps call
+  // them with.  They are single-cluster TensorPool apps: build with
+  // `config=tensorpool256`, whose 4 MiB L1 is what lets these run unscaled.
+
+  // CEViT's resource grid: [3276, 14, 2] <-> 1092 token rows of 12x7 patches.
+  // n_tok and patch_P are derived by the generator.
+  "patchify_f16": {
+    "type": "float16",
+    "defines": [
+      ("grid_F", 3276)
+      ("grid_T", 14)
+      ("grid_C", 2)
+      ("patch_H", 12)
+      ("patch_W", 7)
+    ]
+    "arrays": [
+      ("__fp16", "l2_A")
+      ("__fp16", "l2_B")
+    ]
+  },
+
+  // CELERE's front-end unpack, template row 3: six levels, the deepest table
+  // permute_f16p takes.  array_N, perm_NLEV and perm_RUN come from the level table
+  // itself, so the shape is stated in ONE place -- gendatalib_nn._permute_map.
+  "permute_f16": {
+    "type": "float16",
+    "defines": []
+    "arrays": [
+      ("__fp16", "l2_A")
+      ("__fp16", "l2_B")
+      ("int32_t", "l2_levels")
+    ]
+  },
+
+  // CELERE's window pool, template row 5.  137 rows in windows of 12 is the SHORT
+  // FINAL WINDOW case -- 5 live rows, still divided by 12.
+  "pool_f16": {
+    "type": "float16",
+    "defines": [
+      ("pool_NIN", 137)
+      ("pool_NOUT", 12)
+      ("pool_WIN", 12)
+      ("pool_LANE", 3072)
+    ]
+    "arrays": [
+      ("__fp16", "l2_A")
+      ("__fp16", "l2_B")
+    ]
+  },
+
+  // CEViT's K transpose, template row 13.
+  "transpose_f16": {
+    "type": "float16",
+    "defines": [
+      ("matrix_M", 1092)
+      ("matrix_N", 32)
+    ]
+    "arrays": [
+      ("__fp16", "l2_A")
+      ("__fp16", "l2_B")
+    ]
+  },
+
   "ofdm_f16": {
     "type": "float16",
     "defines": [
@@ -632,8 +695,8 @@
   "softmax_f16": {
     "type": "float16",
     "defines": [
-      ("matrix_M", 2)
-      ("matrix_N", 8)
+      ("matrix_M", 456)
+      ("matrix_N", 456)
     ]
     "arrays": [
       ("__fp16", "l2_A")

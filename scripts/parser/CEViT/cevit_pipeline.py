@@ -23,11 +23,11 @@ software/apps/multi_cluster/cevit_<mode>_<pool>/main.c.
          shim has, so the read cannot be hidden as well.
 
 SCOPE.  THIS PARTITION IS TUNED FOR TENSORPOOL.  The stage widths were chosen against its
-RedMulE GEMM peak, where the period is 0.086 ms against Terapool's 0.526; on Terapool a GEMM is
+RedMulE GEMM peak, where the period is 0.087 ms against Terapool's 0.526; on Terapool a GEMM is
 a PE matmul and the balance moves -- the attention core becomes the wall instead of the FFN
 block -- so a Terapool-first partition would want different widths, not just a different
 config.  The Terapool numbers are honest output of the same model, they are simply not what the
-shape was optimised for.  All four apps do fit L1, between 2206 and 2581 KiB.
+shape was optimised for.  All four apps do fit L1, between 2343 and 2718 KiB.
 
 Both are generated, for both pools -- four apps.  Under cwt only what crosses an item boundary
 takes a second copy (a hand-off's landing zone and whatever an outbound transfer reads), and
@@ -78,29 +78,39 @@ THE TWO BOUNDARIES
 The score matrix, the largest tensor in the model, never crosses anything: it is produced,
 softmaxed and consumed inside one lane of one stage.
 
-LAYOUT ROWS.  The template has seven and none is a kernel -- nothing in
-software/kernels/baremetal permutes a tensor.  A transfer can perform one only when it was
-crossing that boundary anyway, and here every one has a transfer to ride (DROPPED_ROWS), so
-nothing is left to spin for on the PE path:
+LAYOUT ROWS.  The template has seven and every one is performed.  WHICH ENGINE PERFORMS IT
+FOLLOWS FROM THE SHAPE OF ITS INNERMOST RUN, and from nothing else:
 
-    row 2             patchify                       the inbound LPDDR read
     rows 11, 12       split q,k,v + split heads      the 1 -> 2 hand-off's source addressing
-    row 13            transpose K                    ASSUMED onto the 1 -> 2 hand-off
     rows 17, 18       transpose + merge heads        the 2 -> 3 hand-off's destination stride
-    row 33            merge patches                  the outbound LPDDR write
+    row 2             patchify                       patchify_f16p, on stage 1's cores
+    row 13            transpose K                    transpose_f16p, on stage 2's cores
+    row 33            merge patches                  unpatchify_f16p, on stage 3's cores
 
-ROW 13 IS THE ONE OPTIMISM IN THIS FILE.  Row 14 contracts against K TRANSPOSED and the
-partition assumes the hand-off produces K^T on the way, which a DMA cannot do: K^T is
-[d_head, tokens], so a descriptor building it walks 2-byte runs against a 64 B line.  What is
-emitted is the plain strided slab, delivering K.  The CYCLES are unaffected -- row 14's GEMM is
-issued at the same M, N and P, and the app checks no result -- so what is lost is a numerical
-answer nobody reads.  Putting row 13 back in STAGES buys a real transpose, as a PE wait on
-stage 1 or 2.
+THE FIRST FOUR ARE FREE because d_head is 32 halfwords, exactly one 64 B DMA line: picking a
+head's column stripe out of the projection, or scattering it back by column, costs a
+descriptor no more than a contiguous copy would.  The other three have no such run.  A
+transpose of a 2-byte element walks 2-byte runs whichever axis it strides, and patchify's
+channel axis is interleaved in the grid while being part of the token index in the output, so
+it bottoms out at one element too.
 
-CAVEAT ON PATCHIFY.  It is charged as a plain contiguous read and it is not one: [Nf, Nt, C]
-interleaves the two channels and the channel is part of the output row index, so one patch row
-walks 84 elements with two different strides against a 64 B line -- a three-level nest no
-single flex_dma_async_2d expresses.  Treat that leg as optimistic until it is measured.
+AND THE DMA IS PRICED PER RUN, NOT PER BYTE.  The iDMA middle-end (external_repo,
+idma/me/idma_me_2d.cpp) emits ONE BURST PER REPETITION and the TCDM back-end issues ONE LINE
+PER CYCLE, where a line is tcdm_width = cores * banking * 4 bytes -- 8 KiB on TensorPool, 16
+KiB on Terapool.  A descriptor whose runs are single elements therefore spends a whole
+line-cycle to move two bytes: row 13 lowered to a DMA is 69,888 cycles a lane against stage
+2's ~50,000 of compute, and it would be the pipeline's wall.  The cores address the TCDM by
+word and there are hundreds of them, so the same permutation is a few dozen iterations each.
+That is the whole argument; LAYOUT_LOWERING is where it is written down, and build_stages
+refuses a layout row that is in neither table.
+
+THE GRID STAGES CARRY THE RESOURCE GRID, NOT THE TOKEN MATRIX.  Stage 1's inbound leg brings
+[Nf_slab, Nt, C] as it lies and row 2 patchifies it after it lands; stage 3 folds its output
+back before the outbound leg ships it.  So both off-chip legs stay plain contiguous bursts.
+A lane's token slab need not start on a subcarrier block -- 546 tokens is not a multiple of
+the four one block makes -- so the two lanes' grid slabs OVERLAP BY ONE BLOCK.  Each lane
+reads and writes its OWN LPDDR node, so the block is held twice and the two copies never
+meet; whoever writes the grid to DRAM writes each south node the slab _patch_slab names.
 
 THE ATTENTION RESIDUAL SPILLS, AND NOTHING ELSE DOES.  A residual has to leave the chip exactly
 when it SKIPS a stage: row 9 is on stage 1 and row 19 on stage 3, and a boundary only ever
@@ -111,10 +121,12 @@ boundary 1 -> 2, so raising lpddr_channels buys little.  The FFN residual never 
 -> row 28 stays on one lane.
 
 L1 BUDGET.  Stage 2 sets it and its score matrix sets stage 2: [364 queries x 1092 keys],
-written once by Q*K^T and once by the softmax, is 1.6 MiB of the 1.9 MiB the stage declares.
-About 2.2 MiB against TensorPool's 3948 KiB and Terapool's 3544, with no tiling.  Two heads per
-lane is a BATCH loop and the emitter will not nest a tiling inside one, so `tiles` must stay 1
-here; a larger PRB count needs a wider stage 2, a tiling, or both.
+written once by Q*K^T and once by the softmax, is 1.6 MiB of the 2.0 MiB the stage declares.
+Row 13's K^T adds 137 KiB to that -- the price of transposing out of place, and the only L1 the
+real permutations cost on this stage.  About 2.3 MiB against TensorPool's 3948 KiB and
+Terapool's 3544, with no tiling.  Two heads per lane is a BATCH loop and the emitter will not
+nest a tiling inside one, so `tiles` must stay 1 here; a larger PRB count needs a wider stage 2,
+a tiling, or both.
 
 Every layer is lowered to a REAL baremetal kernel call operating on placeholder L1 scratch --
 these kernels' cycle counts are data-independent, so the apps need no HBM preload.  Pass --wait
@@ -174,6 +186,17 @@ BYTES_PER_ELEM = 2                       # FP16
 DMA_LINE_B     = 64
 DMA_LINE_ELEMS = DMA_LINE_B // BYTES_PER_ELEM
 
+# Stack ONE CORE gets, from stack_size in config/*.mk (512 on every pool this generates
+# for).  THIS NUMBER HAS TWO JOBS and both are load-bearing:
+#
+#   * L1.  num_cores of them come off the TCDM before the app may declare a buffer, which
+#     is what _l1_geometry books as 'stacks'.
+#   * DEPTH.  It is also the ceiling on main + one compute_stage + one kernel, and four
+#     bytes of it are gone before main() starts -- _reset_vector sets sp to the top of the
+#     core's slot minus 4.  Nothing checks that at build time, so the emitter keeps the
+#     depth down instead: see _render_stack_note and NO_INLINE.
+PE_STACK_B = 512
+
 
 def _line(n: int) -> int:
     """Round an ELEMENT count up to a whole DMA line."""
@@ -209,36 +232,76 @@ LPDDR_IN_EDGE = 'south'
 LPDDR_OUT_EDGE = 'north'
 
 
-# PE-run layout cost, the same fit celere_pipeline.py uses: a strided halfword permutation
-# with no arithmetic to hide the addressing behind.  DORMANT ON THIS PARTITION -- every
-# layout row rides a transfer (see DROPPED_ROWS), so nothing reaches this fit.  Kept
-# because it is what would cost a layout row stranded mid-stage, and because it is the
-# honest alternative DROPPED_ROWS' row 13 is measured against.  It is a timing model, not
-# a lowering: a row costed here would spin in the emitted app and move no bytes.  The fit
-# was taken on patchify_f16, a halfword-strided gather; re-fit from an RTL run with
-# --bench.
-PE_LAYOUT_FLOPS_PER_ELEM = 8.9
-PE_LAYOUT_FIXED_CYCLES = 1029            # per-invocation entry cost (cluster rendezvous)
+# A permutation kernel moves ONE ELEMENT PER CORE per this many cycles: a strided load and
+# a strided store, with no arithmetic to hide the addressing behind.  That is the whole
+# difference from the FLOPs-per-element fit this replaces -- that one was quoted against a
+# patchify_f16 kernel which did not exist in software/kernels/baremetal.
+#
+# EACH FIGURE IS THE INSTRUCTION COUNT OF THE EMITTED LOOP, AND SO A FLOOR.  Both kernels
+# are hand-written asm -- p.lhu/p.sh with post-increment, so the pointers are walked by the
+# memory ops and the body carries no address arithmetic -- and both are unrolled, so the
+# per-element cost is the two memory ops plus a share of the loop scaffolding.  Counted off
+# the assembly clang emits at -O3 for the mempool target:
+#
+#   transpose   18 instructions per 8 elements: 8 p.lhu, 8 p.sh, a decrement and a branch.
+#   patchify    24 per PATCH ROW (Nw = 7 here: an unrolled-4 block, a straight-line 2 and
+#               the wrap element, plus the row's branches) and ~16 more per token for the
+#               one address computation a token needs, over its Nh * Nw = 84 elements.
+#               A short run is why this is dearer than the transpose: the scaffolding is
+#               amortised over 7 elements, not 8, and cannot be over more.
+#
+# THEY ARE FLOORS.  Neither carries the load-use stall nor the bank conflicts a scattered
+# access pattern provokes, both of which push the real figure up.  Re-fit from an RTL run
+# with --bench; the model is optimistic until you do.
+LAYOUT_CYCLES_PER_ELEM: Dict[str, float] = {
+    'transpose':  2.25,
+    'patchify':   3.6,
+    'unpatchify': 3.6,
+}
 
 # Layout rows no kernel runs and no local copy moves: a TRANSFER CARRIES EACH OF THEM, so
 # the row is the address pattern of a descriptor and costs nothing extra.
 #
-#   row 2         patchify                    the inbound LPDDR read on stage 1
 #   rows 11, 12   split q,k,v / split heads   the 1 -> 2 hand-off's source addressing:
 #                                             head h's Q slab is a d_head run at a
 #                                             3*d_model stride out of row 10's output
 #   rows 17, 18   transpose + merge heads     the 2 -> 3 hand-off's destination stride
-#   row 33        merge patches               the outbound LPDDR write on stage 3
 #
-# ROW 13 IS HERE ON AN ASSUMPTION, AND IT IS THE ONE OPTIMISM IN THIS FILE: row 14
-# contracts against K TRANSPOSED, and a DMA cannot build K^T -- a descriptor for
-# [d_head, tokens] walks 2-byte runs against a 64 B line, which _check_alignment would
-# refuse.  What is emitted is the plain contiguous slab.  It costs NOTHING IN CYCLES (same
-# M, N and P) and the app checks no result, so only a numerical answer is lost.  Put row 13
-# back in STAGES to buy a real transpose, as a wait on stage 1 or 2.
+# All four are free because d_head is exactly one 64 B DMA line, so picking a head's column
+# stripe costs a descriptor no more than a contiguous copy would.  They carry 0 FLOPs, so
+# nothing leaves the latency totals with them.
+DROPPED_ROWS = (11, 12, 17, 18)
+
+# Layout rows a REAL PE KERNEL performs, and which one.  THE DMA IS THE WRONG ENGINE FOR
+# THESE THREE: it moves whole TCDM lines at one line per cycle, and a line is
+# tcdm_width = cores * banking * 4 bytes (8 or 16 KiB), so a descriptor whose innermost run
+# is one 2-byte element spends a line-cycle to move two bytes.  Costed that way row 13
+# alone is 69,888 cycles a lane against stage 2's ~50,000 of compute.  The cores address
+# the TCDM by word and there are hundreds of them, so the same permutation is a few dozen
+# iterations each -- see LAYOUT_CYCLES_PER_ELEM and _layout_shape.
 #
-# All seven rows carry 0 FLOPs, so nothing leaves the latency totals with them.
-DROPPED_ROWS = (2, 11, 12, 13, 17, 18, 33)
+#   row 2    patchify        [Nf, Nt, C] -> [tokens, Nh*Nw].  The channel axis is
+#                            interleaved in the grid and part of the token index in the
+#                            output, so every run a descriptor could make is one element.
+#   row 13   transpose K     THE ROW AND THE KERNEL ARE NOT THE SAME PERMUTATION, and the
+#                            row is the smaller of the two.  The template writes row 13 as
+#                            [tokens, heads, d_head] -> [heads, tokens, d_head]: a regroup
+#                            of the HEAD axis, nothing transposed inside a head.  The
+#                            1 -> 2 descriptor already delivers that -- it lands each head's
+#                            K as its own contiguous [tokens, d_head] slab -- so the regroup
+#                            is free, like rows 11 and 12 beside it.
+#                            WHAT THE KERNEL DOES is the transpose row 14 needs and no
+#                            template row names: [tokens, d_head] -> [d_head, tokens], per
+#                            head, because row 14 contracts against K TRANSPOSED and the
+#                            template says so only in the row's title.  It is charged here
+#                            rather than dropped because it is the one that costs something:
+#                            a transposing descriptor walks 2-byte runs whichever axis it
+#                            strides, since the element is 2 bytes.
+#   row 33   merge patches   the inverse of row 2, on the way out.
+#
+# Every LAYOUT_KERNELS row must be in exactly one of DROPPED_ROWS or here; build_stages
+# refuses a template that leaves one in neither, so no layout row can quietly cost nothing.
+LAYOUT_LOWERING: Dict[int, str] = {2: 'patchify', 13: 'transpose', 33: 'unpatchify'}
 
 # Rows whose "weights" are indexed by TOKEN and so split with the tokens.  Row 6 adds the
 # positional-encoding table, one row per token, so a lane holding 546 tokens holds 546
@@ -275,9 +338,13 @@ STAGES: List[dict] = [
     # INSTEAD -- head h's Q slab is a 64 B run at a 768 B stride, one whole DMA line either
     # way (see _handoff_qkv).  Row 6's weights split with the tokens; see
     # SPLIT_WEIGHT_ROWS, which this partition is the first to make use of.
+    #
+    # ROW 2 IS ITS OWN PART, and so is every other kernel-lowered layout row: a part is a
+    # change of shape, and the patchify's shape is the resource grid, not the token stream
+    # the four rows after it share.
     dict(n_par=2,
          split='i_2 1092/2 tokens per lane; all 4 heads on both',
-         parts=[dict(rows=[5, 6, 9, 10])]),
+         parts=[dict(rows=[2]), dict(rows=[5, 6, 9, 10])]),
     # THE ATTENTION CORE, on 6 lanes = 2 head groups x 3 query slabs, so a lane owns TWO
     # HEADS and 364 of their 1092 queries.  Lane c owns head group c / 3 and query slab
     # c % 3.
@@ -288,23 +355,30 @@ STAGES: List[dict] = [
     # ONE loop, not a tiling nested inside a batch, and refuses the combination.  It does
     # not need the tiling either: a lane's score matrix is [364, 1092] written twice,
     # ~1.6 MiB against a 4 MiB TCDM.
+    #
+    # ROW 13 TAKES A PART OF ITS OWN, batched over the same 2 heads: pass h reads head h's
+    # K out of the landing zone and writes head h's K^T, so both are live when row 14 comes
+    # to contract against them.  It cannot share the attention rows' part -- only a part's
+    # LAST row's output walks with the loop, and row 13 is not it.
     dict(n_par=6,
          split='i_2 4/2 (2 heads) per lane, i_3 1092/3 queries per lane',
-         parts=[dict(rows=[14, 15, 16], head_groups=2)]),
+         parts=[dict(rows=[13], head_groups=2),
+                dict(rows=[14, 15, 16], head_groups=2)]),
     # THE FFN BLOCK AND THE OUTPUT PROJECTION, on TWO clusters holding 546 tokens each.
     # Every row here is row-wise over tokens, so any number of lanes divides it and the
     # width is a free choice; two is what keeps the ~310 MFLOP of GEMM from being the
     # pipeline's wall, which it is at one lane (0.183 ms against stage 2's 0.075).
     dict(n_par=2,
          split='i_2 1092/2 tokens per lane',
-         parts=[dict(rows=[19, 22, 23, 24, 25, 26, 27, 28, 30])]),
+         parts=[dict(rows=[19, 22, 23, 24, 25, 26, 27, 28, 30]),
+                dict(rows=[33])]),
 ]
 
 # WHAT THE SHAPE COSTS.  The cuts follow from the model; the widths do not.  Modelled ctt
 # periods for the shapes this script has been through:
 #
 #                                     clusters   ctt TensorPool   ctt Terapool   cluster-ms
-#   2 / 6 / 2, this one                  10       0.0863 ms        0.5262 ms        0.863
+#   2 / 6 / 2, this one                  10       0.0869 ms        0.5263 ms        0.869
 #   1 / 4 / 2, stage 3 doubled            7       0.1546           0.5944           1.082
 #   6 + 2, replicated front end           8       0.0896           0.5564           0.717
 #   8 + 2, replicated front end          10       0.0730           0.5079           0.730
@@ -326,46 +400,50 @@ STAGES: List[dict] = [
 # role, so the score matrix row 14 writes and the one row 15 reads are the same claim on
 # the same silicon.
 #
-#   STAGE 1 runs out of Y_BUF after its first row; only the patch tensor arrives from
+#   STAGE 1 runs out of Y_BUF after its first row; only the resource grid arrives from
 #   outside, so X_BUF holds that and nothing else:
 #
 #     row  A operand                       B operand              output
-#      5   X:PATCH (the LPDDR read)        W: embedding matrix    Y:EMB
+#      2   X:PATCH (the LPDDR read)        --                     Y:PATCHED  [546, 84]
+#      5   Y:PATCHED                       W: embedding matrix    Y:EMB
 #      6   the positional table, in W      --                     Y:EMB, in place
 #      9   Y:EMB                           --                     Y:RESIDUAL
 #     10   Y:RESIDUAL                      W: W_qkv, whole        Y:QKV  [546, 3*d_model]
 #
-#   STAGE 2 takes ALL THREE of its operands from the boundary, the one place here where
-#   operand B is neither a weight nor an earlier row's output.  Row 14's B is K, not K^T
-#   (see DROPPED_ROWS); the GEMM's shape is the same either way.
+#   STAGE 2 takes ALL THREE of its attention operands from the boundary, the one place here
+#   where operand B is neither a weight nor an earlier row's output.  Row 13 transposes the
+#   K that arrives, so row 14 really does contract against K^T:
 #
-#     14   X:QKV_Q                         X:QKV_K (as K^T)       Y:SCORES
+#     13   X:QKV_K                         --                     Y:QKV_KT  [d_head, tokens]
+#     14   X:QKV_Q                         Y:QKV_KT (K^T)         Y:SCORES
 #     15   Y:SCORES                        --                     Y:SCRATCH
 #     16   Y:SCRATCH                       X:QKV_V                Y:ATTNH
 #
 #   STAGE 3 takes the head-merged attention output into Y:FFN_RESID, because row 19's axpy
-#   computes Y += X; the residual arrives separately, off LPDDR, into X:RESIDUAL.
-BIND_X: Dict[int, str] = {9: 'Y:EMB', 10: 'Y:RESIDUAL',
+#   computes Y += X; the residual arrives separately, off LPDDR, into X:RESIDUAL.  Row 33
+#   folds the output projection back onto the resource grid the LPDDR write ships.
+BIND_X: Dict[int, str] = {2: 'X:PATCH', 5: 'Y:PATCHED', 9: 'Y:EMB', 10: 'Y:RESIDUAL',
+                          13: 'X:QKV_K',
                           14: 'X:QKV_Q', 15: 'Y:SCORES', 16: 'Y:SCRATCH',
-                          19: 'RESIDUAL', 22: 'Y:FFN_RESID', 28: 'Y:FFN_RESID'}
+                          19: 'RESIDUAL', 22: 'Y:FFN_RESID', 28: 'Y:FFN_RESID',
+                          33: 'Y:OUTPUT'}
 
 # Rows whose OUTPUT has to land in a named region rather than at the base of Y_BUF, because
 # something later in the STEP still has to read it -- a later row, a hand-off, or an LPDDR
 # write.  Everything unnamed writes the base and is scratch the next row overwrites.
 #
-# A LAYOUT ROW MAY ALSO CLAIM ONE (see _fp): a layout row is normally a VIEW, but one that
-# really does produce a second tensor needs somewhere to put it.  Nothing on this partition
-# is in that position -- every layout row here is dropped, row 13 included.
-BIND_Y: Dict[int, str] = {5: 'EMB', 6: 'EMB', 9: 'RESIDUAL', 10: 'QKV',
-                          14: 'SCORES', 16: 'ATTNH',
-                          19: 'FFN_RESID', 30: 'OUTPUT'}
+# THE THREE KERNEL-LOWERED LAYOUT ROWS ALL CLAIM ONE (see LAYOUT_LOWERING): a permutation
+# that runs is not a view, it writes a second tensor and that tensor needs somewhere to go.
+# The four rows a descriptor carries claim nothing, which is what makes them free.
+BIND_Y: Dict[int, str] = {2: 'PATCHED', 5: 'EMB', 6: 'EMB', 9: 'RESIDUAL', 10: 'QKV',
+                          13: 'QKV_KT', 14: 'SCORES', 16: 'ATTNH',
+                          19: 'FFN_RESID', 30: 'OUTPUT', 33: 'UNPATCHED'}
 
 # Rows whose operand B is not a weight, so _w_layout must not reserve room for it in W_BUF;
 # the value says where it lives instead.  Both of stage 2's attention matmuls are like
-# that and both name X_BUF: a lane's K and V arrive over the boundary from stage 1, so
-# they land in the inbound buffer and are contracted against where they lie.  A 'Y:'
-# prefix works too, for a lane that projected its own K and V.
-BIND_W: Dict[int, str] = {14: 'X:QKV_K', 16: 'X:QKV_V'}
+# that: row 16's V arrives over the boundary and is contracted against where it lands, and
+# row 14's K^T is what row 13 just wrote into Y_BUF.
+BIND_W: Dict[int, str] = {14: 'Y:QKV_KT', 16: 'X:QKV_V'}
 
 # The three buffers a bind value may name, and the one a bare value means for each table.
 _BIND_BUFS = ('X', 'W', 'Y')
@@ -446,6 +524,12 @@ class Cut:
     groups: int = 1           # lanes dividing the LEADING axis (the attention heads)
     tiles:  int = 1           # serial passes ONE lane takes over its own share
     heads:  int = 1           # the model's head count, from Geometry -- see hpl
+    # THE MODEL'S SHAPE, carried here so the shape and footprint of a row can be read
+    # WITHOUT the ragged i_*/o_* columns.  Only the three kernel-lowered layout rows need
+    # it: their dims are written token-major while the rest of the file is head-major, so
+    # the generic `lead = prod(ind[:-2])` reads row 13's [1, 1092, 4, 32] as 1092 batch
+    # elements.  Everything else still comes off the columns.  See _layout_shape.
+    geom:   Optional['Geometry'] = None
 
     @property
     def hpl(self) -> int:
@@ -535,7 +619,7 @@ class Stage:
         return self.din_ms + self.latency
 
 
-@dataclass
+@dataclass(frozen=True)
 class Geometry:
     """The model's shape, read from the template rather than hard-coded."""
     tokens:  int      # i_2 of the token stream (1092)
@@ -543,6 +627,23 @@ class Geometry:
     heads:   int      # 4
     d_head:  int      # 32
     patch:   int      # patch length, the token matrix's row (84)
+    # THE RESOURCE GRID BEHIND THE TOKENS, which row 2 patchifies and row 33 folds back.
+    # Needed because those two are real kernels now: a token is one (subcarrier block,
+    # symbol block, channel) triple and the kernel has to index the grid to find it.
+    nf:      int      # subcarriers (3276)
+    nt:      int      # symbols (14)
+    nh:      int      # subcarriers in one patch (12)
+    nw:      int      # symbols in one patch (7)
+    chan:    int      # channels, the interleaved last axis of the grid (2)
+
+    @property
+    def tok_per_block(self) -> int:
+        """Tokens one SUBCARRIER BLOCK produces: every symbol block, every channel.
+
+        The granule the token axis really comes in.  A lane whose token slab is not a
+        multiple of it straddles a subcarrier block -- see _check_patch_slab.
+        """
+        return (self.nt // self.nw) * self.chan
 
 
 @dataclass
@@ -779,7 +880,35 @@ def parse_layers(grid: List[List], cols: Dict[str, int],
     return layers
 
 
-def load_template(path: str) -> List[LayerRow]:
+def read_params(grid: List[List], first_row: int) -> Dict[str, int]:
+    """The trailing parameter block: `label, value` pairs in the first two columns.
+
+    The layer rows stop at find_data_end and everything below is this block -- PRBs, Nf,
+    Nh, Nw, d_model and the rest.  Most of it restates what the dims columns already say
+    and read_geometry prefers the rows for those, but THE PATCH SHAPE IS ONLY HERE: row 2
+    says [Nf, Nt, C] -> [tokens, Nh*Nw], which pins the PRODUCT Nh*Nw and nothing else, so
+    a 12 x 7 patch and a 6 x 14 one are the same row.  Row 2 is a real kernel now and the
+    kernel has to know which.
+
+    Labels are lowercased and stripped; a row whose second cell is not a number is skipped,
+    which passes over the prose in the header row's own comment column.
+    """
+    params: Dict[str, int] = {}
+    for r in range(first_row, len(grid)):
+        row = grid[r]
+        if len(row) < 2:
+            continue
+        label = _to_str(row[0]).strip().lower()
+        if not label or _is_blank(row[1]):
+            continue
+        try:
+            params[label] = _to_int(row[1])
+        except (TypeError, ValueError):
+            continue
+    return params
+
+
+def load_template(path: str) -> Tuple[List[LayerRow], Dict[str, int]]:
     grid       = read_grid(path)
     header_row = find_header_row(grid)
     cols       = build_column_map(grid[header_row])
@@ -787,6 +916,7 @@ def load_template(path: str) -> List[LayerRow]:
     data_end   = find_data_end(grid, cols, data_start)
     check_for_errors(grid, cols, data_start, data_end - 1)
     layers = parse_layers(grid, cols, data_start, data_end - 1)
+    params = read_params(grid, data_end)
     if not layers:
         raise ValueError("No data rows found below the header row")
     # The template fills the block name and N_repetitions only on the row that OPENS a
@@ -798,40 +928,62 @@ def load_template(path: str) -> List[LayerRow]:
         if r.block:
             block, n_rep = r.block, r.n_rep
         r.block, r.n_rep = block, n_rep
-    return layers
+    return layers, params
 
 
 # ---------------------------------------------------------------------------
 # Model geometry
 # ---------------------------------------------------------------------------
 
-def read_geometry(layers: List[LayerRow]) -> Geometry:
+def read_geometry(layers: List[LayerRow], params: Dict[str, int]) -> Geometry:
     """Read the model's shape off the rows the partition already names.
 
     Nothing here is a constant of this script: the hand-off descriptors, the lane maps and
-    the buffer layouts all follow from these five numbers, so a different PRB count is a
+    the buffer layouts all follow from these numbers, so a different PRB count is a
     different CSV.  Row 10 gives the token count and d_model, row 14 the head count and
-    d_head, row 5 the patch length.
+    d_head, row 5 the patch length, row 2 the resource grid the patches come from.
+
+    ONLY THE PATCH SHAPE COMES OUT OF THE PARAMETER BLOCK, and only because the rows cannot
+    give it: row 2's dims pin Nh*Nw and not Nh, and row 2 is a kernel now.  Everything the
+    rows do say is read from them and cross-checked against the block.
     """
     by_row = {r.excel_row: r for r in layers}
     qkv    = by_row.get(10)
     scores = by_row.get(14)
     front  = by_row.get(5)
-    if not (qkv and scores and front):
-        missing = [n for n, r in ((10, qkv), (14, scores), (5, front)) if not r]
+    patch  = by_row.get(2)
+    if not (qkv and scores and front and patch):
+        missing = [n for n, r in ((2, patch), (5, front), (10, qkv), (14, scores)) if not r]
         raise ValueError(
-            f'template is missing row(s) {missing}; the geometry is read from row 5 (the '
-            f'first dense), row 10 (the QKV projection) and row 14 (Q*K^T)')
-    if not (qkv.in_dims and scores.in_dims and front.in_dims):
+            f'template is missing row(s) {missing}; the geometry is read from row 2 (the '
+            f'patchify), row 5 (the first dense), row 10 (the QKV projection) and row 14 '
+            f'(Q*K^T)')
+    if not (qkv.in_dims and scores.in_dims and front.in_dims and patch.in_dims):
         raise ValueError(
             'the template has no i_*/o_* tensor-shape columns; they are needed to derive '
             'the hand-off descriptors, so this partition cannot be built without them')
+    if len(patch.in_dims) < 3:
+        raise ValueError(
+            f"row 2 ('{patch.op}') has dims {patch.in_dims}; the patchify kernel needs the "
+            f'full [Nf, Nt, C] resource grid, so three of them at least')
+    missing = [k for k in ('nh', 'nw') if k not in params]
+    if missing:
+        raise ValueError(
+            f'the template\'s parameter block does not give {missing}; row 2 pins only the '
+            f'PRODUCT Nh*Nw, so the patch shape has to be stated there (one `Nh, 12` and '
+            f'one `Nw, 7` row under the layer table)')
 
+    nf, nt, chan = patch.in_dims[-3:]
     g = Geometry(tokens  = qkv.in_dims[-2],
                  d_model = qkv.in_dims[-1],
                  heads   = scores.in_dims[1],
                  d_head  = scores.in_dims[-1],
-                 patch   = front.in_dims[-1])
+                 patch   = front.in_dims[-1],
+                 nf      = nf,
+                 nt      = nt,
+                 nh      = params['nh'],
+                 nw      = params['nw'],
+                 chan    = chan)
     if g.heads * g.d_head != g.d_model:
         raise ValueError(
             f'row 14 says {g.heads} heads x {g.d_head} d_head = {g.heads * g.d_head}, but '
@@ -840,7 +992,58 @@ def read_geometry(layers: List[LayerRow]) -> Geometry:
         raise ValueError(
             f"row 10 ('{qkv.op}') projects to {qkv.out_dims[-1]}, not 3 x d_model = "
             f'{3 * g.d_model}; the 1 -> 2 hand-off reads Q, K and V out of that one output')
+    # The patch shape has to reproduce BOTH of row 2's ends, or the kernel indexes a grid
+    # the template is not describing.
+    if g.nh * g.nw != g.patch:
+        raise ValueError(
+            f'the parameter block says Nh x Nw = {g.nh} x {g.nw} = {g.nh * g.nw}, but row 5 '
+            f'reads a patch of {g.patch} elements')
+    if g.nf % g.nh or g.nt % g.nw:
+        raise ValueError(
+            f'the {g.nf} x {g.nt} resource grid does not divide into {g.nh} x {g.nw} '
+            f'patches; row 2 cuts it with no remainder')
+    made = (g.nf // g.nh) * (g.nt // g.nw) * g.chan
+    if made != g.tokens:
+        raise ValueError(
+            f'row 2 makes {made} tokens out of a {g.nf} x {g.nt} x {g.chan} grid in '
+            f'{g.nh} x {g.nw} patches, but row 10 runs on {g.tokens}')
     return g
+
+
+def _patch_slab(geom: Geometry, n_par: int, lane: int) -> Tuple[int, int, int, int]:
+    """(first token, tokens, first subcarrier, subcarriers) one lane of an n_par stage has.
+
+    THE TOKEN SPLIT NEED NOT RESPECT THE GRID, and on this partition it does not: a
+    subcarrier block makes tok_per_block = (Nt/Nw) * C tokens -- four here -- and 1092
+    tokens over 2 lanes is 546 each, which is not a multiple of four.  So lane 0's tokens
+    end halfway through subcarrier block 136 and lane 1's start there, and the two lanes'
+    SLABS OF THE GRID OVERLAP BY ONE BLOCK.
+
+    That is a premise about the off-chip layout, not a conflict.  Each lane reads and
+    writes its OWN LPDDR node (LPDDR_LEGS gives the PATCH and OUTPUT legs node='column'),
+    so the shared block is simply held twice, and on the way out each node carries the half
+    of it that lane computed.  Whoever writes the grid to DRAM writes each south node the
+    slab this returns; whoever reads the north nodes back takes each one's own tokens.
+
+    Returned per lane rather than as one number because the straddle is not symmetric in
+    general -- only the width and the block size decide it, and both are read here.
+    """
+    n_tok = geom.tokens // n_par
+    tok0  = lane * n_tok
+    blk   = geom.tok_per_block
+    fb0   = tok0 // blk
+    fb1   = (tok0 + n_tok - 1) // blk          # inclusive: the last block it touches
+    return tok0, n_tok, fb0 * geom.nh, (fb1 - fb0 + 1) * geom.nh
+
+
+def _patch_slab_elems(geom: Geometry, n_par: int) -> int:
+    """Elements of the grid the WORST-OFF lane of an n_par stage holds.
+
+    One number, because the PATCH and OUTPUT regions are declared once for every lane of
+    the stage and _leg_piece_bytes wants a single piece size.  The max bounds every lane;
+    _check_patch_slab proves no lane needs more.
+    """
+    return max(_patch_slab(geom, n_par, p)[3] for p in range(n_par)) * geom.nt * geom.chan
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +1077,7 @@ def build_stages(layers: List[LayerRow], geom: Geometry) -> List[Stage]:
         at = 0
         for j, pspec in enumerate(spec['parts']):
             cut  = Cut(n_par=spec['n_par'], groups=pspec.get('head_groups', 1),
-                       tiles=pspec.get('tiles', 1), heads=geom.heads)
+                       tiles=pspec.get('tiles', 1), heads=geom.heads, geom=geom)
             part = Part(cut=cut, lo=at)
             for rn in pspec['rows']:
                 if rn not in by_row:
@@ -909,8 +1112,25 @@ def build_stages(layers: List[LayerRow], geom: Geometry) -> List[Stage]:
             + '\n'.join(problems)
             + f'\nDROPPED_ROWS = {list(DROPPED_ROWS)} must be placed 0 times.')
 
+    # EVERY LAYOUT ROW IS ACCOUNTED FOR SOMEWHERE.  A layout row carries 0 FLOPs, so one
+    # that is neither ridden by a descriptor nor lowered to a kernel would be placed,
+    # costed at nothing and emitted as nothing -- the model would report a network it is
+    # not running.  Naming both tables makes that a stop rather than a silent omission.
+    stranded = [r for r in layers if r.kernel.lower() in LAYOUT_KERNELS
+                and r.excel_row not in DROPPED_ROWS
+                and r.excel_row not in LAYOUT_LOWERING]
+    both = sorted(set(DROPPED_ROWS) & set(LAYOUT_LOWERING))
+    if stranded or both:
+        raise ValueError(
+            'every layout row must be in exactly one of DROPPED_ROWS (a descriptor carries '
+            'it) or LAYOUT_LOWERING (a PE kernel runs it):\n'
+            + ''.join(f'  row {r.excel_row} ({r.kernel} {r.op[:40]!r}) is in neither\n'
+                      for r in stranded)
+            + ''.join(f'  row {rn} is in both\n' for rn in both))
+
     # The lane arithmetic every hand-off descriptor and every LPDDR leg is derived from.
     _check_lane_geometry(stages, geom)
+    _check_patch_slab(stages, geom)
     _check_handoff_sizing(stages, geom)
     _check_alignment(stages, geom)
     return stages
@@ -1001,6 +1221,33 @@ def _check_lane_geometry(stages: List[Stage], geom: Geometry) -> None:
         raise ValueError(
             f'the partition occupies {occupied} cids (widths plus padding), more than the '
             f'{GRID_X} x {GRID_Y} grid provides')
+
+
+def _grid_stages(stages: List[Stage]) -> List[Stage]:
+    """The stages that run a patchify kernel, so touch the RESOURCE GRID and not tokens."""
+    grid = {rn for rn, how in LAYOUT_LOWERING.items() if how in ('patchify', 'unpatchify')}
+    return [st for st in stages
+            if grid & {it.row.excel_row for it in st.items}]
+
+
+def _check_patch_slab(stages: List[Stage], geom: Geometry) -> None:
+    """Hold the grid regions to the slab every lane of the two grid stages really walks.
+
+    The patchify kernels index the grid RELATIVE TO THEIR OWN SLAB (`f0` in _patch_slab),
+    so a region sized to the tokens alone would be short by the straddling block and the
+    last lane would read past the end of X_BUF -- silently, because nothing else in the
+    file knows the grid's shape.  This is the only place that arithmetic is checked.
+    """
+    for i, st in enumerate(_grid_stages(stages)):
+        have = _patch_slab_elems(geom, st.n_par)
+        for p in range(st.n_par):
+            tok0, n_tok, f0, n_f = _patch_slab(geom, st.n_par, p)
+            need = n_f * geom.nt * geom.chan
+            if need > have:
+                raise ValueError(
+                    f'stage {st.idx + 1} lane {p} holds tokens {tok0}..{tok0 + n_tok - 1}, '
+                    f'which span subcarriers {f0}..{f0 + n_f - 1} = {need} grid elements, '
+                    f'more than the {have} the region declares')
 
 
 def _slots_needed(w: int, r: int, mode: str) -> int:
@@ -1428,14 +1675,7 @@ def _fp(st: Stage, k: int, pool: Optional[str]) -> Tuple[int, int, int]:
     count, head grouping and tile count are decided.
     """
     it = st.items[k]
-    x, w, y = _row_footprint(it.row, st.cut_for(k), pool)
-    if not y and it.row.excel_row in BIND_Y:
-        # A PLACED LAYOUT ROW THAT LEAVES SOMETHING BEHIND.  A layout row is normally a
-        # view and claims nothing; row 13 is the exception, because row 14 contracts
-        # against K^T and K^T has to exist somewhere.  Its out_dims describe ONE of the
-        # three tensors the template row transposes, which is exactly the one wanted here.
-        y = max(1, _prod(it.row.out_dims) // max(1, st.cut_for(k).groups))
-    return x, w, y
+    return _row_footprint(it.row, st.cut_for(k), pool)
 
 
 def _sh(st: Stage, k: int) -> dict:
@@ -1528,7 +1768,11 @@ def _x_regions(stages: List[Stage], geom: Geometry, i: int) -> List[Region]:
     previous stage's hand-off -- so this table and the descriptor builders have to agree,
     and _check_handoff_sizing holds them to it.
 
-      stage 1  PATCH        this lane's token slab of the model input, off the south edge
+      stage 1  PATCH        this lane's slab of the RESOURCE GRID, off the south edge --
+                            [Nf_slab, Nt, C], not the token matrix.  Row 2 patchifies it
+                            into Y:PATCHED, so the grid is what crosses the wire and the
+                            slab is sized by _patch_slab, which may straddle a subcarrier
+                            block and hold one more than the tokens strictly need.
       stage 2  QKV_Q/K/V    this lane's head group's three slabs, from the 1 -> 2 boundary
       stage 3  RESIDUAL     this lane's token slab of row 9's output, read back off the
                             south edge two steps after stage 1 wrote it
@@ -1544,7 +1788,7 @@ def _x_regions(stages: List[Stage], geom: Geometry, i: int) -> List[Region]:
     st  = stages[i]
     cut = st.parts[-1].cut
     if i == 0:
-        return _place([('PATCH', (geom.tokens // cut.q_split) * geom.patch)])
+        return _place([('PATCH', _patch_slab_elems(geom, st.n_par))])
     if i == 1:
         tq = geom.tokens // cut.q_split
         return _place([('QKV_Q', tq * geom.d_head * cut.hpl),
@@ -1669,10 +1913,13 @@ class Leg:
 # Which stage moves what off-chip.  FOUR legs, and one of them is the price of this
 # partition:
 #
-#   stage 1  PATCH     in   the model input, off the south edge.  Row 2 (patchify) rides it.
+#   stage 1  PATCH     in   the model input, off the south edge -- the RESOURCE GRID as it
+#                          lies, [Nf_slab, Nt, C].  Row 2 patchifies it on the cores after
+#                          it lands, so this leg is a plain contiguous read and is one.
 #   stage 1  RESIDUAL  out  row 9's output, spilled ...
 #   stage 3  RESIDUAL  in   ... and read back here, two steps later, for row 19.
-#   stage 3  OUTPUT    out  the channel estimate, north.  Row 33 (merge patches) rides it.
+#   stage 3  OUTPUT    out  the channel estimate, north, back on the grid: row 33 folds it
+#                          into Y:UNPATCHED and this leg ships that.
 #
 # THE RESIDUAL SPILLS BECAUSE IT SKIPS A STAGE: row 9 is on stage 1 and row 19 on stage 3,
 # so no boundary can carry it.  The FFN residual is not like that: row 19 -> row 28 never
@@ -1697,7 +1944,7 @@ LPDDR_LEGS: Dict[int, List[Leg]] = {
             node='share', shares=2, slots=4)],
     2: [Leg('RESIDUAL', LPDDR_IN_EDGE,  'RESIDUAL', 'in',
             node='share', shares=2, slots=4),
-        Leg('OUTPUT',   LPDDR_OUT_EDGE, 'OUTPUT',   'out')],
+        Leg('OUTPUT',   LPDDR_OUT_EDGE, 'UNPATCHED', 'out')],
 }
 
 
@@ -1851,14 +2098,50 @@ def _row_shape(row: LayerRow, cut: Cut) -> dict:
         return {'cls': 'add', 'len': _pad(max(1, _prod(ind) // (div * batch)), 8),
                 'batch': batch}
     if k in LAYOUT_KERNELS:
-        # A wait, not a kernel: no permutation kernel exists in software/kernels/baremetal.
-        # BATCH IS FORCED TO 1 whatever the leading axis says -- the spin stands for one
-        # pass over the row's whole destination, and a row like the head merge reads every
-        # head at once, so it must not sit inside a per-head loop.
-        return {'cls': 'wait', 'batch': 1,
-                'why': 'layout op: PE index permutation'}
+        return _layout_shape(row, cut)
     raise ValueError(f"row {row.excel_row} ('{row.op}'): no kernel is mapped to "
                      f"'{row.kernel}'.")
+
+
+def _layout_shape(row: LayerRow, cut: Cut) -> dict:
+    """Per-cluster shape of a layout row that a PE KERNEL runs -- see LAYOUT_LOWERING.
+
+    READ OFF THE GEOMETRY, NOT OFF THE DIMS COLUMNS, and that is not a shortcut: these
+    three rows are written TOKEN-MAJOR in the template while every other shape rule here
+    assumes head-major, so `lead = prod(ind[:-2])` reads row 13's [1, 1092, 4, 32] as 1092
+    batch elements rather than 4 heads.  The hand-off descriptors are built from the
+    geometry for exactly the same reason (see _handoff_consts).
+
+    A row a DESCRIPTOR carries never reaches here: it is in DROPPED_ROWS and build_stages
+    refuses to place it.
+    """
+    how = LAYOUT_LOWERING.get(row.excel_row)
+    g   = cut.geom
+    if how is None:
+        raise ValueError(
+            f"row {row.excel_row} ('{row.op}') is a layout row that is neither in "
+            f'DROPPED_ROWS nor in LAYOUT_LOWERING, so nothing performs it')
+    if g is None:
+        raise ValueError(
+            f'row {row.excel_row} is lowered to a {how} kernel, whose shape comes from the '
+            f'model geometry; the cut carries none (build_stages sets it)')
+
+    if how == 'transpose':
+        # ONE HEAD PER PASS: each head has its own K, so the two a lane owns are a batch
+        # loop, exactly like the attention GEMMs they feed.  rows/cols are what the kernel
+        # is called with, and `elems` is what the cost model charges.
+        return {'cls': 'transpose', 'rows': g.tokens, 'cols': g.d_head,
+                'batch': cut.hpl, 'elems': g.tokens * g.d_head,
+                'why': f'K [{g.tokens}, {g.d_head}] -> K^T per head'}
+    # patchify / unpatchify.  Both walk the same slab and both are cut by TOKEN, so the
+    # shape is the lane's token count and the grid it indexes; `f0` and `tok0` are per-lane
+    # and are emitted at the call site, not here.
+    n_tok = g.tokens // max(1, cut.q_split * cut.tiles)
+    return {'cls': how, 'n_tok': n_tok, 'batch': 1,
+            'elems': n_tok * g.patch,
+            'slab': _patch_slab_elems(g, cut.n_par),
+            'why': (f'[{g.nf}, {g.nt}, {g.chan}] grid <-> [{g.tokens}, {g.patch}] tokens, '
+                    f'{g.nh} x {g.nw} patches')}
 
 
 def _gemm_rows(M: int, pool: Optional[str]) -> int:
@@ -1896,12 +2179,15 @@ def _row_footprint(row: LayerRow, cut: Cut,
         if row.excel_row in SPLIT_WEIGHT_ROWS:
             return 0, s['len'], s['len']
         return s['len'], 0, s['len']
-    if c == 'wait':
-        # A layout row is a VIEW, not a copy: it permutes indices into a tensor that is
-        # already resident and produces no second one, so it claims no buffer space.  The
-        # ONE exception -- row 13, which really does write K transposed -- is handled in
-        # _fp, where the row's BIND_Y entry says so.
-        return 0, 0, 0
+    # A PERMUTATION THAT RUNS IS NOT A VIEW.  Each of these reads one tensor and writes a
+    # second one, so both ends are charged; only the rows a DESCRIPTOR carries are free,
+    # and those never get this far (DROPPED_ROWS, enforced in build_stages).
+    if c == 'transpose':
+        return s['elems'], 0, s['elems']            # K in, K^T out, one head per pass
+    if c == 'patchify':
+        return s['slab'], 0, s['elems']             # grid slab in, token rows out
+    if c == 'unpatchify':
+        return s['elems'], 0, s['slab']             # token rows in, grid slab out
     return 0, 0, 0
 
 
@@ -1965,24 +2251,55 @@ def _is_layout(row: LayerRow) -> bool:
     return row.kernel.lower() in LAYOUT_KERNELS
 
 
-def _layout_latency(row: LayerRow, lanes: float, rate_pe: float,
-                    cycles_per_ms: float) -> float:
+def _layout_latency(shape: dict, cores: int, cycles_per_ms: float) -> float:
     """Modelled latency [ms] of ONE cluster's share of a zero-FLOP layout row.
 
-    The same fit celere_pipeline.py uses: a permutation costs one pass over what it
-    WRITES, at PE_LAYOUT_FLOPS_PER_ELEM per element, plus a fixed per-invocation entry
-    cost.  The destination count comes from the template's Data_out column rather than
-    from out_dims, because a row may carry several tensors at once and only the byte
-    column knows how many.  `lanes` is the part's lanes_eff.  Rows folded into this one
-    are NOT added: one pass over the same addresses, so one wait covers both.
+    A KERNEL COST, NOT A FLOPs FIT.  The row runs on the cores as a strided gather: every
+    element it writes is one load and one store with no arithmetic between them, the work
+    divides over the cluster's cores, and there is nothing else to charge -- which is why
+    this takes a CORE COUNT and not a FLOPs rate.  `shape['elems']` is what one pass
+    writes, already cut to a lane.
+
+    THE RATE IS PER KERNEL, because the two do not cost the same: the transpose amortises
+    its loop over an 8-element unroll and the patchify cannot amortise over more than a
+    patch row.  `shape['cls']` is the lowering, so it is also the key -- see
+    LAYOUT_CYCLES_PER_ELEM.
+
+    A pass is a HEAD on row 13 and the whole row elsewhere; the batch loop multiplies it at
+    the call site, the same way it does for a GEMM.
     """
-    elems = row.dout_bytes / BYTES_PER_ELEM / max(1e-9, lanes)
-    return (PE_LAYOUT_FIXED_CYCLES / cycles_per_ms
-            + elems * PE_LAYOUT_FLOPS_PER_ELEM / rate_pe)
+    rate = LAYOUT_CYCLES_PER_ELEM.get(shape['cls'])
+    if rate is None:
+        raise ValueError(
+            f"no cycles-per-element figure for layout kernel {shape['cls']!r}; "
+            f'LAYOUT_CYCLES_PER_ELEM needs one per LAYOUT_LOWERING value')
+    per_core = shape['elems'] / max(1, cores)
+    return per_core * rate / cycles_per_ms
 
 
-def compute(layers: List[LayerRow], cfg: dict) -> Results:
-    """Cost the model and the partition."""
+def _pool_cores(cfg: dict, pool: str) -> int:
+    """Cores one cluster of this pool has -- num_core_per_cluster of its arch config.
+
+    Only the layout kernels need it: every other row is charged against a FLOPs peak, which
+    already has the core count folded into it.  A permutation has no FLOPs to be charged
+    against, so the width of the cluster is the rate.
+    """
+    cores = cfg.get('cores', {}).get(pool)
+    if not cores:
+        raise ValueError(
+            f'config gives no "cores" for pool {pool!r}; the layout kernels '
+            f'({", ".join(sorted(set(LAYOUT_LOWERING.values())))}) are charged per core, '
+            f'so each pool needs its num_core_per_cluster (see '
+            f'software/runtime/multi_cluster/configs/arch_*.py)')
+    return int(cores)
+
+
+def compute(layers: List[LayerRow], cfg: dict, params: Dict[str, int]) -> Results:
+    """Cost the model and the partition.
+
+    `params` is the template's trailing parameter block; read_geometry takes the patch
+    shape out of it, which the dims columns cannot give.
+    """
     pe_util = cfg['PE_utilization']
     te_util = cfg['TE_utilization']
     pools   = list(cfg['PE_peak'].keys())
@@ -1998,7 +2315,7 @@ def compute(layers: List[LayerRow], cfg: dict) -> Results:
             f'{", ".join(str(s["n_par"]) for s in STAGES)} clusters).  Remove them from '
             f'the config; change STAGES instead.')
 
-    geom = read_geometry(layers)
+    geom = read_geometry(layers, params)
     res.geom = geom
 
     # FLOPs/ms.  Each peak is derated by the utilization of the engine that actually runs
@@ -2035,24 +2352,30 @@ def compute(layers: List[LayerRow], cfg: dict) -> Results:
         res.total_latency[p] = total
 
     bw = Bandwidths(c2c=cfg.get('bandwidth_c2c_gbs'), lpddr=_lpddr_bw(cfg))
-    # The layout fit is quoted partly in CYCLES (a fixed per-invocation entry cost), so the
-    # cost model needs the clock the emitter already reads from the config.
+    # The layout kernels are costed in CYCLES per element per core, so the cost model needs
+    # the clock the emitter already reads from the config.
     cycles_per_ms = cfg.get('frequency', 1_000_000_000) / 1e3
 
     for p in pools:
-        stages  = build_stages(layers, geom)
-        rate_ng = res.flops_per_ms[p]['non_GEMM']
+        stages = build_stages(layers, geom)
+        cores  = _pool_cores(cfg, p)
         for st in stages:
             items = st.items
             for k, it in enumerate(items):
                 # A row is divided over the lanes of ITS PART of the stage, which need not
                 # be all of them and need not be a whole number: the projection is spread
                 # 4.8 ways and the front end 1 way.  See Cut.lanes_eff.
-                lanes = st.cut_for(k).lanes_eff
+                cut   = st.cut_for(k)
+                lanes = cut.lanes_eff
                 if _is_layout(it.row):
                     # A layout row carries 0 FLOPs, so the template can say nothing about
-                    # what it costs; the PE fit does.  See _layout_latency.
-                    it.ms = _layout_latency(it.row, lanes, rate_ng, cycles_per_ms)
+                    # what it costs.  Its SHAPE does: the kernel is one pass over what it
+                    # writes, spread over the cluster's cores.  The shape is already cut to
+                    # a lane, so `lanes` does not divide it again -- but the batch does
+                    # multiply it, once per head, exactly as the emitted loop runs it.
+                    shape = _row_shape(it.row, cut)
+                    it.ms = (_layout_latency(shape, cores, cycles_per_ms)
+                             * shape.get('batch', 1))
                     continue
                 # The FLOPs column carries the row's whole work; a lane does its share.
                 it.ms = res.row_latencies[p][it.row.excel_row] / lanes
@@ -2197,7 +2520,7 @@ def _print_stage_table(pool: str, stages: List[Stage], geom: Geometry,
             print('  ' + '-' * 78)
             print(f'  {"":4}work / lane = 1/{cut.lanes_eff:g} of the row{heads}{tiles}')
             for it in part.items:
-                tag = (' WAIT' if _is_layout(it.row) else
+                tag = (' PERM' if _is_layout(it.row) else
                        ' GEMM' if it.row.is_gemm else '     ')
                 print(f'  {"":4}{it.row.block[:16]:<16}{it.row.excel_row:<6}'
                       f'{it.row.op[:26]:<26}{tag}  {it.ms:>16.6g}')
@@ -2261,25 +2584,25 @@ def print_results(layers: List[LayerRow], res: Results,
     for r in layers:
         block = r.block or block
         # A layout row costs nothing HERE whatever it costs on a stage: this table is the
-        # model's own structure, and the PE layout fit is per lane, so its figure only
-        # exists once the partition does.  Two outcomes, and the tag says which:
+        # model's own structure, and the layout kernel's cost is per lane, so its figure
+        # only exists once the partition does.  Two outcomes, and the tag says which:
         #   DMA   -- a transfer carries it (DROPPED_ROWS)
-        #   WAIT  -- it runs as a mempool_wait; see the per-stage table below
+        #   PERM  -- a PE permutation kernel runs it; see the per-stage table below
         if r.excel_row in DROPPED_ROWS:
             tag = 'DMA '
         elif _is_layout(r):
-            tag = 'WAIT'
+            tag = 'PERM'
         else:
             tag = 'GEMM' if r.is_gemm else '   .'
         vals = ''.join(f'{res.row_latencies[p][r.excel_row]:>16.6g}'
-                       if tag not in ('DMA ', 'WAIT') else f'{"--":>16}'
+                       if tag not in ('DMA ', 'PERM') else f'{"--":>16}'
                        for p in pools)
         print(f'{r.excel_row:<5}{block:<16}{r.op[:20]:<20}{tag:<5}{vals}')
     print('-' * len(header))
     totals = ''.join(f'{res.total_latency[p]:>16.6g}' for p in pools)
     print(f'{"":<5}{"":<16}{"Tot min latency":<25}{totals}')
-    print(f'{"":<5}(DMA rides a transfer; WAIT is a mempool_wait sized per lane -- its')
-    print(f'{"":<5} cost is in the stage table below)')
+    print(f'{"":<5}(DMA rides a transfer; PERM is a real permutation kernel costed per')
+    print(f'{"":<5} lane and per core -- its cost is in the stage table below)')
 
     if res.stages:
         print()
@@ -2311,6 +2634,8 @@ _KERNEL_INCLUDES = [
     'baremetal/mempool_gelu_f16.h',
     'baremetal/mempool_relu_f16.h',
     'baremetal/mempool_axpy_f16.h',
+    'baremetal/mempool_transpose_f16.h',
+    'baremetal/mempool_patchify_f16.h',
 ]
 
 
@@ -2323,6 +2648,40 @@ def _render_includes(wait: bool) -> List[str]:
     if not wait:
         L += [f'#include "{h}"' for h in _KERNEL_INCLUDES]
     return L
+
+
+def _render_stack_note(stages: List[Stage]) -> List[str]:
+    """The NO_INLINE macro, and why the app has to care about its stack.
+
+    A CORE'S STACK IS {PE_STACK_B} BYTES AND THAT IS THE WHOLE BUDGET.  _reset_vector hands
+    core k of a tile sp = base + (k + 1) * STACK_SIZE - 4 and writes sp - (STACK_SIZE - 4)
+    into the stacklimit CSR, so four of the bytes are gone before main() starts.  Nothing in
+    the toolchain checks the depth, and the overrun is a store below __stack_start -- on
+    hart 0 that is an access to 0xFFFFFFFC.
+    """
+    n = len(stages)
+    return [
+        '/* NO_INLINE: give this function ITS OWN STACK FRAME.',
+        ' *',
+        f' * A core gets STACK_SIZE bytes of stack ({PE_STACK_B} on both pools; see',
+        ' * config/*.mk) and _reset_vector leaves STACK_SIZE - 4 of them usable -- it starts',
+        ' * sp four bytes down and writes that limit into the stacklimit CSR.  Nothing in the',
+        ' * toolchain checks the depth against it.',
+        ' *',
+        f' * INLINED, THE {n} STAGE BODIES SHARE ONE FRAME IN main(), and it is sized by the',
+        ' * SUM of their spills rather than the largest of them -- main() was 432 B in this',
+        ' * app, so main -> softmax_parallel_2x4_f16vec (80 B) needed 512 of the 508 and',
+        ' * stored past the bottom of the stack.  A stage of its own frame bounds the depth',
+        ' * at main + ONE stage + ONE kernel instead.',
+        ' *',
+        ' * ONLY THE FUNCTIONS THAT SPILL ARE MARKED.  The leaf wrappers below (dma_2d and',
+        ' * friends) marshal a few values into argument registers and call straight into',
+        ' * flex_dma_pattern.h, whose entry points carry no frame at all; un-inlining one of',
+        ' * those would move no spill out of its caller and would only add a frame to the',
+        ' * transfer chain.  noinline pays where several large bodies are folded into one',
+        ' * frame, and nowhere else. */',
+        '#define NO_INLINE __attribute__((noinline))',
+    ]
 
 
 def _render_dma_helper(bench: bool, blocking: bool = True) -> str:
@@ -2436,16 +2795,19 @@ def _render_stage_tables(stages: List[Stage], geom: Geometry,
     A(' * literal, so a change of width in the generator\'s STAGES table is a change of one')
     A(' * number here and no edit at all to the code that reads them.')
     A(' *')
-    A(' * BETWEEN THEM THE TWO BOUNDARIES PERFORM FIVE OF THE MODEL\'S LAYOUT ROWS, and the')
-    A(' * two LPDDR legs perform the other two, so none is left to run on the PE path.')
-    A(' * Rows 11 and 12 are the 1 -> 2 boundary picking a head\'s column stripe out of the')
-    A(' * projection; rows 17 and 18 are the 2 -> 3 boundary\'s DESTINATION STRIDE -- one')
-    A(' * DH_B run per token at column h*DH_B of a DM_B-wide row IS the transpose back to')
-    A(' * token-major and the reshape that folds the head axis into the feature one.  Row')
-    A(' * 13 (transpose K) is ASSUMED onto the 1 -> 2 boundary and is the one optimism')
-    A(' * here: the K descriptor below is a plain contiguous slab and does NOT transpose.')
-    A(' * The GEMM shapes are unaffected, so the cycle counts are right; only a numerical')
-    A(' * result would be wrong, and this app checks none. */')
+    A(' * BETWEEN THEM THE TWO BOUNDARIES PERFORM FOUR OF THE MODEL\'S LAYOUT ROWS, and')
+    A(' * they perform them for free.  Rows 11 and 12 are the 1 -> 2 boundary picking a')
+    A(' * head\'s column stripe out of the projection; rows 17 and 18 are the 2 -> 3')
+    A(' * boundary\'s DESTINATION STRIDE -- one DH_B run per token at column h*DH_B of a')
+    A(' * DM_B-wide row IS the transpose back to token-major and the reshape that folds')
+    A(' * the head axis into the feature one.  EVERY RUN IS DH_B, one whole 64 B line, so')
+    A(' * the strided descriptor costs no more than a contiguous copy would.')
+    A(' *')
+    A(' * THE OTHER THREE LAYOUT ROWS RUN ON THE CORES, not here: rows 2 and 33 patchify')
+    A(' * and unpatchify the resource grid, and row 13 transposes K for the attention.')
+    A(' * None of the three has a run longer than one 2-byte element, and the DMA is')
+    A(' * priced per RUN -- one line-cycle each -- so a descriptor would pay a whole TCDM')
+    A(' * line to move two bytes.  See LAYOUT_LOWERING in the generator. */')
     for title, defines in _handoff_consts(stages, geom):
         A(f'/* {title} */')
         for name, val, note in defines:
@@ -2586,12 +2948,11 @@ def _render_push_helper(cwt: bool = False) -> str:
         ' * producer at 2 x 6 lanes.  Both ranges are intersected rather than assumed to',
         ' * line up, so nothing here knows either stage\'s width.',
         ' *',
-        ' * ROW 13 (transpose K) IS ASSUMED ONTO THIS TRANSFER AND IS NOT PERFORMED.  Row 14',
-        ' * contracts against K^T; what arrives is K.  A descriptor that really transposed',
-        ' * it would walk 2-byte runs against a 64 B line, so it is not written.  Nothing',
-        ' * about the CYCLES depends on it -- row 14\'s GEMM is issued at the same M, N and',
-        ' * P -- and this app checks no result. */',
-        'static inline void push_qkv(uint32_t lane, uint32_t x_base, uint64_t src'
+        ' * WHAT ARRIVES IS K, NOT K^T, AND THAT IS DELIBERATE.  Row 14 contracts against',
+        ' * K^T, but a descriptor that transposed on the way would walk 2-byte runs and pay',
+        ' * a whole TCDM line-cycle for each one.  Row 13 does it on the cores instead,',
+        ' * once K has landed -- see transpose_f16p in compute_stage_2(). */',
+        'static NO_INLINE void push_qkv(uint32_t lane, uint32_t x_base, uint64_t src'
         + (', uint32_t alt)' if cwt else ')'),
         '{',
         '    uint32_t base = STAGE_BASE[STAGE_2];',
@@ -2641,7 +3002,7 @@ def _render_push_helper(cwt: bool = False) -> str:
         ' * loop leaves a lane\'s heads back to back in ATTNH, HEAD_SRC bytes apart.',
         ' *',
         ' * Each source overlaps only its own destinations, so A*V moves EXACTLY ONCE. */',
-        'static inline void push_attn(uint32_t lane, uint32_t y_base, uint64_t src'
+        'static NO_INLINE void push_attn(uint32_t lane, uint32_t y_base, uint64_t src'
         + (', uint32_t alt)' if cwt else ')'),
         '{',
         '    uint32_t base = STAGE_BASE[STAGE_3];',
@@ -2685,7 +3046,7 @@ def _render_lpddr_helper(cwt: bool = False) -> str:
         ' * spilled tensor safe: a leg with slots > 1 keeps that many copies of every piece',
         ' * and uses copy (item % slots), so item m\'s residual is still there when stage 3',
         ' * reads it two steps after stage 1 wrote it.  Legs with slots == 1 ignore it. */',
-        'static inline void lpddr_move(uint32_t stage, uint32_t lane, uint32_t dir,',
+        'static NO_INLINE void lpddr_move(uint32_t stage, uint32_t lane, uint32_t dir,',
         '                              uint32_t item, uint64_t x_base, uint64_t y_base'
         + (', uint32_t alt)' if cwt else ')'),
         '{',
@@ -2730,8 +3091,7 @@ def _render_lpddr_helper(cwt: bool = False) -> str:
 
 def _render_layer_call(item: Item, pool: str, cut: Cut, bench: bool = False,
                        x_tile: int = 0, y_tile: int = 0, w_tile: int = 0,
-                       var: str = 't', cycles_per_ms: float = 1e6,
-                       loop_count: int = 1, par: str = '',
+                       var: str = 't', par: str = '',
                        shift: Optional[Dict[str, int]] = None) -> List[str]:
     """C statement(s) for one row, dispatched by kernel and pool.
 
@@ -2816,14 +3176,30 @@ def _render_layer_call(item: Item, pool: str, cut: Cut, bench: bool = False,
         src    = wb if from_w else xb
         work.append(f'axpy_f16vecp_local_unrolled4(0x3C00u, {src}, {yb}, '
                     f'{s["len"]}u);  /* {tag}: Y += {"W" if from_w else "X"} */')
-    elif c == 'wait':
-        # A timing stand-in: nothing in software/kernels/baremetal permutes a tensor, so
-        # the spin stands for the addressing work and no bytes move.  The trailing sync
-        # keeps the rendezvous the kernel it replaces would have ended on -- every core
-        # spins the same count, so the barrier is nearly free.
-        cyc = max(1, int(item.ms * cycles_per_ms / max(1, loop_count)))
-        work.append(f'mempool_wait({cyc}UL);'
-                    f'  /* {tag}: timing stand-in -- {_c_comment(s["why"])} */')
+    elif c == 'transpose':
+        # THE PERMUTATION THE ATTENTION NEEDS AND A DESCRIPTOR CANNOT MAKE.  The boundary
+        # delivers K as [tokens, d_head] per head; row 14 contracts against K^T.  A
+        # transposing DMA descriptor would move one 2-byte element per repetition and pay a
+        # whole TCDM line-cycle for each, so it runs on the cores instead -- one pass per
+        # head, the same batch loop the GEMMs below it use.
+        work.append(f'transpose_f16p({xb}, {yb}, '
+                    f'{s["rows"]}u, {s["cols"]}u, cid, nt);'
+                    f'  /* {tag}: {_c_comment(s["why"])} */')
+        work.append('flex_intra_cluster_sync();')
+    elif c in ('patchify', 'unpatchify'):
+        g  = cut.geom
+        nk = s['n_tok']
+        # WHICH TOKENS AND WHICH SUBCARRIERS THIS LANE HAS.  The token slab is the lane's
+        # share; the grid slab starts at the first subcarrier block any of those tokens
+        # falls in, which is NOT lane * something whenever the split straddles a block --
+        # see _patch_slab.  Both are derived here rather than tabulated, so a change of
+        # stage width needs no second edit.
+        tok0 = f'lane * {nk}u'
+        f0   = f'(lane * {nk}u / {g.tok_per_block}u) * {g.nh}u'
+        fn   = 'patchify_f16p' if c == 'patchify' else 'unpatchify_f16p'
+        work.append(f'{fn}({xb}, {yb}, {tok0}, {f0}, {nk}u,')
+        work.append(f'    {g.nt}u, {g.nh}u, {g.nw}u, {g.chan}u, cid, nt);'
+                    f'  /* {tag}: {_c_comment(s["why"])} */')
         work.append('flex_intra_cluster_sync();')
     else:
         raise ValueError(f"row {row.excel_row} ('{row.op}'): no kernel is mapped to "
@@ -2862,14 +3238,23 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
         rows = ', '.join(str(it.row.excel_row) for it in st.items)
         L.append(f'/* stage {st.idx + 1}: rows {rows}, {st.n_par} lane(s) '
                  f'over {_c_comment(st.split)} */')
-        L.append(f'static inline void compute_stage_{st.idx + 1}(uint32_t lane'
+        # NO_INLINE, not inline: folded into main() all three stages' spills add up in ONE
+        # frame and the core's 512 B stack does not hold main + a stage + a kernel.  See
+        # _render_stack_note.
+        L.append(f'static NO_INLINE void compute_stage_{st.idx + 1}(uint32_t lane'
                  + (', uint32_t par)' if mode == 'cwt' else ')'))
         L.append('{')
-        # No kernel addresses `lane`: every operand a stage reads is either at the base of
-        # its buffer or at a fixed region offset, because the boundary lands each lane's own
-        # slab at the start of the region it goes to.  The parameter stays in the signature
-        # so main() can call every stage the same way.
-        L.append('    (void)lane;')
+        # ALMOST no kernel addresses `lane`: every operand a stage reads is either at the
+        # base of its buffer or at a fixed region offset, because the boundary lands each
+        # lane's own slab at the start of the region it goes to.  THE PATCHIFY ROWS ARE THE
+        # EXCEPTION -- their tokens are numbered in the whole model, not in the lane, so
+        # they need to know which lane this is.  The parameter stays in the signature
+        # either way, so main() can call every stage the same way.
+        uses_lane = not wait and any(
+            LAYOUT_LOWERING.get(it.row.excel_row) in ('patchify', 'unpatchify')
+            for it in st.items)
+        if not uses_lane:
+            L.append('    (void)lane;')
         # THE PARITY OFFSETS, cwt only.  `shift` maps a named region to how far its second
         # copy is, so only the operands a transfer actually touches move on an odd item and
         # everything else -- the score matrix, SCRATCH, the weights -- stays where it is.
@@ -2921,7 +3306,6 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
                                                    loop.x if k == lo else 0,
                                                    loop.y if k == hi - 1 else 0,
                                                    w_step, loop.var,
-                                                   cycles_per_ms, loop.count,
                                                    par, shift):
                         L.append(f'{ind}{line}')
             if loop.count > 1:
@@ -3230,6 +3614,8 @@ def _render_c(pool: str, stages: List[Stage], geom: Geometry,
     A('')
     lines.extend(_render_includes(wait))
     A('')
+    lines.extend(_render_stack_note(stages))
+    A('')
     if wait:
         A('/* CYCLES_PER_MS: nop-loop iterations that approximate 1 ms of wall time. */')
         A(f'#define CYCLES_PER_MS  {int(cycles_per_ms)}UL')
@@ -3316,7 +3702,7 @@ def app_name(mode: str, pool: str) -> str:
 #   runtime -- the runtime's own .l1 objects sharing the region with ours
 #   align   -- our buffers' alignment attribute, NUM_BANKS * sizeof(int32_t)
 def _l1_geometry(num_cores: int, banking: int, bank_size: int,
-                 stack: int = 512) -> Dict[str, int]:
+                 stack: int = PE_STACK_B) -> Dict[str, int]:
     banks = banking * num_cores
     return {
         'total':   banks * bank_size,
@@ -3709,9 +4095,9 @@ def write_summary(res: Results, path: str, csv_name: str) -> None:
 
 def run(template_path: str, config_path: str) -> Tuple[Results, List[LayerRow]]:
     """Programmatic entry point: returns (Results, parsed rows)."""
-    cfg    = load_config(config_path)
-    layers = load_template(template_path)
-    res    = compute(layers, cfg)
+    cfg = load_config(config_path)
+    layers, params = load_template(template_path)
+    res = compute(layers, cfg, params)
 
     by_row = {r.excel_row: r for r in layers}
     for rn in DROPPED_ROWS:
@@ -3719,6 +4105,24 @@ def run(template_path: str, config_path: str) -> Tuple[Results, List[LayerRow]]:
         if r:
             print(f"Rides a transfer (no kernel, no local copy): row {rn} '{r.op}' "
                   f'[{r.kernel}], {int(r.dout_bytes)} B')
+    for rn, how in sorted(LAYOUT_LOWERING.items()):
+        r = by_row.get(rn)
+        if r:
+            print(f"Runs as a PE permutation kernel ({how}_f16p): row {rn} '{r.op}' "
+                  f'[{r.kernel}], {int(r.dout_bytes)} B')
+    # THE ONE PREMISE THE GRID LEGS REST ON, said once and not per pool.  Every pool builds
+    # the same partition, so the straddle is a property of the widths alone.
+    geom = res.geom
+    for st in _grid_stages(next(iter(res.stages.values()), [])):
+        have  = _patch_slab_elems(geom, st.n_par)
+        whole = geom.nf * geom.nt * geom.chan
+        dup   = have * st.n_par - whole
+        if dup:
+            print(f'Grid slab straddles a subcarrier block: stage {st.idx + 1} declares '
+                  f'{have} grid elements a lane, {dup} more than the {whole} the grid holds '
+                  f'({dup // (geom.nh * geom.nt * geom.chan)} block(s) duplicated).  Each '
+                  f'lane reads and writes its own LPDDR node, so the two copies never meet; '
+                  f'see _patch_slab.')
     return res, layers
 
 

@@ -91,10 +91,11 @@ may sit on top of.  A row naming the SAME region twice is a view, not a copy.  _
 the single authority on every offset inside X_BUF.  W_BUF gives every row its own region and is
 sized to their SUM: a stage's weights are resident, re-read on every item.
 
-HAND-OFFS.  Every boundary carries ONE tensor with rows = 1, because an encoder pass is
-self-contained and the only thing that has to cross between two of them is Z.  Every cluster
-stores its share box-outer, so a lane's box columns are one contiguous run and each leg is a
-plain scatter, gather or copy.
+HAND-OFFS.  Every boundary carries ONE tensor, because an encoder pass is self-contained and
+the only thing that has to cross between two of them is Z.  Every cluster stores its share
+box-outer, so a lane's box columns are one contiguous run.  Two legs also PERFORM a layout
+row on the way -- the lattice scatter into stage 2 and the observation gather into stage 4 --
+as a table of segments; the other two are plain copies.
 
 LPDDR.  Five legs cross the chip boundary, four of them on the south edge: the model input in
 and the WIN summaries out on stage 1, both back in as the R3 base on stage 4, and the channel
@@ -167,7 +168,6 @@ LAYOUT_KERNELS = {'reshape', 'split', 'split&reshape', 'transpose'}
 # into the generated source.
 NO_KERNEL = {
     'rope': 'no rope kernel exists',
-    'pool': 'no average-pool kernel exists',
 }
 
 TENSOR_ENGINE_POOLS = {'TensorPool'}     # picks TE_utilization and the RedMulE emitter
@@ -193,17 +193,96 @@ HBM_CHAN_PLACEMENT = {'west': 0, 'north': 4, 'east': 0, 'south': 4}
 LPDDR_IN_EDGE = 'south'
 LPDDR_OUT_EDGE = 'north'
 
-# PE-run layout cost, the same fit cevit_pipeline.py uses: a strided halfword permutation
-# with no arithmetic to hide the addressing behind.  See LAYOUT ROWS in the module
-# docstring for what this is and is not evidence of.
-PE_LAYOUT_FLOPS_PER_ELEM = 8.9
-PE_LAYOUT_FIXED_CYCLES = 1029            # per-invocation entry cost (cluster rendezvous)
+# A permutation kernel moves ONE ELEMENT PER CORE per this many cycles, counted off the
+# assembly clang emits at -O3 for the mempool target.  This replaces a FLOPs-per-element
+# fit that was quoted against a `patchify_f16` kernel which did not exist in
+# software/kernels/baremetal; the kernels named here do.
+#
+#   permute   permute_f16p walks a level table with an asm inner run -- 8 p.lhu, 8 p.sh,
+#             a decrement and a branch, 18 instructions per 8 elements.  Every CELERE row
+#             lowered to it has a run of 48 or more, so the level counters and carries are
+#             under a tenth of the work and do not appear here.
+#
+# IT IS A FLOOR.  It carries neither the load-use stall nor the bank conflicts a scattered
+# access pattern provokes, both of which push the real figure up.  Re-fit from an RTL run
+# with --bench; the model is optimistic until you do.
+LAYOUT_CYCLES_PER_ELEM: Dict[str, float] = {
+    'permute': 2.25,
+}
 
-# Layout rows no kernel runs -- they ride a DMA.  Row 3 rides the inbound LPDDR read; rows
-# 9, 33 and 44 ride the hand-offs out of stages 1, 3 and 4.  All four carry 0 FLOPs, so
-# only their modelled layout time leaves the totals.  The other eight layout rows sit
-# inside a stage with no boundary to fold them into and run there as mempool_wait() spins.
-DROPPED_ROWS = (3, 9, 33, 44)
+# ---- Where each of the template's layout rows is actually performed ---------
+#
+# THREE OUTCOMES, NOT TWO, and the difference is the whole discipline here.  A layout row
+# carries 0 FLOPs, so the template can say nothing about what it costs; what it costs
+# depends entirely on which engine performs it, and one of the three engines is "none".
+#
+# FREE_ROWS -- a VIEW.  The operand is already in the order its consumer wants, so nothing
+# runs and nothing moves.  This is not the same as being carried by a transfer: there is no
+# transfer.  Charging one of these anything at all is OVER-counting, which is how they were
+# costed before (a mempool_wait each).
+#
+#   row 13   the q|k|v split.  The template is explicit -- "Zero-copy slice; no kernel.
+#            Three contiguous sub-ranges at stride o_4".  Row 15 reads it strided and
+#            materialises what the GEMM needs; see below.
+#   row 23   UF.  U leaves row 20 in window-major order, which puts each window's spans
+#            beside its own summary, so a fold is a CONTIGUOUS [L_l, d_head] sub-block and
+#            row 27 can contract against it where it lies.  Verified against
+#            redmule_synch_parallel, which addresses X as a dense [M, N] and has no
+#            leading-dimension argument -- that is the test for every claim of this kind
+#            here, and it is what rows 15 and 22 FAIL.
+#   row 41   the R3 base.  Its two source regions are PAT and WIN, which arrive as two
+#            LPDDR legs, and _stage_layout lands inbound tensors back to back -- so the
+#            concatenation is the layout, and there is nothing left to do.
+FREE_ROWS = (13, 23, 41)
+
+# DROPPED_ROWS -- carried by a MOVE that was happening anyway, so the row is the address
+# pattern of a descriptor and costs no extra cycles.  The DMA is priced PER RUN, not per
+# byte -- one burst per repetition, one TCDM line per cycle, a line being
+# cores * banking * 4 bytes (8 KiB here) -- so this is only free when the runs are long:
+#
+#   row 9    stage 1 -> 2 entry.  Interleaves the window summaries among the spans while
+#            assembling the lattice: row 7 embedded PAT and WIN CONCATENATED, row 9 wants
+#            them window-major.  Four rectangles of whole token rows -- see
+#            _handoff_segments -- and the spell row it also inserts has no source, so what
+#            the leg carries is the 149 rows and the consumer's 150th is the pitch.
+#   row 29   NOTHING MOVES.  The residual it loads IS the lattice the stage already holds:
+#            stages 2 and 3 take Z as their inbound tensor and row 30 reads it where it
+#            landed, so this is a second reader of a resident region, not a copy.  It is
+#            here rather than in FREE_ROWS because the row names a load the model draws as
+#            an edge; the app has nothing to issue for it either way.
+#   row 33   stage 3 -> 4 entry.  Drops the spell row -- row 9 put it LAST in every box
+#            column -- so the crop is the PITCH DIFFERENCE between the two ends, one
+#            rectangle per column.  It is not a plain copy only because a lane holds more
+#            than one column, and the gap sits inside its share.
+DROPPED_ROWS = (9, 29, 33)
+
+# LAYOUT_LOWERING -- a real PE kernel runs it, because no move is going that way or because
+# a descriptor would be dearer than the cores:
+#
+#   row 3    RA unpack + patchify.  Composes three factorizations; six levels, run = 48.
+#            On-chip by ruling: the inbound leg carries the RAW GRID and this patchifies it
+#            after it lands, rather than assuming DRAM was written pre-grouped.
+#   row 15   the head gather.  Row 13 leaves Q, K and V strided by 3*d_model inside QKV;
+#            rows 17 and 20 are GEMMs and RedMulE takes a DENSE operand, so QG, KG and UG
+#            have to exist.  Run = d_head = 128.
+#   row 22   the local fold.  Re-folds Q and K FROM ROW 13, not from the rotated QG/KG --
+#            the local pass takes pb_fine instead of rope, so it needs the unrotated pair.
+#            Same strided source, same dense-operand requirement.  Run = 128.
+#   row 28   the head merge, as TWO static folds (n_full of L_l, one of L_rem).  Run = 128.
+#   row 40   the span-major restore.  In-stage on stage 4: its input is row 38's output,
+#            which is computed there, so no entry transfer can carry it.  Run = 256.
+#   row 44   the per-PRB re-pack.  This one sits at the 4 -> 5 boundary and STILL goes to
+#            the cores, which is the clearest case of the per-run rule: its runs are 48
+#            halfwords, so a descriptor would spend 19,008 line-cycles moving 1/170th of a
+#            line each time, against about 2,000 cycles on the cores.
+LAYOUT_LOWERING: Dict[int, str] = {3: 'permute', 15: 'permute', 22: 'permute',
+                                   28: 'permute', 40: 'permute', 44: 'permute'}
+
+# A layout row whose op names MORE THAN ONE TENSOR moves each of them: row 15 gathers Q, K
+# and U, row 22 folds Q and K, and the template's out dims describe ONE of them.  The count
+# multiplies both the calls _permute_levels returns and the output _row_shape charges, so
+# neither the emitted code nor the cost model sees only the first.
+PERMUTE_TENSORS: Dict[int, int] = {15: 3, 22: 2}
 
 
 # ---------------------------------------------------------------------------
@@ -217,17 +296,24 @@ DROPPED_ROWS = (3, 9, 33, 44)
 
 # One whole encoder pass, in template order: the projection, the merged dual-global
 # attention, the local spectral pass and the skip block.  Stages 2 and 3 each run all of it.
+# Row 29 is NOT here: the residual load is a MOVE, and a strided one, so it rides a
+# descriptor and overlaps row 30's GEMM exactly as the template says it should.  See
+# DROPPED_ROWS.  Rows 13 and 23 stay in the list although they are FREE_ROWS -- they are
+# real steps of the network and belong in the ledger; they simply cost nothing and emit
+# nothing.
 _ENCODER_PASS = [11, 12, 13, 15, 16, 17, 18, 19, 20,   # LN, W_qkv, split, gather, rope,
                  22, 23,                               #   scores, mask, softmax, A x V
-                 24, 25, 26, 27, 28, 29, 30, 31]       # local fold + pass, then W_o + skip
+                 24, 25, 26, 27, 28, 30, 31]           # local fold + pass, then W_o + skip
 
 STAGES: List[dict] = [
-    # The front end.  Rows 5, 7 and 8 come to ~0.091 ms even at two lanes on TensorPool,
+    # The front end.  ROW 3 IS HERE, not on the inbound leg: the RA unpack composes three
+    # factorizations and bottoms out at a 48-halfword run, so the leg carries the RAW GRID
+    # and permute_f16p patchifies it after it lands.  Rows 5, 7 and 8 come to ~0.091 ms even at two lanes on TensorPool,
     # still under the ~0.135 ms period.  pad=2 leaves cids 2-3 idle so that stages 4 and 5
     # start on a column boundary; nothing else can take them, since every other stage
     # splits an axis needing a divisor of 16 or of 2384 = 149 x 16.
     dict(n_par=2, pad=2, tiles=1, tile_from=0, split='i_3 (16 -> 8 spatial patches)',
-         rows=[5, 7, 8]),
+         rows=[3, 5, 7, 8]),
     # Encoder pass 0, whole, on 8 lanes -- every row is cluster-local over this lane's 2
     # box columns.  The lattice arrives already assembled: row 9 rides the inbound leg.
     dict(n_par=8, tiles=1, tile_from=0, split='i_3 (16 -> 2 spatial patches)',
@@ -244,9 +330,12 @@ STAGES: List[dict] = [
     # which saves carrying 915,456 elements across a boundary.  Eight lanes: at four this
     # stage is the bottleneck at 0.188 ms, at eight it is 0.095.
     dict(n_par=8, tiles=1, tile_from=0, split='i_2 (2384 -> 298 = 2 box columns)',
-         rows=[34, 35, 36, 37, 38, 40, 41, 42, 43]),
-    # The head.  Four lanes, each draining to its own node on the 4-wide north edge, with
-    # row 44's per-PRB blocking performed by the inbound hand-off.  Row 48 is TILED: at
+         rows=[34, 35, 36, 37, 38, 40, 41, 42, 43, 44]),
+    # The head.  Four lanes, each draining to its own node on the 4-wide north edge.  Row
+    # 44's per-PRB blocking is done on the PRODUCER side, at the tail of stage 4, so the
+    # hand-off carries the already-packed tensor: its runs are 48 halfwords, and a
+    # descriptor doing the re-pack would pay a TCDM line-cycle for each of 19,008 of them
+    # against about 2,000 cycles on the cores.  Row 48 is TILED: at
     # four lanes it would otherwise hold 736,512 elements live.
     dict(n_par=4, tiles=2, tile_from=3, split='i_3 (16 -> 4 spatial patches)',
          rows=[45, 46, 47, 48]),
@@ -259,23 +348,24 @@ STAGES: List[dict] = [
 #
 # One entry per tensor crossing a stage boundary, in the order the producer lays it out --
 # and so the consumer.  `elems` is the WHOLE tensor across every lane of the producing
-# stage; `rows` is how many unsplit leading repetitions it has in the producer's local
-# layout, so a lane owns (elems/lanes)/rows contiguous elements out of every elems/rows.
-# Every boundary here splits a box-like axis, so all of them have rows = 1.
+# stage, so a lane owns elems/lanes of it and a consumer needs elems/lanes_next.
 
 @dataclass(frozen=True)
 class Tensor:
     name: str
     elems: int
-    rows: int = 1
+    # A LAYOUT ROW THIS LEG PERFORMS, by name in _handoff_segments.  '' is a plain copy,
+    # which is every leg whose two ends agree on the order of the token rows inside a box
+    # column.  Naming one replaces the leg's single descriptor with that row's segments.
+    scatter: str = ''
     # LPDDR legs only.  '' takes the direction's default edge; naming one overrides it,
     # which is how stage 1's WIN spill and stage 4's R3 base read both go SOUTH.
     edge: str = ''
 
 
 # stage index (0-based) -> the tensor(s) it hands to the next stage.  EVERY CLUSTER STORES
-# ITS SHARE BOX-OUTER -- a lane's box columns are one contiguous run -- so every leg here
-# has rows = 1 and every descriptor is a plain scatter, gather or copy.
+# ITS SHARE BOX-OUTER -- a lane's box columns are one contiguous run -- which is what lets a
+# leg address one column at a time and lets a plain copy be a plain copy.
 _LATTICE = 150 * 16 * 256         # 614,400 -- 150 lattice rows x 16 box columns x d_model
 
 HANDOFF: Dict[int, List[Tensor]] = {
@@ -284,16 +374,19 @@ HANDOFF: Dict[int, List[Tensor]] = {
     # producer holds -- row 9 reads 610,304 elements and writes 614,400, the extra 4,096
     # being the learned spell row, one per box column, which no DMA can bring from stage 1
     # -- so that the rule "a stage DMAs the next stage's Data_in and no more" still holds.
-    0: [Tensor('Z lattice', _LATTICE)],
+    0: [Tensor('Z lattice', _LATTICE, scatter='row9_lattice')],
     # Row 31's Z, back on the lattice.  8 to 8, straight copy.  The ONLY thing the two
     # encoder passes share: pass 1 reads it at its row 11 and again at its row 29.
     1: [Tensor('Z lattice', _LATTICE)],
-    # Row 33 (dropped) rides this leg: the gather that drops the 16 lattice rows the FFN
-    # does not see and leaves 2384 observation carriers.  8 to 8, straight copy.
-    2: [Tensor('ZO observation carriers', 2384 * 256)],
-    # Row 44 (dropped) rides this leg: the per-PRB blocking that takes the stream out of
-    # the i_2 = 149 token domain and into the i_2 = 1188 PRB one.  8 to 4, fan-in.  What is
-    # declared is row 44's output, which is exactly row 45's Data_in.
+    # Row 33 (dropped) rides this leg: the gather that drops the spell row the FFN does
+    # not see, leaving 2384 observation carriers.  8 to 8, and NOT a straight copy -- the
+    # dropped row sits at the end of each of a lane's box columns, so the crop is the
+    # pitch difference between the two ends.
+    2: [Tensor('ZO observation carriers', 2384 * 256, scatter='row33_crop')],
+    # Row 44 ran on the PRODUCER's cores, at the tail of stage 4 -- its runs are 48
+    # halfwords, far too short for a descriptor -- so this leg carries the already-packed
+    # tensor and is a plain copy.  8 to 4, fan-in.  What is declared is row 44's output,
+    # which is exactly row 45's Data_in.
     3: [Tensor('per-PRB blocks', 1188 * 16 * 48)],
 }
 
@@ -893,15 +986,37 @@ def _row_shape(row: LayerRow, n_par: int, tiles: int) -> dict:
     if k == 'add':
         # axpy's UNROLLED4 body moves 8 elements per core per step.
         return {'cls': 'add', 'len': _pad(max(1, _prod(ind) // div), 8)}
-    if k in NO_KERNEL or k in LAYOUT_KERNELS:
+    if k == 'pool':
+        # A REAL REDUCTION, not a permutation: it contracts the window axis and leaves
+        # every (i_3, i_4) element beside it alone, so pool_mean_f16p runs it as a vector
+        # accumulate over contiguous rows.  `lane` is what stays independent.
+        lane = max(1, _prod(outd[2:]) if len(outd) > 2 else 1)
+        n_in = max(1, ind[1] if len(ind) > 1 else 1)
+        n_out = max(1, outd[1] if len(outd) > 1 else 1)
+        win = -(-n_in // n_out)          # ceil: the last window is short, the divisor is not
+        return {'cls': 'pool', 'n_in': n_in, 'n_out': n_out, 'win': win,
+                'lane': max(1, lane // div),
+                'in': max(1, _prod(ind) // div), 'out': max(1, _prod(outd) // div)}
+    if row.excel_row in FREE_ROWS:
+        # A VIEW.  Nothing runs, nothing moves, nothing is claimed -- see FREE_ROWS for
+        # why each of the three is one.  It stays an Item so the ledger still lists it.
+        return {'cls': 'free', 'in': 0, 'out': 0,
+                'why': 'view: the operand is already in the order its consumer wants'}
+    if row.excel_row in LAYOUT_LOWERING:
+        # `in` is the whole source tensor whatever the row moves out of it -- rows 15 and 22
+        # read stripes of one QKV -- so only the OUTPUT carries the tensor count.
+        return {'cls': LAYOUT_LOWERING[row.excel_row],
+                'in': max(1, _prod(ind) // div),
+                'out': max(1, PERMUTE_TENSORS.get(row.excel_row, 1)
+                           * _prod(outd or ind) // div),
+                'why': 'index permutation, on the cores'}
+    if k in NO_KERNEL:
         # A wait, not a kernel -- but the tensors it stands for are live all the same.
-        # rope rotates Q and K IN PLACE, so it names one buffer; a layout row and the
-        # window pool both read one tensor and write another.
+        # rope rotates Q and K IN PLACE, so it names one buffer.
         inplace = k == 'rope'
         return {'cls': 'wait', 'in': max(1, _prod(ind) // div),
                 'out': 0 if inplace else max(1, _prod(outd or ind) // div),
-                'why': NO_KERNEL.get(k, 'layout op: PE index permutation'),
-                'layout': k in LAYOUT_KERNELS}
+                'why': NO_KERNEL[k], 'layout': False}
     raise ValueError(f"row {row.excel_row} ('{row.op}'): no kernel is mapped to "
                      f"'{row.kernel}'.")
 
@@ -948,6 +1063,13 @@ def _row_footprint(row: LayerRow, n_par: int, tiles: int,
     if c == 'add':
         return s['len'], 0, s['len']
     if c == 'wait':
+        return s['in'], 0, s['out']
+    if c == 'free':
+        # A view claims nothing: its operand is already resident, in the order wanted.
+        return 0, 0, 0
+    if c in ('permute', 'pool'):
+        # A permutation that RUNS is not a view, and a reduction never was: each reads one
+        # tensor and writes a second, so both ends are charged.
         return s['in'], 0, s['out']
     return 0, 0, 0
 
@@ -1185,16 +1307,42 @@ def _row_latency(row: LayerRow, rate_gemm: float, rate_pe: float) -> float:
     return row.flops / row.n_rep / (rate_gemm if row.is_gemm else rate_pe)
 
 
-def _layout_latency(item: Item, n_par: int, rate_pe: float,
+def _pool_cores(cfg: dict, pool: str) -> int:
+    """Cores one cluster of this pool has -- num_core_per_cluster of its arch config.
+
+    Only the permutation kernels need it.  Every other row is charged against a FLOPs peak
+    with the core count already folded in; a permutation has no FLOPs to be charged
+    against, so the width of the cluster IS the rate.
+    """
+    n = cfg.get('cores', {}).get(pool)
+    if not n:
+        raise ValueError(
+            f'config gives no "cores" for pool {pool!r}; the permutation kernels are '
+            f'charged per core, so each pool needs its num_core_per_cluster (see '
+            f'software/runtime/multi_cluster/configs/arch_*.py)')
+    return int(n)
+
+
+def _layout_latency(item: Item, n_par: int, cores: int,
                     cycles_per_ms: float) -> float:
     """Modelled latency [ms] of ONE cluster's ONE tile of a zero-FLOP layout row.
 
     Applied to the DESTINATION element count: a permutation costs one pass over what it
-    writes.
+    writes, spread over the cluster's cores.
+
+    A CORE COUNT, NOT A FLOPs RATE.  A permutation carries no FLOPs, so there is no peak to
+    charge it against; what sets the rate is how many cores are walking and how many cycles
+    each element costs one of them.  See LAYOUT_CYCLES_PER_ELEM.
     """
+    how = LAYOUT_LOWERING.get(item.row.excel_row)
+    rate = LAYOUT_CYCLES_PER_ELEM.get(how)
+    if rate is None:
+        raise ValueError(
+            f'row {item.row.excel_row} is lowered to {how!r}, which has no '
+            f'cycles-per-element figure; LAYOUT_CYCLES_PER_ELEM needs one per '
+            f'LAYOUT_LOWERING value')
     elems = _row_footprint(item.row, n_par, item.tiles)[2]
-    return (PE_LAYOUT_FIXED_CYCLES / cycles_per_ms
-            + elems * PE_LAYOUT_FLOPS_PER_ELEM / rate_pe)
+    return elems / max(1, cores) * rate / cycles_per_ms
 
 
 def compute(layers: List[LayerRow], cfg: dict) -> Results:
@@ -1228,6 +1376,7 @@ def compute(layers: List[LayerRow], cfg: dict) -> Results:
         flops_per_ms[pool] = {'non_GEMM': rate_pe, 'GEMM': rate_gemm}
 
         stages = build_stages(layers)
+        cores = _pool_cores(cfg, pool)
         lat: Dict[int, float] = {}
 
         for st in stages:
@@ -1241,10 +1390,16 @@ def compute(layers: List[LayerRow], cfg: dict) -> Results:
                 if item.row.flops:
                     whole = _row_latency(item.row, rate_gemm, rate_pe)
                     item.ms = whole / (st.n_par * item.tiles)
+                elif item.row.excel_row in FREE_ROWS:
+                    # A VIEW costs nothing, and saying so is the point: charging one a
+                    # spin, as this file used to, reports a network slower than the one
+                    # it runs.
+                    item.ms = 0.0
+                    whole = 0.0
                 else:
-                    # A zero-FLOP layout row: the fit is per cluster per tile, so the
-                    # whole-stage figure the report column wants is the scaled-up one.
-                    item.ms = _layout_latency(item, st.n_par, rate_pe, cycles_per_ms)
+                    # A zero-FLOP layout row a KERNEL runs: the figure is per cluster per
+                    # tile, so the whole-stage number the report column wants is scaled up.
+                    item.ms = _layout_latency(item, st.n_par, cores, cycles_per_ms)
                     whole = item.ms * st.n_par * item.tiles
                 lat[item.excel_row] = lat.get(item.excel_row, 0.0) + whole
                 x, w, y = _row_footprint(item.row, st.n_par, item.tiles, pool)
@@ -1521,18 +1676,55 @@ L1_GEOMETRY = {
 }
 
 
+def _parity_elems(st: Stage, pool: str) -> int:
+    """Elements of ONE stage that need a SECOND copy under cwt.
+
+    ONLY WHAT CROSSES AN ITEM BOUNDARY, which is two things and not the whole buffer:
+
+      * the stage's FIRST kernel's input -- the landing zone.  Under cwt the transfer that
+        brings item i+1 runs while item i computes, so the bytes being written are not the
+        bytes being read and the two cannot share a region.
+      * the stage's LAST kernel's output -- whatever an outbound transfer reads.  Same
+        argument the other way: item i is being shipped while item i+1 is being computed
+        into the same place.
+
+    EVERYTHING ELSE IS SINGLE.  The pinned intermediates and the scratch arena are written
+    and read inside one item's compute, with a barrier either side, so no transfer is ever
+    looking at them -- and the WEIGHTS are never written at all.  Doubling the whole of X,
+    which this file used to do, charges the parity copy to regions no transfer touches; it
+    is what put both cwt apps over budget by 943 KiB (TensorPool) and 1355 KiB (Terapool).
+    """
+    inbound = (_tensors('hand', st.idx - 1) if st.idx else []) + _tensors('hin', st.idx)
+    landing = sum(int(_lane_bytes(t, st.n_par)) for t in inbound) // BYTES_PER_ELEM
+
+    drain = sum(x.nbytes // st.n_par for x in _stage_xfers(st.idx))
+    drain += sum(int(_lane_bytes(t, st.n_par)) // st.tiles
+                 for t in _tensors('hout', st.idx))
+    return landing + drain // BYTES_PER_ELEM
+
+
 def _l1_footprint(stages: List[Stage], mode: str, pool: str) -> Tuple[int, str]:
     nx, nw = _scratch_elems(stages, pool)
-    dup = 2 if mode == 'cwt' else 1
+    par = 0
+    if mode == 'cwt':
+        # ONE X_BUF AND ONE PARITY REGION SERVE EVERY STAGE, so the declaration has to
+        # satisfy both maxima independently: X >= max(own) and parity >= max(parity).  That
+        # is max(own) + max(parity), which is an upper bound on max(own + parity) and here
+        # exceeds it by about 385 KiB -- the two maxima fall on different stages (stage 1
+        # owns the largest working set, stage 5 the largest boundary pair).  Sizing to the
+        # tighter number would need a per-stage buffer, which the app does not have.
+        par = max((_parity_elems(st, pool) for st in stages), default=0)
+        par = ((par + 31) // 32) * 32
     geo = L1_GEOMETRY.get(pool, {'stacks': 0, 'align': 64})
-    sizes = [dup * nx * BYTES_PER_ELEM, nw * BYTES_PER_ELEM]
+    sizes = [(nx + par) * BYTES_PER_ELEM, nw * BYTES_PER_ELEM]
     at = geo['stacks']
     for sz in sizes:
         at = ((at + geo['align'] - 1) // geo['align']) * geo['align'] + sz
     total = at - geo['stacks']
-    d = '2x' if dup == 2 else ''
-    parts = (f'{d}X {nx * BYTES_PER_ELEM}B + W {nw * BYTES_PER_ELEM}B '
-             f'+ {(total - sum(sizes)) / 1024:.0f} KiB align')
+    parts = (f'X {nx * BYTES_PER_ELEM}B'
+             + (f' + parity {par * BYTES_PER_ELEM}B' if par else '')
+             + f' + W {nw * BYTES_PER_ELEM}B '
+               f'+ {(total - sum(sizes)) / 1024:.0f} KiB align')
     return total, parts
 
 
@@ -1548,18 +1740,69 @@ _KERNEL_INCLUDES = [
     'baremetal/mempool_layernorm_f16.h',
     'baremetal/mempool_gelu_f16.h',
     'baremetal/mempool_axpy_f16.h',
+    'baremetal/mempool_pool_f16.h',
+    'baremetal/mempool_permute_f16.h',
 ]
 
 
-# Stage bodies and the DMA helpers are emitted INLINE.  A core's whole 512 B
-# sequential-memory slot IS its stack -- config/tensorpool256.mk sets
-# stack_size = seq_mem_size = 512 and flex_start.S arms the stacklimit CSR -- so every
-# stage body lands in main()'s frame at once.  Measured with objdump it fits with room:
-# ~288 B on TensorPool, ~352 B on Terapool, whose GEMM lowering calls the 144 B
-# matmul_4x2_parallel_f16vec.  Re-measure if a stage table ever carries a deep
-# hand-written kernel with a live pointer chain across an asm block.
-_INLINE_T = lambda ret: f'static inline {ret}'
+# Stack a core gets, from stack_size in config/*.mk (512 on every pool this generates for).
+# config/tensorpool256.mk sets stack_size = seq_mem_size = 512, so the core's whole
+# sequential-memory slot IS its stack, and flex_start.S arms the stacklimit CSR from it.
+PE_STACK_B = 512
+
+# THE STAGE BODIES GET THEIR OWN FRAMES, and that is a change from how this file used to
+# emit them.  Inlined, all five land in main()'s frame at once and it is sized by the SUM
+# of their spills rather than the largest of them.  That was measured to fit -- 288 B on
+# TensorPool against the 508 usable (STACK_SIZE - 4; _reset_vector starts sp four bytes
+# down) -- under a stage table that lowered every layout row to a mempool_wait.
+#
+# IT NO LONGER HOLDS.  The permutation rows are real kernels now, and permute_f16p is
+# exactly the case the old comment said to re-measure for: a six-level table with a live
+# pointer chain across its asm blocks, 176 B of frame on its own.  main() measured 416 B
+# once the two new kernels were in, up 128 B and leaving 92 B of the budget -- and the
+# remaining work on this partition all lands in the same frame.
+#
+# So the depth is bounded instead: main + ONE stage + ONE kernel, which no longer grows
+# with the number of stages.  Nothing in the toolchain checks stack depth, and an overrun
+# is a store below __stack_start -- on hart 0 an access to 0xFFFFFFFC -- so the emitter
+# keeps the depth down rather than relying on a measurement staying true.
+#
+# ONLY THE FUNCTIONS THAT SPILL ARE MARKED.  The leaf DMA wrappers (dma_2d and friends,
+# lpddr_node_addr) stay inline: they marshal a few values into argument registers and call
+# straight into flex_dma_pattern.h, whose entry points carry no frame at all, so
+# un-inlining one would move no spill out of its caller and would only add a frame to the
+# transfer chain.  cevit_pipeline.py draws the line in the same place.
+_LEAF_T = lambda ret: f'static inline {ret}'   # leaf wrappers: no frame of their own
+_INLINE_T = lambda ret: f'static NO_INLINE {ret}'
 _INLINE = _INLINE_T('void')
+
+
+def _render_stack_note(stages: List[Stage]) -> List[str]:
+    """The NO_INLINE macro, and why the app has to care about its stack."""
+    n = len(stages)
+    return [
+        '/* NO_INLINE: give this function ITS OWN STACK FRAME.',
+        ' *',
+        f' * A core gets STACK_SIZE bytes of stack ({PE_STACK_B} on both pools; see',
+        ' * config/*.mk) and _reset_vector leaves STACK_SIZE - 4 of them usable -- it starts',
+        ' * sp four bytes down and writes that limit into the stacklimit CSR.  Nothing in the',
+        ' * toolchain checks the depth against it.',
+        ' *',
+        f' * INLINED, THE {n} STAGE BODIES SHARE ONE FRAME IN main(), and it is sized by the',
+        ' * SUM of their spills rather than the largest of them.  That fit while every layout',
+        ' * row was a mempool_wait; it stopped being comfortable once the permutations became',
+        ' * real kernels -- permute_f16p alone carries 176 B, and main() measured 416 B of the',
+        ' * 508 available.  A stage of its own frame bounds the depth at main + ONE stage +',
+        ' * ONE kernel instead.',
+        ' *',
+        ' * ONLY THE FUNCTIONS THAT SPILL ARE MARKED.  The leaf wrappers below (dma_2d and',
+        ' * friends) marshal a few values into argument registers and call straight into',
+        ' * flex_dma_pattern.h, whose entry points carry no frame at all; un-inlining one of',
+        ' * those would move no spill out of its caller and would only add a frame to the',
+        ' * transfer chain.  noinline pays where several large bodies are folded into one',
+        ' * frame, and nowhere else. */',
+        '#define NO_INLINE __attribute__((noinline))',
+    ]
 
 
 def _c_comment(text: str) -> str:
@@ -1625,22 +1868,20 @@ class Xfer:
     two stages' dout_c2c and din_c2c, which is what makes "a stage DMAs the next stage's
     input, no more" true by construction; _check_handoff_sizing holds the generator to it.
 
-    `rows` is the destination row count: each side's share divides into that many
-    contiguous runs, and the 2D descriptor follows from the two run lengths.
     """
     name: str
     nbytes: int           # the WHOLE tensor, across every lane of both sides
-    rows: int
+    scatter: str = ''     # the layout row this leg performs; '' is a plain copy
 
 
 def _stage_xfers(i: int) -> List[Xfer]:
     """The tensors stage i pushes to stage i+1, laid out back to back.
 
-    A lane owns (bytes/lanes)/rows contiguous bytes out of every bytes/rows, and the side
-    with fewer lanes holds several of the other's runs side by side; push_to_next picks
-    fan-out, fan-in or a straight copy from the two lane counts alone.  The shape checks
-    stay here so a mis-sized template row stops the generator rather than emitting a
-    descriptor that walks off a buffer at run time.
+    A lane owns bytes/lanes contiguous bytes of it, and the side with fewer lanes holds
+    several of the other's shares side by side; push_to_next picks fan-out, fan-in or a
+    straight copy from the two lane counts alone.  The shape checks stay here so a
+    mis-sized template row stops the generator rather than emitting a descriptor that
+    walks off a buffer at run time.
     """
     if i + 1 >= len(STAGES):
         return []
@@ -1655,12 +1896,12 @@ def _stage_xfers(i: int) -> List[Xfer]:
                 f"a multiple of one another, so no lane owns a whole number of the "
                 f"other side's runs")
         for lanes, side in ((lanes_p, 'producing'), (lanes_c, 'consuming')):
-            if t.elems % (lanes * t.rows):
+            if t.elems % lanes:
                 raise ValueError(
                     f"stage {i + 1} tensor '{t.name}': {t.elems} elements do not divide "
-                    f"over {t.rows} row(s) x the {lanes} lanes of the {side} stage, so "
-                    f"no lane owns a whole number of runs")
-        out.append(Xfer(t.name, t.elems * BYTES_PER_ELEM, t.rows))
+                    f"over the {lanes} lanes of the {side} stage, so no lane owns a "
+                    f"whole number of them")
+        out.append(Xfer(t.name, t.elems * BYTES_PER_ELEM, t.scatter))
     return out
 
 
@@ -1740,12 +1981,36 @@ def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str) -> List[st
     A(' * out of wherever its own buffer layout put it -- for the encoder stages a pinned')
     A(' * region, not the tail of the last kernel\'s output.')
     A(' *')
-    A(' * rows = 1 means the split axis is outermost and each share is one contiguous run;')
-    A(' * rows > 1 puts the re-layout in the 2D descriptor\'s strides. */')
+    A(' * A LEG IS ONE OF TWO THINGS.  With nseg == 0 it is a plain copy: the split axis')
+    A(' * is outermost at both ends, so each share is one contiguous run and the two lane')
+    A(' * counts decide everything -- fan-out, fan-in or straight across.')
+    A(' *')
+    A(' * nseg > 0 IS A LEG THAT PERFORMS A LAYOUT ROW.  Then the leg walks ONE BOX COLUMN')
+    A(' * at a time -- `cols` of them per consumer, src_pitch and dst_pitch apart at the')
+    A(' * two ends -- and issues SEG[seg0 .. seg0+nseg) inside each, which is where the')
+    A(' * row\'s token-order map lives.  The two pitches differ exactly when the row adds or')
+    A(' * drops rows: the lattice scatter\'s consumer column is one row longer than its')
+    A(' * producer\'s, the observation gather\'s one shorter, and that difference IS the')
+    A(' * insert and the crop.  nseg == 0 keeps the plain copy below. */')
+    A('typedef struct {')
+    A('    uint32_t chunk;      /* bytes of ONE run */')
+    A('    uint32_t src_off, dst_off;      /* bytes into the box column, at each end */')
+    A('    uint32_t src_stride, dst_stride, reps;')
+    A('    uint32_t visits;     /* box columns this segment is REISSUED for; 1 when it')
+    A('                          * had its repetition level spare and took the column')
+    A('                          * stride into it instead */')
+    A('} seg_t;')
+    segs = _emit_handoff_segs(stages)
+    A(f'static const seg_t SEG[{max(1, len(segs))}] = {{')
+    L.extend(segs if segs else ['    { 0u, 0u, 0u, 0u, 0u, 0u, 0u },'])
+    A('};')
+    A('')
     A('typedef struct {')
     A('    uint32_t bytes;    /* the WHOLE tensor, across every lane of both sides */')
-    A('    uint32_t rows;     /* destination rows each side\'s share divides into */')
     A('    uint32_t src_off;  /* byte offset in the PRODUCER\'s X_BUF of its own share */')
+    A('    uint32_t cols;     /* box columns ONE CONSUMER holds; 0 when nseg == 0 */')
+    A('    uint32_t src_pitch, dst_pitch;  /* bytes of one box column, at each end */')
+    A('    uint32_t seg0, nseg;            /* this leg\'s segments in SEG */')
     A('} xfer_t;')
     A('')
     first, rows = [0], []
@@ -1753,16 +2018,34 @@ def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str) -> List[st
            for i in range(n_st) for x in _stage_xfers(i)}
     xfers = [(i, x) for i in range(n_st) for x in _stage_xfers(i)]
     wb = max((len(str(x.nbytes)) for _, x in xfers), default=1)
-    wr = max((len(str(x.rows)) for _, x in xfers), default=1)
     ws = max((len(str(v)) for v in src.values()), default=1)
+    tabs = _handoff_segments()
+    seg0 = {}
+    n = 0
     for i in range(n_st):
         for x in _stage_xfers(i):
-            rows.append(f'    {{ {x.nbytes:>{wb}}u, {x.rows:>{wr}}u, '
-                        f'{src[(i, x.name)]:>{ws}}u }},'
+            if x.scatter:
+                seg0[(i, x.name)] = n
+                n += len(tabs[x.scatter][2])
+    for i in range(n_st):
+        for x in _stage_xfers(i):
+            if x.scatter:
+                sr, dr, sg = tabs[x.scatter]
+                # A consumer's box columns, and one column's bytes at each end.  The
+                # column count is the CONSUMER's -- the producer sends that many per
+                # consumer, whatever its own share holds.
+                cols = _N_BOX // stages[i + 1].n_par
+                pitch = _D_MODEL * BYTES_PER_ELEM
+                tail = (f'{cols}u, {sr * pitch}u, {dr * pitch}u, '
+                        f'{seg0[(i, x.name)]}u, {len(sg)}u')
+            else:
+                tail = '0u, 0u, 0u, 0u, 0u'
+            rows.append(f'    {{ {x.nbytes:>{wb}}u, {src[(i, x.name)]:>{ws}}u, '
+                        f'{tail} }},'
                         f'  /* stage {i + 1}: {_c_comment(x.name)} */')
         first.append(len(rows))
     A(f'static const xfer_t STAGE_XFER[{max(1, len(rows))}] = {{')
-    L.extend(rows if rows else ['    { 0u, 1u, 0u },'])
+    L.extend(rows if rows else ['    { 0u, 0u, 0u, 0u, 0u, 0u, 0u },'])
     A('};')
     A(f'static const uint8_t STAGE_XFER_FIRST[N_STAGES + 2] = '
       f'{{ 0, {", ".join(str(f) for f in first)} }};')
@@ -1817,6 +2100,39 @@ def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str) -> List[st
     return L
 
 
+def _emit_handoff_segs(stages: List[Stage]) -> List[str]:
+    """The SEG[] rows, in the order STAGE_XFER's seg0 indices assume.
+
+    Token rows become bytes here and nowhere else: _handoff_segments states each map in
+    the unit the model thinks in, and d_model is a property of the tensor, not of the map.
+    """
+    tabs = _handoff_segments()
+    out: List[str] = []
+    pitch = _D_MODEL * BYTES_PER_ELEM
+    for i in range(len(stages)):
+        for x in _stage_xfers(i):
+            if not x.scatter:
+                continue
+            sr, dr, segs = tabs[x.scatter]
+            cols = _N_BOX // stages[i + 1].n_par
+            for (lab, chunk, so, do, ss, ds, reps) in segs:
+                # A SEGMENT THAT DOES NOT USE ITS LEVEL TAKES THE COLUMN AXIS INSTEAD.
+                # The descriptor has exactly one repetition level; a rectangle with reps
+                # = 1 has it spare, so the column stride goes there and one descriptor
+                # covers every column the consumer holds.  A rectangle already walking a
+                # fold axis cannot -- the two ends' column pitches DIFFER, by the row this
+                # leg inserts or drops, so no single stride pair reaches across a column
+                # boundary and the fold axis at once.
+                if reps == 1 and cols > 1:
+                    reps, ss, ds, visits = cols, sr, dr, 1
+                else:
+                    visits = cols
+                out.append(f'    {{ {chunk * pitch}u, {so * pitch}u, {do * pitch}u, '
+                           f'{ss * pitch}u, {ds * pitch}u, {reps}u, {visits}u }},'
+                           f'  /* stage {i + 1}: {_c_comment(lab)} */')
+    return out
+
+
 def _render_push_helper(issue: bool = False) -> str:
     sfx = '_issue' if issue else ''
     d2 = f'dma_2d{sfx}'
@@ -1845,29 +2161,45 @@ def _render_push_helper(issue: bool = False) -> str:
         '        uint32_t src_off = x->src_off;            /* where THIS stage holds it */',
         '        uint32_t own_src = x->bytes / lanes;      /* what this cluster holds */',
         '        uint32_t own_dst = x->bytes / lanes_nx;   /* what one consumer needs */',
-        '        uint32_t src_run = own_src / x->rows;     /* this lane\'s run per row */',
-        '        uint32_t dst_run = own_dst / x->rows;     /* a consumer\'s run per row */',
         '',
-        '        if (lanes_nx > lanes) {',
-        '            /* Fan-out: this lane\'s share covers r consecutive consumers, and',
-        '             * consumer k\'s part is one dst_run out of every src_run.  The',
-        '             * consumers are disjoint per producer, so no rotation is needed --',
-        '             * every lane is already writing a different set of clusters. */',
+        '        if (x->nseg) {',
+        '            /* A LEG THAT PERFORMS A LAYOUT ROW.  One consumer takes x->cols box',
+        '             * columns, and a fan-out producer feeds r of them back to back out',
+        '             * of its own share -- so consumer k\'s first column is column',
+        '             * k * cols of what this lane holds.  Inside a column the segments',
+        '             * are the row\'s token-order map, and the two pitches carry the row',
+        '             * it inserts or drops. */',
+        '            uint32_t r = lanes_nx > lanes ? lanes_nx / lanes : 1u;',
+        '            for (uint32_t k = 0; k < r; k++)',
+        '                for (uint32_t s = 0; s < x->nseg; s++)',
+        '                    for (uint32_t c = 0; c < SEG[x->seg0 + s].visits; c++) {',
+        '                        const seg_t *g = &SEG[x->seg0 + s];',
+        f'                        {ds}((uint64_t)remote_cid(base_nx + lane * r + k,',
+        '                                  dst_base + dst_off + c * x->dst_pitch',
+        '                                  + g->dst_off),',
+        '                             src_base + (uint64_t)(src_off',
+        '                                  + (k * x->cols + c) * x->src_pitch',
+        '                                  + g->src_off),',
+        '                             g->chunk, g->dst_stride, g->src_stride, g->reps);',
+        '                    }',
+        '        } else if (lanes_nx > lanes) {',
+        '            /* Fan-out: this lane\'s share covers r consecutive consumers back',
+        '             * to back, so consumer k takes the k-th own_dst of it.  They are',
+        '             * disjoint per producer, so no rotation is needed -- every lane is',
+        '             * already writing a different set of clusters. */',
         '            uint32_t r = lanes_nx / lanes;',
         '            for (uint32_t k = 0; k < r; k++)',
-        f'                {ds}((uint64_t)remote_cid(base_nx + lane * r + k,',
+        f'                {d2}((uint64_t)remote_cid(base_nx + lane * r + k,',
         '                                          dst_base + dst_off),',
-        '                     src_base + (uint64_t)(src_off + k * dst_run),',
-        '                     dst_run, dst_run, src_run, x->rows);',
+        '                     src_base + (uint64_t)(src_off + k * own_dst), own_dst);',
         '        } else if (lanes > lanes_nx) {',
         '            /* Fan-in: r producers share one consumer, and this lane lands in',
-        '             * slot (lane % r) of every destination row. */',
+        '             * slot (lane % r) of its inbound region. */',
         '            uint32_t r = lanes / lanes_nx;',
-        f'            {ds}((uint64_t)remote_cid(base_nx + lane / r,',
+        f'            {d2}((uint64_t)remote_cid(base_nx + lane / r,',
         '                                      dst_base + dst_off',
-        '                                      + (lane % r) * src_run),',
-        '                 src_base + (uint64_t)src_off,',
-        '                 src_run, dst_run, src_run, x->rows);',
+        '                                      + (lane % r) * own_src),',
+        '                 src_base + (uint64_t)src_off, own_src);',
         '        } else {                                    /* straight hand-off */',
         f'            {d2}((uint64_t)remote_cid(base_nx + lane, dst_base + dst_off),',
         '                 src_base + (uint64_t)src_off, own_src);',
@@ -1881,6 +2213,285 @@ def _render_push_helper(issue: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # Per-layer emission
 # ---------------------------------------------------------------------------
+
+# ---- Level tables for the permutation kernels ------------------------------
+#
+# permute_f16p walks a table of (extent, src_step, dst_step) levels, fastest first, with a
+# contiguous RUN at the bottom.  This is where each lowered row's index map is written
+# down, cut to ONE LANE's share.
+#
+# WHAT IS PINNED AND WHAT IS CHOSEN.  Every extent, every run and every count here follows
+# from the template -- from the row's own dims, from `out_width = pspan * n_bins * S2 * 2`
+# and from row 44's `span_prbs * n_bins * ups_in`, which are two independent statements of
+# the same 384 and agree.  What the template does NOT pin is the ORDER of the two
+# two-dimensional indices: which of (bv, bh) is outer in the box index, and which of
+# (kv, kh) is outer within a patch.  A convention is chosen here and used consistently.
+# It changes no cycle -- the run length, the run count and both footprints are identical
+# either way -- and this app moves placeholder data and checks no result, so what a
+# different convention would change is a numerical answer nobody reads.
+#
+# ROW 3, the front-end unpack, is the one that needs all six levels: a 2-D tile index over
+# a 2-D antenna plane cannot be one uniform stride, so each half of each pair is its own
+# level.  Its run is P * S2 * 2 = 48 and is CONTIGUOUS AT BOTH ENDS -- the pilot, symbol
+# and re/im axes are adjacent in the received grid and adjacent again in the patch payload.
+_CELERE_N_FULL = 11        # n_full = floor(n_span / W)
+_CELERE_L_L = 13           # L_l = W + 1, spans plus their own summary
+_CELERE_L_REM = 6          # L_rem = n_span - n_full*W + 1
+_RA_U_V, _RA_U_H = 4, 16                 # 4 x 16 dual-pol UPA, pol already on the batch axis
+_RA_G_V, _RA_G_H = 2, 2                  # antennas per patch = g_v * g_h = 4
+_PILOTS_PER_PRB, _SYMS, _RI = 12, 2, 2   # P, S2, re/im
+_SPAN_PRBS = 2
+
+# ---- Segment tables for the layout rows a HAND-OFF performs ----------------
+#
+# A leg's descriptor walks ONE BOX COLUMN at a time, because that is the axis every stage
+# splits and the axis a lane stores outermost.  Inside a column the unit is a TOKEN ROW of
+# d_model, and a layout row is then a map from the producer's token order to the
+# consumer's -- which is what these segments are.  Each is one dma_2d_strided: `reps` runs
+# of `chunk` token rows, walking the source by src_stride and the destination by
+# dst_stride, both from the segment's own base.  Everything is in TOKEN ROWS here; the
+# emitter scales by d_model and the element size.
+#
+# A SEGMENT PER RECTANGLE, for the same reason _permute_levels needs one: a level walks at
+# ONE uniform stride, and neither of these maps is uniform end to end.
+_D_MODEL, _N_BOX = 256, 16
+
+
+def _handoff_segments() -> Dict[str, Tuple[int, int, List[Tuple[str, int, int, int, int, int, int]]]]:
+    """name -> (producer token rows per column, consumer's, [segments]).
+
+    A segment is (label, chunk, src_off, dst_off, src_stride, dst_stride, reps).
+    """
+    n_full, l_l, l_rem = _CELERE_N_FULL, _CELERE_L_L, _CELERE_L_REM
+    spans, summ = l_l - 1, l_rem - 1        # spans in a whole window, in the short one
+    n_summ = n_full + 1                     # every window contributes one summary
+    n_span = n_full * spans + summ          # 137
+    return {
+        # ROW 9, the lattice scatter.  Row 7 embedded PAT and WIN CONCATENATED on i_2, so
+        # the producer holds [every span | every summary]; row 9's own description asks for
+        # window-major [w0 spans | w0 summary | w1 ... | spell].  Interleaving one summary
+        # after every window's spans is the whole of it, and it takes four rectangles: the
+        # whole windows' spans and summaries walk at a uniform stride, the short last
+        # window's do not.  THE SPELL ROW HAS NO SOURCE -- it is learned, one per box
+        # column -- so 149 rows cross and the consumer's 150th is left alone.
+        'row9_lattice': (n_span + n_summ, n_span + n_summ + 1, [
+            ('whole windows, spans',    spans, 0,             0,     spans, l_l,   n_full),
+            ('short window, spans',     summ,  n_full * spans, n_full * l_l, summ, summ, 1),
+            ('whole windows, summaries', 1,    n_span,        spans, 1,     l_l,   n_full),
+            ('short window, summary',    1,    n_span + n_full, n_full * l_l + summ, 1, 1, 1),
+        ]),
+        # ROW 33, the observation-carrier gather.  It drops the spell row, which row 9 put
+        # LAST in the column, so what crosses is each column's leading n_obs rows -- and
+        # the crop lives in the PITCH DIFFERENCE, the producer's column being one row
+        # longer than the consumer's.  One rectangle, and it is only not a plain copy
+        # because a lane holds more than one column.
+        'row33_crop': (n_span + n_summ + 1, n_span + n_summ, [
+            ('drop the spell row', n_span + n_summ, 0, 0, n_span + n_summ, n_span + n_summ, 1),
+        ]),
+    }
+
+
+# One permute_f16p call: (label, run, levels fastest-first, src_off, dst_off).  A level is
+# (count, src_step, dst_step) in ELEMENTS, and the two offsets are where the call starts in
+# the row's source and destination buffers -- both 0 for a row that takes one call.
+PermCall = Tuple[str, int, List[Tuple[int, int, int]], int, int]
+
+
+def _permute_levels(row: LayerRow, n_par: int) -> List[PermCall]:
+    """One (label, run, levels fastest-first, src_off, dst_off) per CALL, for ONE LANE.
+
+    A row takes more than one call for either of two reasons.  Its shape may not be one
+    rectangle -- rows 22 and 28 have the n_full whole folds and one short L_rem fold, row
+    44 a cropped last token -- and emitting each rectangle separately is what keeps every
+    level's stride uniform.  Or its op may name SEVERAL TENSORS (PERMUTE_TENSORS): row 15
+    gathers Q, K and U out of one QKV and row 22 folds Q and K, and each of those is its
+    own walk.  The two multiply: row 22 is 2 tensors x 2 rectangles = 4 calls.
+
+    EVERY STRIDE IS THIS LANE'S, NOT THE MODEL'S.  _row_shape divides every extent by
+    n_par * tiles, so the buffer these walk holds n_box / n_par boxes; a stride built from
+    the full box grid steps n_par times too far and runs off the end of X_BUF.  The lane's
+    own counts (box, bh_lane, bv_lane) are what every stride is built from.
+
+    THE OFFSETS ARE WHAT PLACE A CALL, and a call that is not the first of its row needs
+    them: the remainder fold starts where the whole folds stopped, and tensor t starts one
+    whole tensor past tensor t-1.  Without them every call would restart at the row's base
+    and overwrite the one before it.
+    """
+    n = row.excel_row
+    ind, outd = row.in_dims, row.out_dims
+
+    if n == 3:
+        n_bv, n_bh = _RA_U_V // _RA_G_V, _RA_U_H // _RA_G_H
+        n_box = n_bv * n_bh
+        n_span = outd[1]
+        fp = ind[1]                                   # padded pilot subcarriers
+        pspan = fp // n_span                          # 24 = span_prbs * P
+        per_ant = fp * _SYMS * _RI                    # elements one antenna contributes
+        run = _PILOTS_PER_PRB * _SYMS * _RI           # 48, contiguous both ends
+        n_bins = _RA_G_V * _RA_G_H
+        ow = pspan * n_bins * _SYMS * _RI             # out_width = 384
+        # This lane owns n_box / n_par boxes.  The split takes the HORIZONTAL tile axis
+        # first and only spills into the vertical one once it is exhausted, so a lane's
+        # boxes stay a rectangle and both levels keep a uniform stride.
+        bh_lane = n_bh // n_par if n_par <= n_bh else 1
+        bv_lane = n_bv if n_par <= n_bh else max(1, n_bv // (n_par // n_bh))
+        # The destination holds THIS LANE'S boxes back to back, so a row of them is
+        # bh_lane wide and a span is bh_lane * bv_lane of them -- not n_bh and n_box, which
+        # are the whole grid's and would leave n_par - 1 boxes' worth of hole per step.
+        return [('whole', run, [(_RA_G_H, _RA_U_V * per_ant, run),
+                     (_RA_G_V, per_ant, _RA_G_H * run),
+                     (_SPAN_PRBS, _PILOTS_PER_PRB * _SYMS * _RI, n_bins * run),
+                     (bh_lane, _RA_G_H * _RA_U_V * per_ant, ow),
+                     (bv_lane, _RA_G_V * per_ant, bh_lane * ow),
+                     (n_span, pspan * _SYMS * _RI, bh_lane * bv_lane * ow)], 0, 0)]
+
+    if n == 15:
+        # QG[b, h, t, d] = QKV[t, b, stripe*d_model + h*d_head + d].  Q, K and V are the
+        # three stripes of ONE QKV, so this is three calls: stripe s reads at column
+        # s*d_model and writes the s-th gathered tensor.
+        #
+        # THE THREE TOGETHER FILL QKV, WHICH IS ALSO WHAT THEY READ (BIND pins both ends
+        # there), so a gathered block lands on source the other stripes have not read yet.
+        # The apps move placeholder data and check no result, so what this costs is a
+        # numerical answer nobody reads; making it exact means staging through the arena,
+        # which is a partition decision -- see the module header's L1 budget.
+        n_box, n_tok, d_model = outd[0], outd[2], ind[2]
+        heads, d_head = outd[1], outd[3]
+        box = max(1, n_box // n_par)
+        row_b = box * 3 * d_model            # one token of QKV IN THIS LANE, q|k|v
+        tens = box * heads * n_tok * d_head  # one gathered tensor
+        levels = [(n_tok, row_b, d_head),
+                  (heads, d_head, n_tok * d_head),
+                  (box, 3 * d_model, heads * n_tok * d_head)]
+        return [(f'{t}G', d_head, levels, s * d_model, s * tens)
+                for s, t in enumerate(('Q', 'K', 'U'))]
+
+    if n == 22:
+        # QF[a, h, m, d] = Q[w*L_l + m, b, h*d_head + d], a = w*box + b.  TWO tensors, Q
+        # and K -- the first two stripes of QKV -- and TWO rectangles each, the n_full
+        # whole folds and the short L_rem one, so four calls.  The remainder starts where
+        # the whole folds stopped at BOTH ends: fold n_full of the source, and the
+        # n_full * bulk elements of the destination they filled.
+        n_box, d_model = outd[0], outd[2]
+        heads, d_head = 2, d_model // 2
+        box = max(1, n_box // n_par)
+        row_b = box * 3 * d_model
+        n_full, l_l, l_rem = _CELERE_N_FULL, _CELERE_L_L, _CELERE_L_REM
+        bulk = box * heads * l_l * d_head             # one whole fold, in the destination
+        tens = n_full * bulk + box * heads * l_rem * d_head        # one folded tensor
+        out: List[PermCall] = []
+        for t, name in enumerate(('Q', 'K')):
+            out.append((f'{name}F full folds', d_head,
+                        [(l_l, row_b, d_head),
+                         (heads, d_head, l_l * d_head),
+                         (box, 3 * d_model, heads * l_l * d_head),
+                         (n_full, l_l * row_b, bulk)],
+                        t * d_model, t * tens))
+            out.append((f'{name}F remainder fold', d_head,
+                        [(l_rem, row_b, d_head),
+                         (heads, d_head, l_rem * d_head),
+                         (box, 3 * d_model, heads * l_rem * d_head)],
+                        t * d_model + n_full * l_l * row_b, t * tens + n_full * bulk))
+        return out
+
+    if n == 28:
+        # UD[b, w*L_l + m, h*d_head + d] = UL[(w*box + b), h, m, d].  Two rectangles again.
+        # THE DESTINATION GAP IS THE PROOF THE SECOND ONE IS PLACED: the box stride is the
+        # whole n_tok * d_model while the whole folds cover only n_full * l_l * d_model of
+        # it, and what is left is exactly the remainder fold's l_rem tokens.
+        heads, l_l, d_head = ind[1], ind[2], ind[3]
+        n_box, n_tok, d_model = outd[0], outd[1], outd[2]
+        box = max(1, n_box // n_par)
+        n_full, l_rem = _CELERE_N_FULL, _CELERE_L_REM
+        return [('full folds', d_head,
+                 [(heads, l_l * d_head, d_head),
+                  (l_l, d_head, d_model),
+                  (n_full, box * heads * l_l * d_head, l_l * d_model),
+                  (box, heads * l_l * d_head, n_tok * d_model)], 0, 0),
+                ('remainder fold', d_head,
+                 [(heads, l_rem * d_head, d_head),
+                  (l_rem, d_head, d_model),
+                  (box, heads * l_rem * d_head, n_tok * d_model)],
+                 n_full * box * heads * l_l * d_head, n_full * l_l * d_model)]
+
+    if n == 40:
+        # ZS: fold order -> [physical | summary] on o_2, boxes on o_3.  Run = d_model, and
+        # both ends are contiguous over it, so this is one level plus the run.
+        n_tok, n_box, d_model = outd[1], outd[2], outd[3]
+        box = max(1, n_box // n_par)
+        return [('whole', d_model,
+                 [(n_tok, box * d_model, box * d_model),
+                  (box, d_model, d_model)], 0, 0)]
+
+    if n == 44:
+        # BLK: every payload row of out_width ungroups into span_prbs*n_bins per-PRB blocks
+        # of ups_in, and the physical segment is CROPPED by a contiguous tail -- 1188 kept
+        # of the 1192 the tokens make, so the last token keeps only 4 of its 8 blocks.  The
+        # bulk and that short last token are two calls, the same shape as the two static
+        # folds rows 22 and 28 take.
+        n_tok, n_box, ow = ind[1], ind[2], ind[3]
+        blocks_out, ups_in = outd[1], outd[3]
+        per_row = ow // ups_in                        # span_prbs * n_bins = 8
+        box = max(1, n_box // n_par)
+        full, tail = divmod(blocks_out, per_row)
+        out = [('bulk', ups_in, [(per_row, ups_in, box * ups_in),
+                                 (box, ow, ups_in),
+                                 (full, box * ow, per_row * box * ups_in)], 0, 0)]
+        if tail:
+            out.append(('crop tail', ups_in, [(tail, ups_in, box * ups_in),
+                                              (box, ow, ups_in)],
+                        full * box * ow, full * per_row * box * ups_in))
+        return out
+
+    raise ValueError(f'row {n} is in LAYOUT_LOWERING but has no level table; '
+                     f'_permute_levels must gain one')
+
+
+def _walk_bounds(run: int, extents: List[Tuple[int, int]], base: int) -> Tuple[int, int]:
+    """[lowest, one-past-highest] element a levelled walk touches, from `base`.
+
+    Steps are SIGNED -- a level that unfolds an axis walks backwards -- so the two ends
+    accumulate separately; a plain sum would net a backward level against a forward one and
+    report a span narrower than the walk really covers.
+    """
+    lo = hi = base
+    for n, step in extents:
+        span = (n - 1) * step
+        if span < 0:
+            lo += span
+        else:
+            hi += span
+    return lo, hi + run
+
+
+def _check_permute_extents(stages: List[Stage], pool: str) -> None:
+    """Every permute call must stay inside X_BUF.  Raises if one does not.
+
+    WHY THIS EXISTS.  A level table is data, and a stride built from the model's extents
+    rather than the lane's overruns silently: the cores walk past X_BUF, through W_BUF and
+    over the barrier counter, and the app hangs tens of thousands of cycles later with all
+    of them asleep in wfi and nothing in the trace pointing back here.  The walk is
+    arithmetic the generator already has, so it can say so before the app is written.
+    """
+    nx, _nw = _scratch_elems(stages, pool)
+    for st in stages:
+        for item in st.items:
+            if LAYOUT_LOWERING.get(item.row.excel_row) != 'permute':
+                continue
+            base_x, base_y = _item_offsets(item, st, pool)
+            for label, run, levels, s_off, d_off in _permute_levels(item.row, st.n_par):
+                for end, base, col in (('source', base_x + s_off, 1),
+                                       ('destination', base_y + d_off, 2)):
+                    lo, hi = _walk_bounds(run, [(l[0], l[col]) for l in levels], base)
+                    if lo >= 0 and hi <= nx:
+                        continue
+                    raise ValueError(
+                        f'stage {st.idx + 1} row {item.row.excel_row} '
+                        f'({label!r}): its {end} walk covers [{lo}, {hi}) of an X_BUF of '
+                        f'{nx} elements.  A permute level built from the model\'s extents '
+                        f'instead of this lane\'s (n_par = {st.n_par}) steps too far -- '
+                        f'see _permute_levels.')
+
 
 def _layer_cycles(ms: float, cycles_per_ms: float) -> int:
     return max(1, int(ms * cycles_per_ms))
@@ -1947,6 +2558,32 @@ def _render_item(item: Item, idx: int, st: Stage, pool: str, bench: bool, dbl: b
     elif c == 'add':
         work.append(f'axpy_f16vecp_local_unrolled4(0x3C00u, {xbuf}, {ybuf}, '
                     f'{sh["len"]}u);  /* {tag}: Y += X */')
+    elif c == 'free':
+        # A VIEW: its operand is already in the order the consumer wants, so there is
+        # nothing to emit.  The comment stays, because the row is a real step of the
+        # network and a reader looking for it should find it here rather than conclude it
+        # was forgotten.
+        work.append(f'/* {tag}: {_c_comment(sh["why"])} -- no code, no cycles. */')
+    elif c == 'pool':
+        work.append(f'pool_mean_f16p({xbuf}, {ybuf}, {sh["n_in"]}u, {sh["n_out"]}u, '
+                    f'{sh["win"]}u, {sh["lane"]}u, cid, nt);  /* {tag} */')
+        work.append('flex_intra_cluster_sync();')
+    elif c == 'permute':
+        # One call per rectangle -- see _permute_levels for why some rows need two -- and
+        # one level table each, emitted beside the call so the map can be read here.
+        # A SYNC AFTER EVERY RECTANGLE: the kernel ends with no barrier of its own, so
+        # without one a core would enter the next call while another is still in this
+        # one, and the two rectangles of a split row address the same buffer.
+        calls = _permute_levels(row, st.n_par)
+        for j, (label, run, levels, s_off, d_off) in enumerate(calls):
+            nm = f'lv{item.excel_row}_{idx}_{j}'
+            work.append(f'static const perm_level_t {nm}[] = {{')
+            for (cnt, ss, ds) in levels:
+                work.append(f'    {{ {cnt}u, {ss}, {ds} }},')
+            work.append(f'}};  /* {_c_comment(label)} */')
+            work.append(f'permute_f16p({xbuf}{off(s_off)}, {ybuf}{off(d_off)}, {run}u, '
+                        f'{nm}, {len(levels)}u, cid, nt);  /* {tag} */')
+            work.append('flex_intra_cluster_sync();')
     elif c == 'wait':
         # The stand-in keeps the rendezvous the kernel it replaces would have ended on:
         # every core spins the same count, so the barrier is nearly free.
@@ -2076,9 +2713,10 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
         L.append('/* ---- Per-cluster compute: one mempool_wait() per layer (timing only). */')
     else:
         L.append('/* ---- Per-cluster compute: real baremetal kernel calls, X -> Y.')
-        L.append('   rope, pool and the layout rows are mempool_wait() even here: no')
-        L.append('   kernel for them exists in the tree.  See LAYOUT ROWS in the')
-        L.append('   generator\'s docstring for what that does and does not measure. */')
+        L.append('   ROPE IS THE ONLY STAND-IN LEFT: it alone has no kernel in the tree,')
+        L.append('   and it alone is a mempool_wait() here.  pool runs pool_mean_f16p and')
+        L.append('   every layout row is a permute_f16p, a hand-off descriptor or a view')
+        L.append('   -- see LAYOUT ROWS in the generator\'s docstring for which is which. */')
     arg = 'uint32_t buf' if dbl else 'void'
     for st in stages:
         work = ', '.join(i.label for i in st.items)
@@ -2409,11 +3047,15 @@ def _render_prologue(pool: str, stages: List[Stage], cycles_per_ms: float,
         ' * set, unrolled onto its own clusters rather than looped.  A WHOLE pass is one',
         ' * stage, so nothing crosses between clusters inside one of these functions.',
         ' *',
-        ' * rope, pool and every layout row are mempool_wait() in every mode: no kernel for',
-        ' * them exists in the tree. */',
+        ' * ROPE IS THE ONLY TIMING STAND-IN: no kernel for it exists in the tree, so it',
+        ' * is a mempool_wait() in every mode.  Every other row runs -- pool on the cores,',
+        ' * and each layout row as a permute_f16p, as the address pattern of a hand-off',
+        ' * descriptor, or as a view that was already in the order its consumer wanted. */',
         '',
     ]
     L += _render_includes(wait)
+    L.append('')
+    L += _render_stack_note(stages)
     L.append('')
     if wait:
         L.append(f'#define CYCLES_PER_MS  {int(cycles_per_ms)}UL')
@@ -2436,6 +3078,10 @@ def _render_prologue(pool: str, stages: List[Stage], cycles_per_ms: float,
     L.append('')
     L += _render_scratch_buffers(stages, pool, dbl)
     L.append('')
+    if not wait:
+        # The bodies below are what would carry a level table off the end of X_BUF, so the
+        # walk is checked here, before any of them is written.
+        _check_permute_extents(stages, pool)
     L += _render_compute_stage_fns(stages, pool, wait, cycles_per_ms, bench, dbl)
     return L
 
@@ -2458,8 +3104,11 @@ def _render_lpddr_helper() -> List[str]:
         ' *',
         ' * hbm_addr() is deliberately NOT used: it is west node 0, and the west edge holds',
         ' * no nodes (see HBM_CHAN_PLACEMENT). */',
-        f'{_INLINE_T("uint64_t")} lpddr_node_addr(uint32_t edge, uint32_t node,',
-        f'{" " * (len(_INLINE_T("uint64_t")) + len(" lpddr_node_addr("))}uint32_t off)',
+        # A LEAF, and inline on purpose: it folds an edge, a node and an offset into one
+        # address and spills nothing, so a frame of its own would only deepen the transfer
+        # chain.  See the NO_INLINE note for where the line is drawn.
+        f'{_LEAF_T("uint64_t")} lpddr_node_addr(uint32_t edge, uint32_t node,',
+        f'{" " * (len(_LEAF_T("uint64_t")) + len(" lpddr_node_addr("))}uint32_t off)',
         '{',
         '    return edge == LPDDR_EDGE_NORTH ? hbm_north(node, off)',
         '                                    : hbm_south(node, off);',

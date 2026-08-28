@@ -10,6 +10,12 @@
         "TensorPool": 6.62
     },
 
+    "_comment_cores": "num_core_per_cluster of the matching software/runtime/multi_cluster/configs/arch_*.py. Only the permutation kernels read it: a permutation carries no FLOPs, so it is charged per element per core rather than against a peak -- see LAYOUT_CYCLES_PER_ELEM in celere_pipeline.py.",
+    "cores": {
+        "Terapool": 1024,
+        "TensorPool": 256
+    },
+
     "_comment_util": "PE_utilization derates the PE path (non-GEMM everywhere, plus GEMMs on a pool with no tensor engine). TE_utilization derates GEMM_peak on pools that have one (TensorPool's RedMulE) and does not affect Terapool.",
     "PE_utilization": 0.28,
     "TE_utilization": 0.4,

@@ -571,3 +571,178 @@ def generate_fmultihead(my_type=np.float32, defines={}):
     Z = np.reshape(Z, (H * M * N), order="C").astype(my_type)
 
     return [X, Y, W_q, W_k, W_v, Z], defines
+
+
+def generate_fflashattention(my_type=np.float16, defines={}):
+    """Single-head scaled dot-product attention.
+
+    Reference for software/apps/nn/flashattention_f16, which computes the same
+    thing with the FlashAttention tiling.  The golden output is the exact
+    softmax evaluated in float64 -- not fsoftmax_taylor, because that app
+    implements a real exponential rather than the Taylor approximation of
+    mempool_softmax_f16.h.
+    """
+    seq_len = defines['SEQ_LEN']
+    head_dim = defines['HEAD_DIM']
+
+    # Normal, not the usual uniform(-0.5, 0.5): with head_dim = 32 and the
+    # 1/sqrt(d) scaling the latter gives a score spread of ~0.05, i.e. a nearly
+    # uniform softmax, which would not exercise the exponential at all.
+    Q = np.random.randn(seq_len, head_dim).astype(my_type)
+    K = np.random.randn(seq_len, head_dim).astype(my_type)
+    V = np.random.randn(seq_len, head_dim).astype(my_type)
+
+    S = np.matmul(Q.astype(np.float64), K.astype(np.float64).T)
+    S = S / math.sqrt(head_dim)
+    P = np.exp(S - np.max(S, axis=1, keepdims=True))
+    P = P / np.sum(P, axis=1, keepdims=True)
+    O = np.matmul(P, V.astype(np.float64))
+
+    Q = np.reshape(Q, (seq_len * head_dim), order='C').astype(my_type)
+    K = np.reshape(K, (seq_len * head_dim), order='C').astype(my_type)
+    V = np.reshape(V, (seq_len * head_dim), order='C').astype(my_type)
+    O = np.reshape(O, (seq_len * head_dim), order='C').astype(my_type)
+
+    return [Q, K, V, O], defines
+
+
+# Golden models for the four layout kernels in software/kernels/baremetal:
+# mempool_{patchify,permute,pool,transpose}_f16.h.  Each is an index map or a
+# plain reduction, so the golden is the map as the kernel's own header states
+# it -- not as the kernel walks it, which is what the test checks.  The shapes
+# are the ones the CELERE and CEViT pipelines use, unscaled.
+
+
+def generate_fpatchify(my_type=np.float32, defines={}):
+    """[Nf, Nt, C] grid <-> [n_tok, Nh*Nw] token rows.
+
+    token = (fb * (Nt/Nw) + tb) * C + c, p = (f - fb*Nh) * Nw + (t - tb*Nw)
+    """
+    grid_F = defines['grid_F']
+    grid_T = defines['grid_T']
+    grid_C = defines['grid_C']
+    patch_H = defines['patch_H']
+    patch_W = defines['patch_W']
+
+    n_tb = grid_T // patch_W
+    n_tok = (grid_F // patch_H) * n_tb * grid_C
+    # patch_NTOK, not n_tok: the define is in scope wherever the header is
+    # included, and n_tok is also patchify_f16p's own parameter name.
+    defines['patch_NTOK'] = n_tok
+    defines['patch_P'] = patch_H * patch_W
+
+    A = (np.random.rand(grid_F, grid_T, grid_C) - 0.5).astype(my_type)
+    B = np.zeros((n_tok, patch_H * patch_W), dtype=my_type)
+    for f in range(grid_F):
+        fb, a = divmod(f, patch_H)
+        for t in range(grid_T):
+            tb, w = divmod(t, patch_W)
+            for c in range(grid_C):
+                tok = (fb * n_tb + tb) * grid_C + c
+                B[tok][a * patch_W + w] = A[f][t][c]
+
+    A = np.reshape(A, (grid_F * grid_T * grid_C), order='C')
+    B = np.reshape(B, (n_tok * patch_H * patch_W), order='C')
+    return [A, B], defines
+
+
+# CELERE's front-end unpack (template row 3): six levels, the most
+# permute_f16p takes.  celere_pipeline.py's _permute_levels emits this same
+# table, and the map is a dense bijection at both ends -- a wrong stride has to
+# land on an element another run owns, so it cannot pass unnoticed.
+_PERM_SPANS = 137                            # subcarrier spans, 273 PRB
+_PERM_PSPAN = 24                             # span_prbs * P
+_PERM_P, _PERM_S2, _PERM_RI = 12, 2, 2       # pilots per PRB, symbols, re/im
+_PERM_U_V, _PERM_U_H = 4, 16                 # the 4 x 16 dual-pol UPA
+_PERM_G_V, _PERM_G_H = 2, 2                  # antennas per patch
+_PERM_SPAN_PRBS = 2
+_PERM_NPAR = 2                               # lanes; this app is one of them
+
+
+def _permute_map(n_par=_PERM_NPAR):
+    """(run, levels fastest-first) for one lane of CELERE's row 3."""
+    fp = _PERM_SPANS * _PERM_PSPAN
+    per_ant = fp * _PERM_S2 * _PERM_RI
+    run = _PERM_P * _PERM_S2 * _PERM_RI
+    n_bins = _PERM_G_V * _PERM_G_H
+    ow = _PERM_PSPAN * n_bins * _PERM_S2 * _PERM_RI
+    n_bv, n_bh = _PERM_U_V // _PERM_G_V, _PERM_U_H // _PERM_G_H
+    bh = n_bh // n_par if n_par <= n_bh else 1
+    bv = n_bv if n_par <= n_bh else max(1, n_bv // (n_par // n_bh))
+    return run, [
+        (_PERM_G_H, _PERM_U_V * per_ant, run),
+        (_PERM_G_V, per_ant, _PERM_G_H * run),
+        (_PERM_SPAN_PRBS, _PERM_P * _PERM_S2 * _PERM_RI, n_bins * run),
+        (bh, _PERM_G_H * _PERM_U_V * per_ant, ow),
+        (bv, _PERM_G_V * per_ant, bh * ow),
+        (_PERM_SPANS, _PERM_PSPAN * _PERM_S2 * _PERM_RI, bh * bv * ow),
+    ]
+
+
+def generate_fpermute(my_type=np.float32, defines={}):
+    """A levelled strided copy, and the level table that drives it.
+
+    The table is a third array of int32 triples -- print_array writes flat
+    typed arrays only -- so main.c fills the struct from it.  One source of
+    truth: the same table makes the golden and drives the kernel.
+    """
+    run, levels = _permute_map()
+    total = 1
+    for n, _, _ in levels:
+        total *= n
+    array_N = total * run
+    defines['array_N'] = array_N
+    defines['perm_NLEV'] = len(levels)
+    defines['perm_RUN'] = run
+
+    A = (np.random.rand(array_N) - 0.5).astype(my_type)
+    B = np.zeros(array_N, dtype=my_type)
+
+    def walk(k, so, do):
+        if k < 0:
+            B[do:do + run] = A[so:so + run]
+            return
+        n, ss, ds = levels[k]
+        for i in range(n):
+            walk(k - 1, so + i * ss, do + i * ds)
+    walk(len(levels) - 1, 0, 0)
+
+    lv = np.array([v for lev in levels for v in lev], dtype=np.int32)
+    return [A, B, lv], defines
+
+
+def generate_fpool(my_type=np.float32, defines={}):
+    """out[w, j] = (1/win) * SUM_{s in window w} in[s, j].
+
+    THE DIVISOR IS ALWAYS `win`, the short final window included: the model
+    pools a zero-padded block, so its 5 live rows of 12 are still divided by
+    12.  That is the kernel's least obvious contract, so the golden states it
+    rather than calling np.mean.
+    """
+    n_in = defines['pool_NIN']
+    n_out = defines['pool_NOUT']
+    win = defines['pool_WIN']
+    lane = defines['pool_LANE']
+
+    A = (np.random.rand(n_in, lane) - 0.5).astype(my_type)
+    B = np.zeros((n_out, lane), dtype=my_type)
+    for w in range(n_out):
+        rows = A[w * win:min(w * win + win, n_in)].astype(np.float64)
+        B[w] = (np.sum(rows, axis=0) / win).astype(my_type)
+
+    A = np.reshape(A, (n_in * lane), order='C')
+    B = np.reshape(B, (n_out * lane), order='C')
+    return [A, B], defines
+
+
+def generate_ftranspose(my_type=np.float32, defines={}):
+    """dst[c][r] = src[r][c]."""
+    matrix_M = defines['matrix_M']
+    matrix_N = defines['matrix_N']
+
+    A = (np.random.rand(matrix_M, matrix_N) - 0.5).astype(my_type)
+    B = A.T.copy()
+
+    A = np.reshape(A, (matrix_M * matrix_N), order='C')
+    B = np.reshape(B, (matrix_M * matrix_N), order='C')
+    return [A, B], defines

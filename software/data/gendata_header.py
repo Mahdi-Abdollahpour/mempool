@@ -91,7 +91,10 @@ def print_array(arr, typ, name):
             count += 1
             if count % 4 == 0:
                 output_string += '\n'
-        output_string = output_string[:-3]
+        # Drop the trailing separator, whatever it is.  A fixed [:-3] assumed
+        # the last element landed on a newline, true only when arr.size is a
+        # multiple of 4; on any other length it ate the value's last digit.
+        output_string = output_string.rstrip().rstrip(',')
         output_string += "};\n\n"
     else:
         output_string += attr
@@ -256,6 +259,10 @@ if __name__ == '__main__':
         "layernorm_f8": {"func": datalib_nn.generate_flayernorm},
         "layernorm_f16": {"func": datalib_nn.generate_flayernorm},
         "gelu_f16": {"func": datalib_nn.generate_fgelu},
+        "patchify_f16": {"func": datalib_nn.generate_fpatchify},
+        "permute_f16": {"func": datalib_nn.generate_fpermute},
+        "pool_f16": {"func": datalib_nn.generate_fpool},
+        "transpose_f16": {"func": datalib_nn.generate_ftranspose},
         "ofdm_f16": {"func": datalib.generate_fofdm},
         "softmax_f8": {"func": datalib_nn.generate_fsoftmax},
         "softmax_f16": {"func": datalib_nn.generate_fsoftmax},
