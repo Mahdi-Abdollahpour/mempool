@@ -12,26 +12,38 @@ software/apps/multi_cluster/cevit_<mode>_<pool>/main.c.
     python cevit_pipeline.py CEViT_273PRBs.csv config.json --plot
 
     ctt  compute-then-transfer: stage s is SKEWED BY s STEPS, so it works on item m at step
-         m + s.  TWO barriers a step, one L1 buffer set, compute and DMA serialized.  Period =
-         slowest compute + slowest transfer over the whole partition, because the barrier
-         stops the two covering for each other.
+         m + s.  A cluster computes and then transfers back to back with NO barrier between
+         them, and ONE barrier closes the step.  Period = max over stages of (compute +
+         transfer): a cluster serialises its own two halves, but two stages with different
+         bottlenecks cover for each other, so the slowest compute and the slowest transfer
+         are only added when they fall on the SAME stage.
     cwt  compute-while-transfer: stage s is SKEWED BY 2s STEPS, so it works on item m at step
          m + 2s.  That leaves a spare step between a producer and its consumer for the
-         transfer to run in, and needs ONE barrier a step.  A step reads item i's OWN input,
-         waits for it, then issues item i-1's drain beside the compute, so the wall is
+         transfer to run in, and needs ONE barrier a step too.  A step reads item i's OWN
+         input, waits for it, then issues item i-1's drain beside the compute, so the wall is
          data_in + max(compute, transfer): flex_dma_async_wait_all() is the only wait the DMA
          shim has, so the read cannot be hidden as well.
 
+NEITHER MODE HAS A BARRIER BETWEEN COMPUTE AND TRANSFER, so in both a predecessor can be
+pushing while its consumer computes, and BOTH DOUBLE THE HAND-OFF LANDING ZONE.  What
+separates them is the OUTBOUND end: under ctt a push completes before the barrier that ends
+the step, so the source it reads is never live across a compute and needs no twin, while
+under cwt the drain is deliberately left running beside the next compute and does.
+
 SCOPE.  THIS PARTITION IS TUNED FOR TENSORPOOL.  The stage widths were chosen against its
-RedMulE GEMM peak, where the period is 0.087 ms against Terapool's 0.526; on Terapool a GEMM is
+RedMulE GEMM peak, where the period is 0.071 ms against Terapool's 0.510; on Terapool a GEMM is
 a PE matmul and the balance moves -- the attention core becomes the wall instead of the FFN
 block -- so a Terapool-first partition would want different widths, not just a different
 config.  The Terapool numbers are honest output of the same model, they are simply not what the
-shape was optimised for.  All four apps do fit L1, between 2343 and 2718 KiB.
+shape was optimised for.  All four apps do fit L1, between 2663 and 2718 KiB.
 
-Both are generated, for both pools -- four apps.  Under cwt only what crosses an item boundary
-takes a second copy (a hand-off's landing zone and whatever an outbound transfer reads), and
-only for the stage a cluster is on.
+CWT IS BARELY WORTH IT HERE, and the model says so: 2.1% of the period on TensorPool, 0.3% on
+Terapool.  The transfers are small beside the compute, so hiding them buys almost nothing,
+while cwt pays for it in a second outbound copy and in twice the time in flight.  ctt is the
+schedule to quote unless the transfer column grows.
+
+Both are generated, for both pools -- four apps.  Only what crosses an item boundary takes a
+second copy, and only for the stage a cluster is on.
 
 THE PARTITION IS NOT SEARCHED FOR.  It lives in STAGES below: THREE stages of TWO, SIX and TWO
 clusters, ten working clusters on a 4 x 3 grid of twelve.
@@ -123,8 +135,10 @@ boundary 1 -> 2, so raising lpddr_channels buys little.  The FFN residual never 
 L1 BUDGET.  Stage 2 sets it and its score matrix sets stage 2: [364 queries x 1092 keys],
 written once by Q*K^T and once by the softmax, is 1.6 MiB of the 2.0 MiB the stage declares.
 Row 13's K^T adds 137 KiB to that -- the price of transposing out of place, and the only L1 the
-real permutations cost on this stage.  About 2.3 MiB against TensorPool's 3948 KiB and
-Terapool's 3544, with no tiling.  Two heads per lane is a BATCH loop and the emitter will not
+real permutations cost on this stage.  Stage 2 is also the only stage that pays for the doubled
+landing zone, 318.5 KiB of it, because it is the only one whose input arrives over a boundary
+rather than off-chip.  About 2.6 MiB against TensorPool's 3948 KiB and Terapool's 3544, with no
+tiling.  Two heads per lane is a BATCH loop and the emitter will not
 nest a tiling inside one, so `tiles` must stay 1 here; a larger PRB count needs a wider stage 2,
 a tiling, or both.
 
@@ -147,6 +161,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -378,7 +393,13 @@ STAGES: List[dict] = [
 # periods for the shapes this script has been through:
 #
 #                                     clusters   ctt TensorPool   ctt Terapool   cluster-ms
-#   2 / 6 / 2, this one                  10       0.0869 ms        0.5263 ms        0.869
+#   2 / 6 / 2, this one                  10       0.0707 ms        0.5100 ms        0.707
+#
+# THE ROWS BELOW WERE MEASURED UNDER THE OLD TWO-BARRIER ctt, whose period was the slowest
+# compute PLUS the slowest transfer.  They are kept because the RANKING is what they were for,
+# and the transfers are small enough here that it does not move; but do not compare them
+# against the row above, and re-measure before quoting one.
+#
 #   1 / 4 / 2, stage 3 doubled            7       0.1546           0.5944           1.082
 #   6 + 2, replicated front end           8       0.0896           0.5564           0.717
 #   8 + 2, replicated front end          10       0.0730           0.5079           0.730
@@ -1156,8 +1177,8 @@ def _check_alignment(stages: List[Stage], geom: Geometry) -> None:
                 raise ValueError(
                     f'{what}: the {x.name} descriptor is not {DMA_LINE_B} B aligned -- '
                     + ', '.join(f'{n} = {v}' for n, v in sorted(bad.items()))
-                    + f'.  Every run would straddle two DMA lines and the leg would go at '
-                      f'half rate, which the byte-based cost model cannot see.')
+                    + '.  Every run would straddle two DMA lines and the leg would go at '
+                      'half rate, which the byte-based cost model cannot see.')
 
     for i, st in enumerate(stages):
         for p in range(st.n_par):
@@ -1253,23 +1274,25 @@ def _check_patch_slab(stages: List[Stage], geom: Geometry) -> None:
 def _slots_needed(w: int, r: int, mode: str) -> int:
     """Item-rotation depth a tensor written by stage `w` and read by stage `r` needs.
 
-    ctt, WAVEFRONT m + s.  Item m is written in the TRANSFER phase of step m + w and read
-    in the COMPUTE phase of step m + r, so the writes strictly between are items
-    m+1 .. m+r-w-1 and r - w slots suffice.  Item m + (r - w) does reuse slot m % slots,
-    but in that step's transfer phase, after the barrier that ended the read's compute
-    phase.
+    ctt, WAVEFRONT m + s.  Item m is written after the compute of step m + w and read at
+    the top of step m + r, so the writes strictly between are items m+1 .. m+r-w-1.  THE
+    WRITE IN THE SAME STEP AS THE READ HAS TO MISS TOO: item m + (r - w) is pushed in step
+    m + r by a writer that may have finished its own compute while the reader is still in
+    its, and ONE barrier a step orders nothing inside a step.  Hence (r - w) + 1.
+
+    (It was r - w when ctt had a second barrier between compute and transfer, which put
+    that write strictly after the read's compute.  Dropping that barrier is what costs the
+    extra slot, and it is the same reason the landing zone is doubled -- see _par_doubled.)
 
     cwt, WAVEFRONT m + 2s.  Item m is drained in step m + 2w + 1 and read at the TOP of
-    step m + 2r.  THE WRITE IN THE SAME STEP AS THE READ HAS TO MISS TOO, and that is the
-    whole difference: cwt has ONE barrier a step and nothing orders two different clusters
-    inside it.  Hence 2(r - w).
+    step m + 2r, and the same same-step write has to miss, so 2(r - w).
 
     A tensor written and read inside one step needs 1 either way.
     """
     gap = r - w
     if gap <= 0:
         return 1
-    return max(1, 2 * gap if mode == 'cwt' else gap)
+    return 2 * gap if mode == 'cwt' else gap + 1
 
 
 def _check_lpddr_slots(stages: List[Stage]) -> None:
@@ -1569,9 +1592,10 @@ def _handoff_consts(stages: List[Stage], geom: Geometry) -> List[Tuple[str, List
           for r in _y_regions(stages, geom, 2, 'TensorPool')}
     tq = geom.tokens // c1.q_split
 
+    # Only the two BYTE figures: a boundary descriptor is built out of strides and run
+    # lengths, so the head and token counts behind them are named in the notes rather
+    # than #defined -- nothing below the geometry block ever reads them as numbers.
     shared = [
-        ('HEADS',    geom.heads,   'attention heads in the model'),
-        ('TOKENS',   geom.tokens,  'the whole model'),
         ('DH_B',     geom.d_head * BYTES_PER_ELEM,
                      'd_head in bytes -- one DMA run, one whole 64 B line'),
         ('DM_B',     geom.d_model * BYTES_PER_ELEM, 'd_model in bytes'),
@@ -1925,9 +1949,9 @@ class Leg:
 # so no boundary can carry it.  The FFN residual is not like that: row 19 -> row 28 never
 # leaves a lane.
 #
-# FOUR SLOTS, BECAUSE cwt NEEDS FOUR AND BOTH APPS READ THIS TABLE.  ctt would do with two
-# -- its late write sits behind the barrier that ended the read's compute phase -- but cwt
-# has ONE barrier a step, so the write CONCURRENT with the read needs a slot of its own.
+# FOUR SLOTS, BECAUSE cwt NEEDS FOUR AND BOTH APPS READ THIS TABLE.  ctt needs three: both
+# schedules have ONE barrier a step, so the write CONCURRENT with the read needs a slot of
+# its own in either, and cwt's wider wavefront then doubles the distance on top of that.
 # _slots_needed derives both numbers and _check_lpddr_slots holds the table to the deeper.
 #
 # TWO PIECES, ONE PER LANE, and 'share' is what makes the two ends NAME THE SAME BYTES:
@@ -2453,21 +2477,25 @@ def _overlap_wall(st: Stage) -> float:
 def _makespan(stages: List[Stage], overlap: bool) -> float:
     """Steady-state period of one pipeline step = what throughput is 1/of.
 
-    Both schedules rendezvous every cluster on a global barrier, so a step costs the
-    slowest thing running inside each barriered phase:
+    ONE BARRIER A STEP IN BOTH SCHEDULES, so a step costs the slowest stage's own wall and
+    nothing is added across stages:
 
-      * ctt: compute -> barrier -> transfer -> barrier, TWO SUBSTAGES, so the step is
-        max_s(compute_s) + max_s(transfer_s).  That is >= the naive
-        max_s(compute_s + transfer_s) whenever the slowest compute and the slowest
-        transfer sit on different stages: the barrier stops them covering for each other.
-      * cwt: one barrier per step, so the step is the slowest stage's own wall.
+      * ctt: a cluster computes then transfers back to back, with no barrier between the
+        two, so its wall is compute + transfer and the step is max_s(compute_s +
+        transfer_s).  Two stages with different bottlenecks cover for each other: the
+        slowest compute and the slowest transfer are only added when they are the SAME
+        stage.  What makes the missing barrier safe is the doubled landing zone -- see
+        _par_doubled.
+      * cwt: the transfer runs beside the compute instead of after it, so the wall is the
+        taller of the two on top of the inbound read -- see _overlap_wall.
+
+    Kept identical to celere_pipeline._makespan so the two models stay comparable.
     """
     if not stages:
         return 0.0
     if overlap:
         return max(_overlap_wall(st) for st in stages)
-    return (max(st.compute_ms  for st in stages)
-            + max(st.transfer_ms for st in stages))
+    return max(st.compute_ms + st.transfer_ms for st in stages)
 
 
 # ---------------------------------------------------------------------------
@@ -2485,7 +2513,7 @@ def _print_stage_table(pool: str, stages: List[Stage], geom: Geometry,
              else 'Serialized  (ctt: compute-then-transfer)')
     model = ('data_in + max(compute, transfer)' if overlap else 'compute + transfer')
     per   = ('max_s(wall)   /* the slowest stage */' if overlap
-             else 'max_s(compute) + max_s(transfer)   /* two barriered substages */')
+             else 'max_s(compute + transfer)   /* the slowest stage */')
     bases, occupied = _stage_bases()
     n_work = sum(st.n_par for st in stages)
     idle   = occupied - n_work
@@ -2664,9 +2692,9 @@ def _render_stack_note(stages: List[Stage]) -> List[str]:
         '/* NO_INLINE: give this function ITS OWN STACK FRAME.',
         ' *',
         f' * A core gets STACK_SIZE bytes of stack ({PE_STACK_B} on both pools; see',
-        ' * config/*.mk) and _reset_vector leaves STACK_SIZE - 4 of them usable -- it starts',
-        ' * sp four bytes down and writes that limit into the stacklimit CSR.  Nothing in the',
-        ' * toolchain checks the depth against it.',
+        ' * the config makefile for each pool) and _reset_vector leaves STACK_SIZE - 4 of',
+        ' * them usable -- it starts sp four bytes down and writes that limit into the',
+        ' * stacklimit CSR.  Nothing in the toolchain checks the depth against it.',
         ' *',
         f' * INLINED, THE {n} STAGE BODIES SHARE ONE FRAME IN main(), and it is sized by the',
         ' * SUM of their spills rather than the largest of them -- main() was 432 B in this',
@@ -2688,7 +2716,8 @@ def _render_dma_helper(bench: bool, blocking: bool = True) -> str:
     """Shared C: the 2D-DMA helper every transfer in the app goes through.
 
     BLOCKING OR NOT IS A PROFILING DECISION, not a schedule one.  ctt is always blocking --
-    its transfer phase is barriered anyway.  cwt only benefits from a non-blocking issue
+    it has to be, since its pushes must land before the barrier that closes the step and it
+    has no later wait to reach them.  cwt only benefits from a non-blocking issue
     when there is a steady state to hide the transfer in, so a single-iteration run and any
     --bench run stay blocking: with the DMA waited on where it is issued, an RTL trace
     attributes cycles to that transfer.
@@ -2814,34 +2843,45 @@ def _render_stage_tables(stages: List[Stage], geom: Geometry,
             A(f'#define {name:<14} {val}u{"  /* " + note + " */" if note else ""}')
         A('')
 
-    # ---- the cwt parity constants ----
+    # ---- the parity constants.  BOTH MODES: ctt doubles its landing zone too. ----
+    # ELEMENTS, not bytes: these are added to __fp16 pointers in the compute functions and
+    # to the byte bases in the transfer helpers, so both forms are emitted -- one scaled
+    # table for the DMA side, the raw deltas for the kernels.
+    dl = [_par_deltas(stages, geom, pool, i, mode) for i in range(len(stages))]
+    dx = [0] + [d[0] for d in dl] + [0]
+    dy = [0] + [d[1] for d in dl] + [0]
+    A('/* ---- Double-buffer parity ---------------------------------------------------')
+    A(' *')
+    A(' * How far a stage\'s SECOND copy is, in bytes, indexed by the 1-based stage number.')
+    A(' * Only what a transfer touches is doubled -- so these are a good deal smaller than')
+    A(' * the buffers themselves, and a stage that doubles nothing in a buffer carries 0')
+    A(' * and its multiply folds away.')
+    A(' *')
     if mode == 'cwt':
-        # ELEMENTS, not bytes: these are added to __fp16 pointers in the compute functions
-        # and to the byte bases in the transfer helpers, so both forms are emitted -- one
-        # scaled table for the DMA side, the raw deltas for the kernels.
-        dx = [0] + [_cwt_deltas(stages, geom, pool, i)[0] for i in range(len(stages))] + [0]
-        dy = [0] + [_cwt_deltas(stages, geom, pool, i)[1] for i in range(len(stages))] + [0]
-        A('/* ---- Double-buffer parity ---------------------------------------------------')
-        A(' *')
-        A(' * How far a stage\'s SECOND copy is, in bytes, indexed by the 1-based stage')
-        A(' * number.  Only what a transfer touches is doubled -- the inbound landing zone in')
-        A(' * X, and in Y whatever an LPDDR leg or the hand-off reads -- so these are a good')
-        A(' * deal smaller than the buffers themselves.  A stage that doubles nothing in a')
-        A(' * buffer carries 0 and its multiply folds away.')
-        A(' *')
-        A(' * The compute functions take the same deltas in ELEMENTS, baked into the offsets')
-        A(' * they already carry; only the DMA side needs them at run time. */')
-        A(f'static const uint32_t XPAR[N_STAGES + 2] = '
-          f'{{ {", ".join(str(v * BYTES_PER_ELEM) + "u" for v in dx)} }};')
-        A(f'static const uint32_t YPAR[N_STAGES + 2] = '
-          f'{{ {", ".join(str(v * BYTES_PER_ELEM) + "u" for v in dy)} }};')
-        # The two a producer needs for its CONSUMER, which it cannot read out of the tables
-        # above without knowing the consumer's stage number -- so they are named directly.
-        A(f'#define S2_XPAR      {_cwt_deltas(stages, geom, pool, 1)[0] * BYTES_PER_ELEM}u'
-          f'  /* where stage 2 keeps its second inbound copy */')
-        A(f'#define S3_YPAR      {_cwt_deltas(stages, geom, pool, 2)[1] * BYTES_PER_ELEM}u'
-          f'  /* and stage 3 its second FFN_RESID */')
-        A('')
+        A(' * UNDER cwt BOTH ENDS ARE DOUBLED: the inbound landing zone in X, and in Y')
+        A(' * whatever an LPDDR leg or the hand-off reads.  Item m is still on the wire')
+        A(' * while item m+1 computes, so each end needs one copy per item in flight.')
+    else:
+        A(' * UNDER ctt ONLY THE INBOUND LANDING ZONE IS DOUBLED, so YPAR is all zeros.  A')
+        A(' * step is compute then transfer under ONE barrier, so a predecessor that')
+        A(' * finished its own compute early pushes item m into this stage\'s X while it is')
+        A(' * still computing item m-1 out of it -- that is the race, and the only one.  An')
+        A(' * outbound transfer lands before the barrier closes the step, so nothing is')
+        A(' * ever reading the source when the next compute starts.')
+    A(' *')
+    A(' * The compute functions take the same deltas in ELEMENTS, baked into the offsets')
+    A(' * they already carry; only the DMA side needs them at run time. */')
+    A(f'static const uint32_t XPAR[N_STAGES + 2] = '
+      f'{{ {", ".join(str(v * BYTES_PER_ELEM) + "u" for v in dx)} }};')
+    A(f'static const uint32_t YPAR[N_STAGES + 2] = '
+      f'{{ {", ".join(str(v * BYTES_PER_ELEM) + "u" for v in dy)} }};')
+    # The two a producer needs for its CONSUMER, which it cannot read out of the tables
+    # above without knowing the consumer's stage number -- so they are named directly.
+    A(f'#define S2_XPAR      {dx[2] * BYTES_PER_ELEM}u'
+      f'  /* where stage 2 keeps its second inbound copy */')
+    A(f'#define S3_YPAR      {dy[3] * BYTES_PER_ELEM}u'
+      f'  /* and stage 3 its second FFN_RESID (0 under ctt) */')
+    A('')
 
     # ---- LPDDR table ----
     A('/* ---- LPDDR legs ------------------------------------------------------------')
@@ -2910,8 +2950,14 @@ def _render_stage_tables(stages: List[Stage], geom: Geometry,
     return L
 
 
-def _render_push_helper(cwt: bool = False) -> str:
+def _render_push_helper() -> str:
     """Shared C: the two hand-offs, one per boundary.
+
+    BOTH MODES TAKE A PARITY, and it means the same thing in each: the low bit of the
+    item whose bytes this descriptor moves, which is what picks the consumer's copy.  A
+    stage that doubles nothing has a zero delta and the term folds away, so there is one
+    signature rather than two.  WHAT THE CALLER PASSES DIFFERS -- ctt pushes the item it
+    just computed, cwt the one it computed last step -- see the two loops.
 
     Everything here is a loop over the constants above; nothing is a descriptor table and
     nothing is a literal, so a change of width is a change of one number in STAGES.  Both
@@ -2952,16 +2998,14 @@ def _render_push_helper(cwt: bool = False) -> str:
         ' * K^T, but a descriptor that transposed on the way would walk 2-byte runs and pay',
         ' * a whole TCDM line-cycle for each one.  Row 13 does it on the cores instead,',
         ' * once K has landed -- see transpose_f16p in compute_stage_2(). */',
-        'static NO_INLINE void push_qkv(uint32_t lane, uint32_t x_base, uint64_t src'
-        + (', uint32_t alt)' if cwt else ')'),
+        'static NO_INLINE void push_qkv(uint32_t lane, uint32_t x_base, uint64_t src,',
+        '                               uint32_t par)',
         '{',
         '    uint32_t base = STAGE_BASE[STAGE_2];',
-    ] + ([] if not cwt else [
-        '    /* The consumer computes this item one step from now, on the copy whose parity',
-        '     * matches it -- the same `alt` the producer reads its own source from, because',
-        '     * both refer to the item in flight rather than the one being computed. */',
-        '    x_base += alt * S2_XPAR;',
-    ]) + [
+        '    /* The consumer computes this item on the copy whose parity matches it, so the',
+        '     * parity is the ITEM IN FLIGHT\'s, not the one the consumer is computing now. */',
+        '    x_base += par * S2_XPAR;',
+    ] + [
         '    /* This producer: the first head it holds, and which token slab it holds. */',
         '    uint32_t hp = (lane / S1_QSPLIT) * S1_HPL, qp = lane % S1_QSPLIT;',
         '    /* Where each stripe lands on the consumer; its SOURCE column is s * DM_B. */',
@@ -3002,13 +3046,15 @@ def _render_push_helper(cwt: bool = False) -> str:
         ' * loop leaves a lane\'s heads back to back in ATTNH, HEAD_SRC bytes apart.',
         ' *',
         ' * Each source overlaps only its own destinations, so A*V moves EXACTLY ONCE. */',
-        'static NO_INLINE void push_attn(uint32_t lane, uint32_t y_base, uint64_t src'
-        + (', uint32_t alt)' if cwt else ')'),
+        'static NO_INLINE void push_attn(uint32_t lane, uint32_t y_base, uint64_t src,',
+        '                                uint32_t par)',
         '{',
         '    uint32_t base = STAGE_BASE[STAGE_3];',
-    ] + ([] if not cwt else [
-        '    y_base += alt * S3_YPAR;',
-    ]) + [
+        '    /* THE CONSUMER\'S LANDING ZONE IS IN Y ON THIS BOUNDARY, not in X: row 19\'s',
+        '     * axpy wants the residual where its own outputs live.  So the parity shift is',
+        '     * a Y one, and it is the destination\'s, not this producer\'s. */',
+        '    y_base += par * S3_YPAR;',
+    ] + [
         '    uint32_t h = lane / S2_QSPLIT, q = lane % S2_QSPLIT;',
         '',
         '    for (uint32_t k = 0; k < S3_LANES; k++) {',
@@ -3028,7 +3074,7 @@ def _render_push_helper(cwt: bool = False) -> str:
     ])
 
 
-def _render_lpddr_helper(cwt: bool = False) -> str:
+def _render_lpddr_helper() -> str:
     """Shared C: the off-chip legs of one stage, in either direction.
 
     A leg moves `pieces` pieces, and where each one lives is derived from the PIECE INDEX
@@ -3047,19 +3093,19 @@ def _render_lpddr_helper(cwt: bool = False) -> str:
         ' * and uses copy (item % slots), so item m\'s residual is still there when stage 3',
         ' * reads it two steps after stage 1 wrote it.  Legs with slots == 1 ignore it. */',
         'static NO_INLINE void lpddr_move(uint32_t stage, uint32_t lane, uint32_t dir,',
-        '                              uint32_t item, uint64_t x_base, uint64_t y_base'
-        + (', uint32_t alt)' if cwt else ')'),
+        '                              uint32_t item, uint64_t x_base, uint64_t y_base,',
+        '                              uint32_t par)',
         '{',
         '    const lpddr_t *tab   = dir ? LPDDR_OUT : LPDDR_IN;',
         '    const uint8_t *first = dir ? LPDDR_OUT_FIRST : LPDDR_IN_FIRST;',
         '    uint32_t col = get_pos(flex_get_cluster_id()).x;',
-    ] + ([] if not cwt else [
-        '    /* Both directions touch the copy of the item IN FLIGHT, not the one being',
-        '     * computed: an inbound read is filling next step\'s input and an outbound write',
-        '     * is draining last step\'s output.  Same parity for both -- see the main loop. */',
-        '    x_base += (uint64_t)alt * XPAR[stage];',
-        '    y_base += (uint64_t)alt * YPAR[stage];',
-    ]) + [
+        '    /* Both directions touch the copy of the item whose bytes are moving.  NEITHER',
+        '     * TERM DOES ANYTHING TODAY: an LPDDR landing zone is never doubled, in either',
+        '     * mode, and no stage that touches LPDDR doubles anything in Y under ctt.  Kept',
+        '     * so a leg added to a doubled region does not silently read the wrong copy. */',
+        '    x_base += (uint64_t)par * XPAR[stage];',
+        '    y_base += (uint64_t)par * YPAR[stage];',
+    ] + [
         '    for (uint32_t e = first[stage]; e < first[stage + 1u]; e++) {',
         '        const lpddr_t *t = &tab[e];',
         '        uint32_t slot = t->slots > 1u ? item % t->slots : 0u;',
@@ -3208,6 +3254,18 @@ def _render_layer_call(item: Item, pool: str, cut: Cut, bench: bool = False,
     return wrap(work)
 
 
+def _names_cid_or_nt(body: List[str]) -> bool:
+    """Does this rendered stage body pass `cid` or `nt` to anything?
+
+    Read off the emitted C rather than off the item list, because it is the KERNEL SIGNATURE
+    that decides -- the core-parallel wrappers take the pair, RedMulE takes neither -- and only
+    _render_layer_call knows which one a row lowered to.  Comments are stripped first: the
+    per-row notes name both freely and would keep a dead declaration alive.
+    """
+    code = re.sub(r'/\*.*?\*/', '', '\n'.join(body), flags=re.S)
+    return re.search(r'\b(?:cid|nt)\b', code) is not None
+
+
 def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
                               cycles_per_ms: float, bench: bool = False,
                               geom: Optional[Geometry] = None,
@@ -3216,7 +3274,7 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
 
     ONE FUNCTION PER STAGE, holding the stage's whole row list in order, and NO BARRIER
     INSIDE ANY OF THEM.  That is a property of the partition, not of the emitter: no stage
-    exchanges anything with its own lanes, so the two global barriers a step needs are the
+    exchanges anything with its own lanes, so the one global barrier a step needs is the
     wavefront's own, in main().
 
     A stage is emitted as its PARTS in order.  A part is not a rendezvous -- the rows run
@@ -3241,8 +3299,8 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
         # NO_INLINE, not inline: folded into main() all three stages' spills add up in ONE
         # frame and the core's 512 B stack does not hold main + a stage + a kernel.  See
         # _render_stack_note.
-        L.append(f'static NO_INLINE void compute_stage_{st.idx + 1}(uint32_t lane'
-                 + (', uint32_t par)' if mode == 'cwt' else ')'))
+        L.append(f'static NO_INLINE void compute_stage_{st.idx + 1}(uint32_t lane, '
+                 f'uint32_t par)')
         L.append('{')
         # ALMOST no kernel addresses `lane`: every operand a stage reads is either at the
         # base of its buffer or at a fixed region offset, because the boundary lands each
@@ -3255,22 +3313,27 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
             for it in st.items)
         if not uses_lane:
             L.append('    (void)lane;')
-        # THE PARITY OFFSETS, cwt only.  `shift` maps a named region to how far its second
-        # copy is, so only the operands a transfer actually touches move on an odd item and
-        # everything else -- the score matrix, SCRATCH, the weights -- stays where it is.
+        # THE PARITY OFFSETS.  `shift` maps a named region to how far its second copy is, so
+        # only the operands a transfer actually touches move on an odd item and everything
+        # else -- the score matrix, SCRATCH, the weights -- stays where it is.  Both modes
+        # carry one; under ctt only the X landing zone is in it, and `doubled` comes back
+        # empty.  RESTRICTED TO THE REGIONS INSIDE THE DOUBLED SPAN: an X region above
+        # x_span has no twin, and shifting it would send its reads past the buffer.
         par, shift = '', {}
-        if mode == 'cwt' and geom is not None:
-            dx, dy = _cwt_deltas(stages, geom, pool, st.idx)
-            _, _, _, doubled = _cwt_doubled(stages, geom, pool, st.idx)
-            shift = {r.name: dx for r in _x_regions(stages, geom, st.idx)}
+        if geom is not None:
+            dx, dy = _par_deltas(stages, geom, pool, st.idx, mode)
+            x_span, _, _, doubled = _par_doubled(stages, geom, pool, st.idx, mode)
+            shift = {r.name: dx for r in _x_regions(stages, geom, st.idx)
+                     if r.off < x_span}
             shift.update({nm: dy for nm in doubled})
             par = 'par'
             if wait or not any(shift.values()):
                 L.append('    (void)par;')
-        if not wait:
-            L.append('    uint32_t cid = mempool_get_core_id();    /* in-cluster core id */')
-            L.append('    uint32_t nt  = mempool_get_core_count();  /* cores per cluster */')
-            L.append('    (void)cid; (void)nt;   /* unused on a RedMulE-only stage */')
+        # THE cid/nt PREAMBLE goes in here, but only if the body turns out to want it: the
+        # core-parallel kernels take the pair and RedMulE takes neither, so a stage that is
+        # all GEMM names them nowhere.  Which kernels run is not known until the calls below
+        # are rendered, so the slot is reserved now and filled in once they are.
+        cid_at = len(L)
         for part in st.parts:
             lo, hi = part.lo, part.hi
             if lo >= hi:
@@ -3310,6 +3373,10 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
                         L.append(f'{ind}{line}')
             if loop.count > 1:
                 L.append('    }')
+        if _names_cid_or_nt(L[cid_at:]):
+            L[cid_at:cid_at] = [
+                '    uint32_t cid = mempool_get_core_id();    /* in-cluster core id */',
+                '    uint32_t nt  = mempool_get_core_count();  /* cores per cluster */']
         L.append('}')
         L.append('')
     return L
@@ -3339,19 +3406,26 @@ def _render_scratch_buffers(stages: List[Stage], geom: Geometry, pool: str,
         ' * stage re-reads all its weights on every item), and for Y the placed regions,',
         ' * each big enough for what writes it AND for what later reads it (a RedMulE GEMM',
         ' * rounds M up, so it can walk further than its producer wrote). */',
-    ] + ([] if mode != 'cwt' else [
+    ] + ([
         '/*',
-        ' * UNDER cwt EACH BUFFER ALSO HOLDS A SECOND COPY of the part a transfer touches,',
-        ' * and only that part: the inbound landing zone in X, and in Y whatever an LPDDR',
-        ' * leg or the hand-off reads.  Item m\'s bytes are still moving while item m+1',
-        ' * computes, so those two ends need one each; the working set does not, because it',
-        ' * is dead the moment the step ends.  The twins are placed after everything the',
-        ' * stage claims, so reaching one is a single per-stage delta times the item\'s low',
-        ' * bit -- see the XPAR/YPAR constants and the `par` argument every compute function',
-        ' * takes.',
+        ' * EACH BUFFER ALSO HOLDS A SECOND COPY of the part a transfer touches, and only',
+        ' * that part.  The twins are placed after everything the stage claims, so reaching',
+        ' * one is a single per-stage delta times the item\'s low bit -- see the XPAR/YPAR',
+        ' * constants and the `par` argument every compute function takes.  That is why',
+        ' * these buffers are only a little larger than a single-copy build and not double.',
         ' *',
-        ' * That is why these are only a little larger than the ctt ones and not double. */',
-    ]) + [
+    ] + ([
+        # WHICH ends are doubled, not WHY -- the race that forces each twin is spelled out
+        # once, over the XPAR/YPAR constants, and repeating it here only puts two copies of
+        # the same argument in one file for a later edit to get out of step.
+        ' * UNDER cwt THAT IS BOTH ENDS: the inbound landing zone in X, and in Y whatever an',
+        ' * LPDDR leg or the hand-off reads.  The working set is doubled at neither end -- it',
+        ' * is dead the moment the step ends.  See Double-buffer parity above for why. */',
+    ] if mode == 'cwt' else [
+        ' * UNDER ctt THAT IS THE INBOUND LANDING ZONE ALONE, so nothing in Y is doubled --',
+        ' * see Double-buffer parity above for why.  Nor is an LPDDR landing zone: a stage',
+        ' * reads its own input, blocking, at the top of its own step. */',
+    ])) + [
         f'#define X_ELEMS  {nx}U',
         f'#define W_ELEMS  {nw}U',
         f'#define Y_ELEMS  {ny}U',
@@ -3381,7 +3455,7 @@ def _render_buffer_init() -> List[str]:
 
 
 def _render_ctt_loop(n_st: int) -> List[str]:
-    """The compute-then-transfer wavefront: two barriered phases a step."""
+    """The compute-then-transfer wavefront: compute then transfer, ONE barrier a step."""
     L: List[str] = []
     A = L.append
     A('    /*')
@@ -3392,11 +3466,16 @@ def _render_ctt_loop(n_st: int) -> List[str]:
     A('     *')
     A('     * The wavefront is keyed on the STAGE, not the cluster: a stage\'s lanes all')
     A('     * work on the SAME item in the same step, on different slices of it.  They need')
-    A('     * no barrier of their own -- the TWO per-step global barriers below rendezvous')
-    A('     * them.')
+    A('     * no barrier of their own -- the per-step global barrier below rendezvous them.')
     A('     *')
-    A('     * compute -> barrier -> transfer -> barrier, so compute and the outbound')
-    A('     * transfers do NOT overlap, which is also why one buffer set suffices.')
+    A('     * COMPUTE THEN TRANSFER WITH NO BARRIER BETWEEN THEM, one barrier closing the')
+    A('     * step.  A cluster serialises its own two halves, but nothing orders one cluster')
+    A('     * against another inside a step: a stage with a short compute reaches its push')
+    A('     * while a slower successor is still computing.  THAT IS WHAT THE DOUBLED LANDING')
+    A('     * ZONE IS FOR -- the producer writes the copy whose parity matches the item in')
+    A('     * flight, which is never the one the consumer is reading.  The step is therefore')
+    A('     * the slowest stage\'s own compute + transfer, not the slowest compute plus the')
+    A('     * slowest transfer.')
     A('     *')
     A('     *   LPDDR(south) --> S1 --> S2 --> S3 --> LPDDR(north)')
     A('     *                      \\                 ^')
@@ -3413,52 +3492,69 @@ def _render_ctt_loop(n_st: int) -> List[str]:
     A('        uint32_t active = (cid < N_CLUSTERS) && (stage != 0u) && (phase <= step)')
     A('                          && (step - phase < N_ITER);')
     A('        /* The item this stage is working on THIS step -- the wavefront\'s whole')
-    A('         * content.  Only the rotating LPDDR legs read it; it is meaningless when')
-    A('         * `active` is false, and nothing uses it there. */')
+    A('         * content.  The rotating LPDDR legs read it, and its low bit picks the')
+    A('         * buffer copy; it is meaningless when `active` is false, and nothing uses')
+    A('         * it there. */')
     A('        uint32_t item   = step - phase;')
+    A('        /* THE SAME BIT EVERYWHERE, and that is what makes it work: a producer is one')
+    A('         * item AHEAD of its consumer in any given step, so writing the copy of its')
+    A('         * OWN item can never be the copy the consumer is reading.  Next step the')
+    A('         * consumer takes that item and reads exactly this parity. */')
+    A('        uint32_t par    = item & 1u;')
     A('')
-    A('        /* ---- Compute phase: the inbound LPDDR read, then all cores compute ----')
+    A('        /* ---- Compute: the inbound LPDDR read, then all cores compute ----')
     A('         *')
     A('         * ONE CALL PER STAGE, holding that stage\'s whole row list and NO BARRIER OF')
     A('         * ITS OWN.  No stage exchanges anything with its own lanes -- stages 1 and 3')
     A('         * are row-wise over tokens, and a stage-2 lane owns whole heads of its own')
-    A('         * queries and reduces over nothing another lane holds -- so the two')
-    A('         * global barriers in this loop are the only rendezvous a step needs, and an')
-    A('         * idle cid simply falls through to them. */')
+    A('         * queries and reduces over nothing another lane holds -- so the one global')
+    A('         * barrier in this loop is the only rendezvous a step needs, and an idle cid')
+    A('         * simply falls through to it. */')
     A('        if (active) {')
     A('            if (LPDDR_IN_FIRST[stage] != LPDDR_IN_FIRST[stage + 1u]) {')
     A('                /* This stage takes bytes off the chip this step: the worker cores')
-    A('                 * must not start until the dm_core\'s load has landed. */')
+    A('                 * must not start until the dm_core\'s load has landed.  ITS OWN read,')
+    A('                 * blocking, of the item it is about to compute -- which is why an')
+    A('                 * LPDDR landing zone needs no second copy. */')
     A('                if (flex_is_dm_core())')
     A('                    lpddr_move(stage, lane, 0u, item,')
     A('                               (uint64_t)(uintptr_t)X_BUF,')
-    A('                               (uint64_t)(uintptr_t)Y_BUF);')
+    A('                               (uint64_t)(uintptr_t)Y_BUF, par);')
     A('                flex_intra_cluster_sync();')
     A('            }')
     A('            /* Every core computes, the dm_core included: it has finished the load and')
     A('             * the intra-cluster sync above, so it is free to join. */')
     A('            switch (stage) {')
     for i in range(n_st):
-        A(f'                case STAGE_{i + 1}: compute_stage_{i + 1}(lane); break;')
+        A(f'                case STAGE_{i + 1}: compute_stage_{i + 1}(lane, par); break;')
     A('                default: break;')
     A('            }')
-    A('        }')
-    A('        flex_global_barrier_xy();   /* compute done before ANY transfer */')
     A('')
-    A('        /* ---- Transfer phase: every active cluster ships its own output ----')
-    A('         *')
-    A('         * The LPDDR legs first (stage 1 spills the residual, stage 3 drains the')
-    A('         * channel estimate), then the boundary this stage feeds.  A stage feeds at')
-    A('         * most one, and the last stage feeds none. */')
-    A('        if (flex_is_dm_core() && active) {')
-    A('            lpddr_move(stage, lane, 1u, item, (uint64_t)(uintptr_t)X_BUF,')
-    A('                       (uint64_t)(uintptr_t)Y_BUF);')
-    A('            if (stage == STAGE_1)')
-    A('                push_qkv (lane, x_off, (uint64_t)(uintptr_t)Y_BUF);')
-    A('            else if (stage == STAGE_2)')
-    A('                push_attn(lane, y_off, (uint64_t)(uintptr_t)Y_BUF);')
+    A('            /* ---- Transfer: this cluster ships what it just computed ----')
+    A('             *')
+    A('             * NO BARRIER IN FRONT OF THIS.  The dm_core drops out of the switch above')
+    A('             * with the rest of its cluster and pushes straight away; other clusters')
+    A('             * may still be computing, and the parity is what keeps that safe.')
+    A('             *')
+    A('             * The LPDDR legs first (stage 1 spills the residual, stage 3 drains the')
+    A('             * channel estimate), then the boundary this stage feeds.  A stage feeds')
+    A('             * at most one, and the last stage feeds none.')
+    A('             *')
+    A('             * PARITY `par`, NOT `par ^ 1`: ctt drains the item it has just computed,')
+    A('             * so the bytes in flight and the bytes computed are the same item.  (cwt')
+    A('             * drains the PREVIOUS one and passes the other bit -- see')
+    A('             * _render_cwt_loop.)  BLOCKING helpers, so everything has landed before')
+    A('             * the barrier below closes the step. */')
+    A('            if (flex_is_dm_core()) {')
+    A('                lpddr_move(stage, lane, 1u, item, (uint64_t)(uintptr_t)X_BUF,')
+    A('                           (uint64_t)(uintptr_t)Y_BUF, par);')
+    A('                if (stage == STAGE_1)')
+    A('                    push_qkv (lane, x_off, (uint64_t)(uintptr_t)Y_BUF, par);')
+    A('                else if (stage == STAGE_2)')
+    A('                    push_attn(lane, y_off, (uint64_t)(uintptr_t)Y_BUF, par);')
+    A('            }')
     A('        }')
-    A('        flex_global_barrier_xy();   /* all transfers done before the next compute */')
+    A('        flex_global_barrier_xy();   /* one per step: compute AND transfer done */')
     A('    }')
     return L
 
@@ -3468,8 +3564,9 @@ def _render_cwt_loop(n_st: int, blocking: bool) -> List[str]:
 
     THE WAVEFRONT IS m + 2s, NOT m + s.  Stage s handles item m at step m + 2s, so a whole
     SPARE STEP sits between a producer finishing item m and its consumer starting on it,
-    and that is the step the transfer runs in.  ctt instead gives the transfer a barriered
-    phase of its own, which is why its period is compute PLUS transfer.
+    and that is the step the transfer runs in.  ctt instead runs the transfer straight after
+    the compute in the SAME step, which is why its wall is compute PLUS transfer where this
+    one's is the taller of the two.
 
     So at one step a cluster computes item i (on the copy whose parity matches i, after
     reading item i's own input off LPDDR) and drains item i-1 in parity i^1.
@@ -3509,7 +3606,7 @@ def _render_cwt_loop(n_st: int, blocking: bool) -> List[str]:
     A('     * is written two stages before it is read, and with ONE barrier a step there is')
     A('     * nothing ordering a later item\'s write against that read.  _slots_needed derives')
     A('     * the depth and the LPDDR tables above carry it. */')
-    A(f'    for (uint32_t step = 0; step < N_ITER + 2u * N_STAGES - 1u; step++) {{')
+    A('    for (uint32_t step = 0; step < N_ITER + 2u * N_STAGES - 1u; step++) {')
     A('        /* `it` is signed on purpose: the drain runs one step AFTER this stage\'s last')
     A('         * compute, so `it - 1` has to stay meaningful at it = 0.  Taking the low bit')
     A('         * of `it` gives compute\'s parity, and the drain\'s item differs from it in')
@@ -3586,7 +3683,7 @@ def _render_c(pool: str, stages: List[Stage], geom: Geometry,
     see _render_ctt_loop and _render_cwt_loop.
     """
     cwt = mode == 'cwt'
-    # BLOCKING TRANSFERS WHENEVER THE POINT IS TO MEASURE THEM.  ctt is barriered anyway; cwt
+    # BLOCKING TRANSFERS WHENEVER THE POINT IS TO MEASURE THEM.  ctt must block anyway; cwt
     # only gains from a non-blocking issue when there is a steady state to hide it in, and a
     # single-iteration run has none -- it is all fill and drain.  --bench likewise: a DMA that
     # is waited on where it is issued is a DMA an RTL trace can attribute cycles to.
@@ -3625,9 +3722,9 @@ def _render_c(pool: str, stages: List[Stage], geom: Geometry,
     A('\n'.join(_render_stage_tables(stages, geom, lpddr, pool, mode)))
     A(_render_dma_helper(bench, blocking))
     A('')
-    A(_render_push_helper(cwt))
+    A(_render_push_helper())
     A('')
-    A(_render_lpddr_helper(cwt))
+    A(_render_lpddr_helper())
     A('')
     lines.extend(_render_scratch_buffers(stages, geom, pool, mode))
     A('')
@@ -3718,25 +3815,45 @@ L1_GEOMETRY = {
 }
 
 
-def _cwt_doubled(stages: List[Stage], geom: Geometry, pool: str,
-                 i: int) -> Tuple[int, int, int, List[str]]:
-    """What stage `i` has to keep a SECOND copy of under cwt.
+def _par_doubled(stages: List[Stage], geom: Geometry, pool: str, i: int,
+                 mode: str = 'cwt') -> Tuple[int, int, int, List[str]]:
+    """What stage `i` has to keep a SECOND copy of under `mode`.
 
-    Returns (x_span, y_lo, y_hi, names): the inbound landing zone is elements [0, x_span)
-    of X_BUF, and the outbound sources are elements [y_lo, y_hi) of Y_BUF.
+    Returns (x_span, y_lo, y_hi, names): the doubled part of X_BUF is elements [0, x_span)
+    and the doubled part of Y_BUF is elements [y_lo, y_hi), `names` being the Y regions in
+    it.
 
-    Item m's bytes are still moving while item m+1's compute has started, so the two ends
-    a transfer touches need two copies each: the X regions a HAND-OFF lands in, and
-    whatever an LPDDR leg or the hand-off READS out of Y.
+    WHAT RACES DEPENDS ON THE SCHEDULE, and the two modes race at different ends:
 
-    AN LPDDR LANDING ZONE IS NOT DOUBLED -- the cwt loop reads item i's own input at the
-    top of step i and computes it in the same step, so one copy is only ever touched by
-    one item.  NOTHING ELSE IS EITHER: a stage's working set is dead the moment the step
-    ends, and doubling the whole of X and Y would charge stage 2 an extra 2.4 MiB for
-    score matrices no transfer reads.
+      * ctt.  A step is compute then transfer with ONE barrier closing it, so a
+        predecessor -- which may have finished its own compute early -- pushes item m into
+        this stage's landing zone while this stage is still computing item m-1 out of it.
+        THE LANDING ZONE IS THE ONLY THING THAT NEEDS A TWIN, but it is doubled WHEREVER IT
+        LANDS: boundary 1 -> 2 delivers into the consumer's X and boundary 2 -> 3 into its
+        Y, where row 19's axpy wants the residual, so both buffers are searched.  The
+        outbound source does NOT need one: the transfer completes before the barrier, so it
+        never overlaps the next item's compute.
+      * cwt.  Item m's bytes are still moving while item m+1's compute has started, so the
+        two ends a transfer touches need two copies each: the X regions a HAND-OFF lands
+        in, AND whatever an LPDDR leg or the hand-off READS out of Y.
+
+        KNOWN GAP, cwt ONLY: the Y set below is the outbound sources alone, so a hand-off
+        that lands in the consumer's Y -- the 2 -> 3 boundary -- is NOT doubled here, and
+        push_attn shifts FFN_RESID by a delta derived from UNPATCHED, which lands it back
+        inside FFN_RESID itself.  cwt needs that landing zone doubled as much as ctt does.
+        Adding it is not a one-liner: FFN_RESID and UNPATCHED sit at opposite ends of Y
+        with OUTPUT between them, so the union is not contiguous and the check below would
+        (correctly) refuse it.  The fix is to reorder _y_regions so the two sit together;
+        until then cwt is wrong on this boundary and ctt is the mode to trust.
+
+    AN LPDDR LANDING ZONE IS NOT DOUBLED IN EITHER MODE -- both loops read item i's own
+    input at the top of step i, blocking, and compute it in the same step, so one copy is
+    only ever touched by one item.  NOTHING ELSE IS EITHER: a stage's working set is dead
+    the moment the step ends, and doubling the whole of X and Y would charge stage 2 an
+    extra 2.4 MiB for score matrices no transfer reads.
 
     THE DOUBLED SET MUST BE CONTIGUOUS, and that is checked rather than hoped for: the
-    emitted C reaches the second copy by adding ONE per-stage delta (see _cwt_deltas).  The
+    emitted C reaches the second copy by adding ONE per-stage delta (see _par_deltas).  The
     fix if it ever stops holding is to reorder BIND_Y so everything a transfer reads sits
     at the end.  PER STAGE, because a cluster belongs to exactly one.
     """
@@ -3755,19 +3872,34 @@ def _cwt_doubled(stages: List[Stage], geom: Geometry, pool: str,
     x_gap  = [r.name for r in xregs if r.name not in landed and r.off < x_span]
     if x_gap:
         raise ValueError(
-            f'stage {i + 1}: the cwt double-buffered span [0, {x_span}) of X_BUF holds '
+            f'stage {i + 1}: the {mode} double-buffered span [0, {x_span}) of X_BUF holds '
             f'{", ".join(sorted(landed))}, which the hand-off writes, but also '
             f'{", ".join(x_gap)}, which it does not.  The emitted C reaches the second copy '
             f'by one per-stage delta, so the doubled regions have to be adjacent and start '
             f'at 0; reorder _x_regions so the hand-off landing zones come first.')
     regs  = {r.name: r for r in _y_regions(stages, geom, i, pool)}
-    names = {lg.region for lg in _lpddr_legs(i) if lg.direction == 'out'}
-    for lane in range(st.n_par):
-        for x in _handoff(stages, geom, i, lane):
-            for nm, r in regs.items():
-                off = r.off * BYTES_PER_ELEM
-                if off <= x.src_off < off + r.elems * BYTES_PER_ELEM:
-                    names.add(nm)
+    names: set = set()
+    if mode == 'cwt':
+        # The OUTBOUND sources: what an LPDDR leg or the hand-off READS out of Y.
+        names = {lg.region for lg in _lpddr_legs(i) if lg.direction == 'out'}
+        for lane in range(st.n_par):
+            for x in _handoff(stages, geom, i, lane):
+                for nm, r in regs.items():
+                    off = r.off * BYTES_PER_ELEM
+                    if off <= x.src_off < off + r.elems * BYTES_PER_ELEM:
+                        names.add(nm)
+    elif i:
+        # The INBOUND landing zone, for the half of it that lands in Y.  Same derivation as
+        # the X half above: taken from the descriptors the previous stage actually issues,
+        # so a boundary that stops landing in Y stops doubling it without an edit here.
+        for lane in range(stages[i - 1].n_par):
+            for x in _handoff(stages, geom, i - 1, lane):
+                if x.dst_buf != 'Y':
+                    continue
+                for nm, r in regs.items():
+                    off = r.off * BYTES_PER_ELEM
+                    if off <= x.dst_off < off + r.elems * BYTES_PER_ELEM:
+                        names.add(nm)
     live = [regs[nm] for nm in names if nm in regs]
     if not live:
         return x_span, 0, 0, []
@@ -3778,21 +3910,22 @@ def _cwt_doubled(stages: List[Stage], geom: Geometry, pool: str,
            if r.name not in names and y_lo <= r.off < y_hi]
     if gap:
         raise ValueError(
-            f'stage {i + 1}: the cwt double-buffered span [{y_lo}, {y_hi}) of Y_BUF holds '
+            f'stage {i + 1}: the {mode} double-buffered span [{y_lo}, {y_hi}) of Y_BUF '
+            f'holds '
             f'{", ".join(sorted(names))}, which a transfer reads, but also '
             f'{", ".join(gap)}, which nothing does.  The emitted C reaches the second copy '
             f'by one per-stage delta, so the doubled regions have to be adjacent; reorder '
             f'BIND_Y so everything a transfer reads sits at the end of Y_BUF.')
     if covered != y_hi - y_lo:
         raise ValueError(
-            f'stage {i + 1}: the cwt doubled Y regions cover {covered} of the '
+            f'stage {i + 1}: the {mode} doubled Y regions cover {covered} of the '
             f'{y_hi - y_lo} elements they span; _place leaves DMA-line padding between '
             f'regions, which is fine, but a hole this large means the span is wrong')
     return x_span, y_lo, y_hi, sorted(names)
 
 
-def _cwt_deltas(stages: List[Stage], geom: Geometry, pool: str,
-                i: int) -> Tuple[int, int]:
+def _par_deltas(stages: List[Stage], geom: Geometry, pool: str, i: int,
+                mode: str = 'cwt') -> Tuple[int, int]:
     """(X, Y) ELEMENTS to add to an offset to reach stage `i`'s SECOND copy.
 
     ONE NUMBER PER BUFFER PER STAGE, which is the whole reason the doubled regions have to
@@ -3804,10 +3937,11 @@ def _cwt_deltas(stages: List[Stage], geom: Geometry, pool: str,
     The emitted C multiplies these by a PARITY BIT, so an undoubled buffer costs a multiply
     by zero the compiler folds away.  BOTH ARE ZERO WHEN THE STAGE DOUBLES NOTHING in that
     buffer: a stage whose X is purely an LPDDR landing zone gets 0, and returning x_elems
-    there would send every read a whole buffer past its data.
+    there would send every read a whole buffer past its data.  UNDER ctt THE Y DELTA IS
+    ALWAYS ZERO -- see _par_doubled for why only the landing zone races there.
     """
     st = stages[i]
-    x_span, y_lo, y_hi, _ = _cwt_doubled(stages, geom, pool, i)
+    x_span, y_lo, y_hi, _ = _par_doubled(stages, geom, pool, i, mode)
     return (st.x_elems if x_span else 0), (st.y_elems - y_lo if y_hi > y_lo else 0)
 
 
@@ -3816,16 +3950,17 @@ def _buf_elems(stages: List[Stage], geom: Geometry, pool: str,
     """(X, W, Y) elements the app DECLARES -- the single source both halves read.
 
     ONE BINARY, THREE BUFFERS, each sized to the largest claim any stage makes on it: every
-    cluster gets all three whatever stage it runs.  Under cwt a stage's claim is its own
-    buffers PLUS its own second copy, so the max is taken over those SUMS -- taking it over
-    each term separately would add stage 2's score matrices to stage 1's projection twin
-    and bill one cluster for both, though no cluster is on both stages.
+    cluster gets all three whatever stage it runs.  BOTH MODES CARRY A SECOND COPY, and a
+    stage's claim is its own buffers PLUS that copy, so the max is taken over those SUMS --
+    taking it over each term separately would add stage 2's score matrices to stage 1's
+    projection twin and bill one cluster for both, though no cluster is on both stages.
+
+    ctt doubles only the hand-off landing zone in X, cwt that and the outbound source in Y;
+    _par_doubled is the one place that decides which.
     """
-    dx = dy = [0] * len(stages)
-    if mode == 'cwt':
-        spans = [_cwt_doubled(stages, geom, pool, i) for i in range(len(stages))]
-        dx = [s[0] for s in spans]
-        dy = [s[2] - s[1] for s in spans]
+    spans = [_par_doubled(stages, geom, pool, i, mode) for i in range(len(stages))]
+    dx = [s[0] for s in spans]
+    dy = [s[2] - s[1] for s in spans]
     return (max(st.x_elems + dx[i] for i, st in enumerate(stages)),
             max(st.w_elems for st in stages),
             max(st.y_elems + dy[i] for i, st in enumerate(stages)))
@@ -3838,6 +3973,9 @@ def _l1_footprint(stages: List[Stage], geom: Geometry, mode: str,
     NOT AN ESTIMATE: _render_scratch_buffers declares exactly what _buf_elems returns, so
     this is what the .l1 section holds.  Each buffer is placed on the pool's alignment
     boundary, so the gaps count too.  W never doubles -- nothing writes it.
+
+    BOTH MODES INCLUDE A SECOND COPY NOW: ctt's inbound landing zone is in the X figure, so
+    the cwt-vs-ctt difference reported below is the OUTBOUND twin alone.
     """
     nx, nw, ny = (n * BYTES_PER_ELEM
                   for n in _buf_elems(stages, geom, pool, mode))
@@ -3849,7 +3987,8 @@ def _l1_footprint(stages: List[Stage], geom: Geometry, mode: str,
     extra = ''
     if mode == 'cwt':
         ctt = _l1_footprint(stages, geom, 'ctt', pool)[0]
-        extra = f'; {(total - ctt) / 1024:.0f} KiB more than ctt, all of it second copies'
+        extra = (f'; {(total - ctt) / 1024:.0f} KiB more than ctt, all of it the outbound '
+                 f'second copies ctt does not need')
     return total, (f'X {nx}B + W {nw}B + Y {ny}B + '
                    f'{(total - nx - nw - ny) / 1024:.0f} KiB align{extra}')
 
@@ -3923,8 +4062,12 @@ def generate_apps(res: Results, apps_dir: str, cycles_per_ms: float, mode: str,
                    if tiled else '')
             print(f'  [{pool}]  WARNING: over budget by {(l1 - budget) / 1024:.1f} KiB -- '
                   f'the .l1 section will not link.{how}')
+        # config= PICKS THE GRID, NOT THE POOL.  Both flavours of this app are laid out on
+        # the 4x3 grid and assert it, so both build under `terapool` whichever pool they are
+        # modelled against -- tensorpool256 is 4x8 and trips the _Static_assert.  The pool in
+        # the app's name is the COST MODEL; the config is the machine it is placed on.
         print(f'  [{pool}]  build with:  make -C {apps_dir} {app} '
-              f'COMPILER=llvm config=tensorpool256')
+              f'COMPILER=llvm config=terapool')
 
 
 # ---------------------------------------------------------------------------
@@ -4055,7 +4198,7 @@ def load_config(path: str) -> dict:
 
 
 def write_summary(res: Results, path: str, csv_name: str) -> None:
-    """Write the machine-readable per-(pool, mode) summary latency_throughput_bars.py reads.
+    """Write the machine-readable per-(pool, mode) summary.
 
     Columns: pool, mode, throughput_ms (= T_pipe, the bottleneck), n_stages, n_clusters,
     latency_ms.
@@ -4066,14 +4209,15 @@ def write_summary(res: Results, path: str, csv_name: str) -> None:
     stage s's work on item m at step m+s, cwt at m+2s.
 
     THE FACTOR OF TWO IS FORCED, not a safety margin: at m + s a stage and its consumer
-    work on adjacent items in the SAME step, so the transfer between them would have to
-    land in the step the consumer is already reading it.  So cwt shortens the period but
-    stretches the time in flight -- it buys THROUGHPUT and pays in latency.
+    work on adjacent items in the SAME step, so a transfer left running past the barrier
+    would land in the step the consumer is already reading it.  ctt can afford the tighter
+    wavefront only because it WAITS on its pushes before the barrier; cwt does not, and
+    buys its shorter period with twice the time in flight.
     """
     views = (('ctt', res.best_throughput,         1),
              ('cwt', res.best_throughput_overlap, 2))
     lines = [
-        '# CEViT pipeline summary  (read by latency_throughput_bars.py)',
+        '# CEViT pipeline summary',
         f'# csv: {csv_name}',
         '# columns: pool  mode  throughput_ms  n_stages  n_clusters  latency_ms',
     ]

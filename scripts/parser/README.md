@@ -1,12 +1,11 @@
 # AI-PHY pipeline parsers
 
-Two performance models, one per network, plus a shared plotting helper.
+Two performance models, one per network.
 
 | tool | what it does |
 | --- | --- |
 | `CEViT/cevit_pipeline.py` | costs the CEViT layer template and generates its GVSOC pipeline apps |
 | `CELERE/celere_pipeline.py` | the same for CELERE |
-| `latency_throughput_bars.py` | plots the `pipeline_summary.txt` either generator writes |
 
 Each generator reads a layer template (`.csv`, `.xlsx`, `.xlsm` or `.ods`) and a JSON hardware
 config, prints a per-row and per-stage latency report, writes a machine-readable summary, and
@@ -20,8 +19,8 @@ script, and each script's module docstring explains its own partition in full.
 ## Scope and status
 
 **Both partitions are tuned for TensorPool, not Terapool.** The stage widths were chosen
-against TensorPool's RedMulE GEMM peak, where the periods come out ~5–6x lower (CEViT ctt:
-0.086 ms against Terapool's 0.526; CELERE ctt: 0.159 against 0.787). On Terapool a GEMM is a
+against TensorPool's RedMulE GEMM peak, where the periods come out ~5–7x lower (CEViT ctt:
+0.071 ms against Terapool's 0.510; CELERE ctt: 0.135 against 0.788). On Terapool a GEMM is a
 PE matmul and the balance moves — in CEViT the attention core becomes the wall instead of the
 FFN block — so a Terapool-first partition would want different widths, not just a different
 config. The Terapool numbers are honest output of the same model; they are simply not what the
@@ -29,11 +28,19 @@ shape was optimised for.
 
 **CELERE was taken as far as ctt on TensorPool.** That is the configuration whose stage widths,
 buffer bindings and LPDDR layout were actually tuned; the other three apps are generated and
-modelled but are a starting point rather than a result. Its ctt build fits both pools at
-2803 KiB, but **cwt fits neither** — it doubles the whole `X_BUF` and comes out 943 KiB over on
-TensorPool and 1355 KiB over on Terapool, so those two apps will not link until the last
-stage's `tiles` is raised or the doubling is made partial the way `cevit_pipeline.py` does it.
-CEViT is the more finished of the two: all four of its apps fit, between 2206 and 2581 KiB.
+modelled but are a starting point rather than a result. Its ctt build is 3691 KiB and fits
+TensorPool's 3948 KiB budget, but **the same app comes out 3699 KiB on Terapool, 155 KiB over
+that pool's 3544** — Terapool spends 512 KiB of TCDM on stacks against TensorPool's 128.
+Raising the last stage's `tiles` does not help there: what puts it over is stage 5's doubled
+*inbound* landing zone, and `tiles` only divides the drain. **cwt fits neither pool** — the
+CELERE emitter doubles the whole `X_BUF`, which lands 1839 KiB over on TensorPool and 2251 KiB
+over on Terapool. CEViT is the more finished of the two: all four of its apps fit, between
+2663 and 2718 KiB.
+
+**cwt is not worth its cost on either model as they stand.** It buys 2.1% of the period on CEViT
+/ TensorPool, 0.3% on CEViT / Terapool, 1.4% on CELERE / Terapool and *nothing at all* on CELERE
+/ TensorPool, where the tiled last stage is the bottleneck in both modes and drains inside its
+own compute either way. Quote ctt unless the transfer column grows.
 
 ## Running them
 
@@ -64,15 +71,25 @@ Both stream items as a wavefront: stage `s` (0-based) is skewed by a fixed `phas
 step `step` it works on item `step - phase`. The two modes differ in that skew.
 
 * **ctt** — compute-then-transfer. **Skew `s` per stage**, so stage `s` works on item `m` at
-  step `m + s`. Two global barriers a step, one L1 buffer set, compute and DMA serialized.
-  Period = slowest compute + slowest transfer, taken over the whole partition, because the
-  barrier stops the two covering for each other.
+  step `m + s`. A cluster computes its stage and then transfers, back to back with **no barrier
+  between them**, and one global barrier closes the step. Period = `max_s(compute_s +
+  transfer_s)`: a cluster serialises its own two halves, but two stages with different
+  bottlenecks cover for each other, so the slowest compute and the slowest transfer are only
+  added when they fall on the same stage.
 * **cwt** — compute-while-transfer. **Skew `2s` per stage**, so stage `s` works on item `m` at
   step `m + 2s`. That leaves a spare step between a producer and its consumer for the transfer
-  to run in, and needs only one barrier a step. Period = the slowest stage's own wall. Only
-  what crosses an item boundary takes a second L1 copy.
+  to run in, so the transfer runs *beside* the compute rather than after it. One barrier a step
+  as well. Period = the slowest stage's own wall, `din + max(compute, transfer)`.
 
 (`phase` in the generated `main.c` is `stage - 1` for ctt and `2 * (stage - 1)` for cwt.)
+
+**Neither mode has a barrier between compute and transfer**, so in both a predecessor can be
+pushing while its consumer computes, and **both double the hand-off landing zone** — indexed by
+the item's low bit, so a producer writes the copy its consumer is not reading. What separates
+them is the *outbound* end: under ctt a push completes before the barrier that ends the step, so
+its source is never live across a compute and needs no twin, while cwt deliberately leaves the
+drain running beside the next compute and does need one. Only what crosses an item boundary is
+ever doubled; the working set, the LPDDR landing zones and the weights are single in both.
 
 cwt shortens the period and lengthens the time in flight: it buys throughput and pays in
 latency. Both are modelled and both are generated, for both pools (TensorPool and Terapool) —
@@ -83,40 +100,38 @@ four apps per model.
 Each generator prints the exact `make` line per app. In short:
 
 ```bash
-make -C software/apps/multi_cluster cevit_ctt_TensorPool COMPILER=llvm config=tensorpool256
+make -C software/apps/multi_cluster cevit_ctt_TensorPool  COMPILER=llvm config=terapool
+make -C software/apps/multi_cluster celere_ctt_TensorPool COMPILER=llvm config=tensorpool256
 ```
 
 * `COMPILER=llvm` is required — the FP16 kernels do not build with GCC.
-* `config=tensorpool256` is required — the default `config=mempool` gives a 1 MiB L1 and the
-  link fails for an unrelated-looking reason.
-* **The grid must match the partition.** `num_cluster_x` / `num_cluster_y` in
+* **`config=` picks the grid, not the pool.** `num_cluster_x` / `num_cluster_y` in
   `software/runtime/multi_cluster/configs/arch_*.py` are `_Static_assert`ed by the emitted app:
-  CEViT needs **4 x 3**, CELERE needs **4 x 8**. The configs currently carry 4 x 3, so building
-  the CELERE apps means raising `num_cluster_y` to 8 first. `hbm_chan_placement` must stay
-  `[0,4,0,4]` (four LPDDR nodes on the north edge and four on the south) for either.
+  CEViT is laid out for **4 x 3** and CELERE for **4 x 8**. So every CEViT app builds under
+  `config=terapool` and every CELERE app under `config=tensorpool256` — *whichever pool it is
+  modelled against*. The pool in the app's name is the cost model; the config is the machine it
+  is placed on, and the two are named alike only by accident.
+* The default `config=mempool` builds neither: 4 x 4 and a 1 MiB L1, so the grid assert fires
+  or the link fails for an unrelated-looking reason.
+* `hbm_chan_placement` must stay `[0,4,0,4]` (four LPDDR nodes on the north edge and four on
+  the south); `terapool` and `tensorpool256` both already carry it.
 
 ## Plotting
 
-Both generators write a `pipeline_summary.txt` with one row per `(pool, mode)`:
+`--plot` on either generator saves per-stage bar plots under `./<model>_split_plots/` —
+per-cluster compute against transfer, stage by stage, which is where a bottleneck is actually
+visible.
+
+Both generators also write a `pipeline_summary.txt` with one row per `(pool, mode)`, for
+whatever wants to read the headline numbers without re-running the model:
 
 ```
 # columns: pool  mode  throughput_ms  n_stages  n_clusters  latency_ms
 ```
 
-`latency_throughput_bars.py` turns that into two bar charts — latency per execution on the
-left, throughput at the bottleneck on the right:
-
-```bash
-python3 latency_throughput_bars.py CEViT/pipeline_summary.txt --out lt_cevit.png
-python3 latency_throughput_bars.py CELERE/pipeline_summary.txt --cwt
-```
-
-Latency is **not** the critical-path sum of the stages: the generated pipelines barrier every
-step, so each step costs the bottleneck period `T_pipe` and an item is resident for one step
-per stage in ctt and two in cwt.
-
-`--plot` on either generator is the complementary view — per-cluster compute against transfer,
-stage by stage, which is where a bottleneck is actually visible.
+`throughput_ms` is `T_pipe`, the bottleneck period. `latency_ms` is **not** the critical-path
+sum of the stages: the generated pipelines barrier every step, so each step costs `T_pipe` and
+an item is resident for one step per stage in ctt and two in cwt.
 
 ## Config keys
 

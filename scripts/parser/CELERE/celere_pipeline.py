@@ -10,19 +10,36 @@ software/apps/multi_cluster/celere_<mode>_<pool>/main.c.
     python celere_pipeline.py CELERE_273PRBs_64ant.csv config.json --mode ctt --iterations 8
     python celere_pipeline.py CELERE_273PRBs_64ant.csv config.json --wait --plot
 
-    ctt  compute-then-transfer: one L1 buffer set, compute and DMA serialized.  Stage s is
-         skewed by s steps, so it works on item m at step m + s.
-    cwt  compute-while-transfer: double-buffered L1 (2x X_BUF), compute and DMA overlapped.
+    ctt  compute-then-transfer: a cluster computes its stage and then transfers, back to
+         back with NO barrier between them, and ONE barrier closes the step.  Stage s is
+         skewed by s steps, so it works on item m at step m + s.  Period = max over stages
+         of (compute + transfer): a cluster serialises its own two halves, but two stages
+         with different bottlenecks cover for each other.  The HAND-OFF LANDING ZONE IS
+         DOUBLED -- see _x_parity_elems -- because a predecessor pushes into it while this
+         stage is still computing the previous item.  Nothing else is.
+    cwt  compute-while-transfer: compute and DMA overlapped, one barrier a step as well.
          Stage s is skewed by 2s steps, which is what leaves a spare step for the transfer.
+         The emitter doubles the WHOLE X_BUF here, which is coarser than it needs to be --
+         see _l1_footprint for why CELERE cannot do what cevit_pipeline.py does.
 
 SCOPE.  THIS PARTITION IS TUNED FOR ctt ON TENSORPOOL, and that is the only configuration whose
-widths, buffer bindings and LPDDR layout were actually fitted -- 0.159 ms of period against
-Terapool's 0.787, and 2803 KiB of L1 against a 3948 KiB budget.  The other three apps are
-generated and modelled but are a starting point, not a result: Terapool runs its GEMMs on the
-PE path and would want different widths, and CWT DOES NOT FIT EITHER POOL -- doubling the whole
-X_BUF puts it 943 KiB over on TensorPool and 1355 KiB over on Terapool, so those two apps will
-not link until `tiles` on the last stage is raised, or the doubling is made partial the way
-cevit_pipeline.py does it.
+widths, buffer bindings and LPDDR layout were actually fitted -- 0.135 ms of period against
+Terapool's 0.788, and 3691 KiB of L1 against a 3948 KiB budget.  The other three apps are
+generated and modelled but are a starting point, not a result:
+
+  * ctt ON TERAPOOL NO LONGER FITS.  The same 3699 KiB is 155 KiB over its 3544 KiB budget,
+    because Terapool spends 512 KiB of TCDM on stacks against TensorPool's 128.  Raising
+    `tiles` does NOT fix this one: the twin is stage 5's INBOUND, and tiles only divides the
+    drain.  A wider stage 5 would -- 8 lanes halve the per-lane landing zone -- but stage 5
+    sits on the north edge of a 4-wide grid and widening it breaks the column-alignment rule.
+  * Terapool runs its GEMMs on the PE path and would want different widths anyway.
+  * CWT DOES NOT FIT EITHER POOL -- the whole-buffer doubling puts it 1839 KiB over on
+    TensorPool and 2251 KiB over on Terapool.
+
+WHAT CWT BUYS HERE IS NOTHING, and the model says so plainly: 0.1352 ms against ctt's 0.1352 on
+TensorPool -- identical, because the tiled last stage is the bottleneck in both and it drains
+inside its own compute either way -- and 0.7769 against 0.7878 on Terapool, 1.4%.  It pays for
+that in a doubled X_BUF and twice the time in flight.  ctt is the schedule to quote.
 
 THE PARTITION IS GIVEN, NOT SEARCHED.  It lives in STAGES / RESIDENT / BIND below: 5 stages of
 2 8 8 8 4 clusters on a 4-wide x 8-tall grid, 30 working plus 2 idle.  Row numbers are
@@ -110,8 +127,9 @@ no C can read; the two are kept in step by hand.
 
 TILING.  Row 48 on stage 5 runs in two tiles: untiled it would hold 736,512 elements live.  A
 tiled stage drains itself, so its transfers are serialised inside its own compute and land in
-`latency` / `drain_ms` rather than the transfer column.  Only the last stage may be tiled, and
-raising `tiles` is the one-line fix when the cwt build's doubled X_BUF does not fit L1.
+`latency` / `drain_ms` rather than the transfer column.  Only the last stage may be tiled.
+Raising `tiles` shrinks what a stage holds LIVE and what it drains; it does not shrink an
+inbound landing zone, so it is no help against the ctt twin -- see SCOPE.
 
 CONFIG.  PE_peak / GEMM_peak in TFLOPS, PE_utilization deriving the PE path, TE_utilization
 deriving GEMM_peak on a pool with a tensor engine, bandwidth_c2c_gbs and bandwidth_lpddr_gbs in
@@ -123,6 +141,7 @@ pipeline_clusters is only a cross-check against the stage table.
 import argparse
 import csv
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -582,10 +601,10 @@ class Stage:
     split: str
     items: List[Item]
     pad: int = 0                 # cids left IDLE after this stage; see _stage_bases
-    latency: float = 0.0         # compute [ms] of ONE cluster, ALL tiles
-    transfer_ms: float = 0.0     # hand-off + LPDDR, per cluster; 0 on a tiled stage
+    latency: float = 0.0         # kernel time [ms] of ONE cluster, ALL tiles
+    transfer_ms: float = 0.0     # OUTBOUND hand-off + LPDDR, per cluster; 0 if tiled
     drain_ms: float = 0.0        # of `latency`, the part a tiled stage spends draining
-    din_ms: float = 0.0          # inbound leg, already inside transfer_ms
+    din_ms: float = 0.0          # inbound LPDDR leg; part of compute_ms, NOT transfer_ms
     # Element offset of every named region inside this cluster's X_BUF, plus ARENA and
     # '@end'.  Filled by compute() from _stage_layout, and the authority every emitter
     # reads: see THE DISTRIBUTED Q/K/V/Z BUFFER.
@@ -599,6 +618,18 @@ class Stage:
     kernel_elems: int = 0        # per-cluster max over layers of (in + out) + weights
     din_bytes: float = 0.0       # per cluster
     dout_bytes: float = 0.0      # per cluster
+
+    @property
+    def compute_ms(self) -> float:
+        """Everything a step costs this stage before its outbound transfers.
+
+        The inbound LPDDR read is serialized in FRONT of the kernels -- the generated loop
+        issues it and holds the worker cores on flex_intra_cluster_sync() until it lands --
+        so a step's compute half is the two of them added.  Kept identical to
+        cevit_pipeline.Stage.compute_ms; this file used to bill din_ms into transfer_ms
+        instead, which put it in the wrong half of the step and overstated the ctt period.
+        """
+        return self.din_ms + self.latency
 
 
 @dataclass
@@ -1146,11 +1177,20 @@ def _stage_layout(st: Stage, pool: str) -> Dict[str, int]:
     The arena is FIRST-FIT into the gaps SCRATCH_OVER opens up, not appended: on the
     encoder stages the Q/K/V folds are dead after row 27 while Z stays live above them.
     Counts are PER CLUSTER.
+
+    A HAND-OFF LANDING ZONE IS NEVER DEAD, whatever SCRATCH_OVER says.  It is doubled, and
+    its twin is reached by adding the whole of X_BUF to an offset inside it (see
+    _x_parity_elems), so a region that straddled the span's edge would have half of itself
+    move on an odd item and half not.  Keeping the arena out of the span is what stops that
+    -- it costs nothing here, because stage 5, the only stage this rules out, does not set
+    the app-wide X claim even after its arena moves up.  The LPDDR landing zones stay
+    eligible: nothing doubles them.
     """
     off: Dict[str, int] = {}
     spans: List[Tuple[int, int, bool]] = []       # (start, end, live)
     at = 0
-    dead = set(SCRATCH_OVER.get(st.idx, ()))
+    handed = {t.name for t in (_tensors('hand', st.idx - 1) if st.idx else [])}
+    dead = set(SCRATCH_OVER.get(st.idx, ())) - handed
 
     # What each region has to hold for the rows BOUND to it, which is not always the
     # tensor's own size: a GEMM's M is rounded up to the tensor-engine count, so a row may
@@ -1424,16 +1464,21 @@ def compute(layers: List[LayerRow], cfg: dict) -> Results:
 
             # A stage pays for the hand-off it PRODUCES plus its own LPDDR legs; the
             # inbound c2c leg is the producer's bill, already counted there.
-            xfer = (_transfer_ms(dout_c2c, bw_c2c)
-                    + _lpddr_leg_ms(lpddr_in, 'hin', st, bw_lpddr)
-                    + _lpddr_leg_ms(lpddr_out, 'hout', st, bw_lpddr))
+            #
+            # THE INBOUND LPDDR LEG IS NOT PART OF THE TRANSFER HALF.  Both generated loops
+            # issue it at the TOP of the compute phase and hold the worker cores until it
+            # lands, so it sits in front of the kernels, not beside the outbound pushes --
+            # see Stage.compute_ms.  Keeping it here, as this file used to, billed it to the
+            # wrong half of the step.
             st.din_ms = _lpddr_leg_ms(lpddr_in, 'hin', st, bw_lpddr)
+            xfer = (_transfer_ms(dout_c2c, bw_c2c)
+                    + _lpddr_leg_ms(lpddr_out, 'hout', st, bw_lpddr))
 
             if st.tiles > 1:
                 # Self-draining: its transfers are serialised inside its own compute, so
                 # they belong to `latency`.  Keep the amount in drain_ms so the reports
                 # can show where that time went instead of burying it in the kernels.
-                st.latency += xfer
+                st.latency += xfer + st.din_ms
                 st.drain_ms = xfer
                 st.transfer_ms = 0.0
                 st.din_ms = 0.0
@@ -1473,28 +1518,36 @@ def compute(layers: List[LayerRow], cfg: dict) -> Results:
 
 
 def _overlap_wall(st: Stage) -> float:
-    """cwt wall time of one stage: the inbound leg cannot hide behind its own compute."""
-    return st.din_ms + max(st.latency, st.transfer_ms - st.din_ms)
+    """cwt wall time of one stage: the inbound leg cannot hide behind its own compute.
+
+    The step is ordered inbound -> wait -> issue the drain -> compute, because
+    flex_dma_async_wait_all() is the only wait the DMA shim has and it drains every
+    outstanding descriptor at once.  So the read is alone in flight at that first wait and
+    it is the OUTBOUND traffic, issued after it, that runs beside the cores.
+    """
+    return st.din_ms + max(st.latency, st.transfer_ms)
 
 
 def _makespan(stages: List[Stage], overlap: bool) -> float:
     """Steady-state period of one pipeline step = what throughput is 1/of.
 
-    Both generated loops rendezvous every cluster on a global barrier, so a step costs the
-    slowest thing running inside each barriered phase:
+    ONE BARRIER A STEP IN BOTH SCHEDULES, so a step costs the slowest stage's own wall and
+    nothing is added across stages:
 
-    * ctt (overlap=False): compute -> barrier -> transfer -> barrier, TWO SUBSTAGES, so
-      the step is max_s(compute_s) + max_s(transfer_s).
-    * cwt (overlap=True): double buffering lets a cluster push item m-1 while it computes
-      item m, one barrier a step, so the step is max_s(wall_s) -- see _overlap_wall.
+    * ctt (overlap=False): a cluster computes then transfers back to back, with no barrier
+      between the two, so its wall is compute + transfer and the step is
+      max_s(compute_s + transfer_s).  Two stages with different bottlenecks cover for each
+      other: the slowest compute and the slowest transfer are only added when they are the
+      SAME stage.  What makes the missing barrier safe is the doubled landing zone -- see
+      _x_parity_elems.
+    * cwt (overlap=True): the transfer runs BESIDE the compute instead of after it, so the
+      wall is the taller of the two on top of the inbound read -- see _overlap_wall.
 
-    This is NOT the naive max_s(compute_s + transfer_s), and is >= it whenever the slowest
-    compute and the slowest transfer sit on DIFFERENT stages.  Kept identical to
-    cevit_pipeline._makespan so the two models stay comparable.
+    Kept identical to cevit_pipeline._makespan so the two models stay comparable.
     """
     if overlap:
         return max(_overlap_wall(s) for s in stages)
-    return max(s.latency for s in stages) + max(s.transfer_ms for s in stages)
+    return max(s.compute_ms + s.transfer_ms for s in stages)
 
 
 # ---------------------------------------------------------------------------
@@ -1676,45 +1729,99 @@ L1_GEOMETRY = {
 }
 
 
-def _parity_elems(st: Stage, pool: str) -> int:
-    """Elements of ONE stage that need a SECOND copy under cwt.
+def _x_parity_elems(st: Stage, pool: str) -> int:
+    """Elements at the BASE of this stage's X_BUF that need a SECOND copy under ctt.
 
-    ONLY WHAT CROSSES AN ITEM BOUNDARY, which is two things and not the whole buffer:
+    THE HAND-OFF LANDING ZONE, AND NOTHING ELSE.  A ctt step is compute then transfer with
+    ONE barrier closing it, so a predecessor that finished its own compute early pushes item
+    m into this stage's landing zone while this stage is still computing item m-1 out of it.
+    Two copies, indexed by the item's low bit, is what makes that safe.
 
-      * the stage's FIRST kernel's input -- the landing zone.  Under cwt the transfer that
-        brings item i+1 runs while item i computes, so the bytes being written are not the
-        bytes being read and the two cannot share a region.
-      * the stage's LAST kernel's output -- whatever an outbound transfer reads.  Same
-        argument the other way: item i is being shipped while item i+1 is being computed
-        into the same place.
+    NOT THE LPDDR LANDING ZONE: the loop issues a stage's own inbound read at the top of its
+    own step, blocking, and computes it in that step, so one copy is only ever touched by
+    one item.  NOT THE OUTBOUND SOURCE either: a push completes before the barrier that ends
+    the step, so nothing is reading it when the next compute starts -- that is exactly what
+    separates ctt from cwt, which leaves the drain running and does need the second copy.
+    NOT the pinned intermediates, the scratch arena or the WEIGHTS, which no transfer sees.
 
-    EVERYTHING ELSE IS SINGLE.  The pinned intermediates and the scratch arena are written
-    and read inside one item's compute, with a barrier either side, so no transfer is ever
-    looking at them -- and the WEIGHTS are never written at all.  Doubling the whole of X,
-    which this file used to do, charges the parity copy to regions no transfer touches; it
-    is what put both cwt apps over budget by 943 KiB (TensorPool) and 1355 KiB (Terapool).
+    CONTIGUOUS AND AT OFFSET 0, which is what lets the emitted C reach the twin by adding
+    one constant: _stage_layout places the hand-off tensors first, before the LPDDR reads
+    and the resident regions, and keeps the arena out of their span.
+
+    SIZED TO THE REACH, NOT THE SPAN.  A GEMM's M is rounded up to the tensor-engine count,
+    so a row bound to a landing region can walk PAST the bytes the DMA wrote.  Overshooting
+    into the next region is harmless -- _stage_layout says as much -- but overshooting the
+    twin would run off the end of X_BUF, so the twin is sized to the furthest any shifted
+    row reaches.  The two are equal on today's partition; this keeps them equal after an
+    edit that pads a row further.
     """
-    inbound = (_tensors('hand', st.idx - 1) if st.idx else []) + _tensors('hin', st.idx)
-    landing = sum(int(_lane_bytes(t, st.n_par)) for t in inbound) // BYTES_PER_ELEM
+    hand = {t.name for t in (_tensors('hand', st.idx - 1) if st.idx else [])}
+    span = sum(_pad(t.elems // st.n_par, DMA_LINE_ELEMS)
+               for t in (_tensors('hand', st.idx - 1) if st.idx else []))
+    layout = st.layout or _stage_layout(st, pool)
+    reach = 0
+    for item in st.items:
+        x_reg, y_reg = BIND.get((st.idx, item.excel_row), ('', ''))
+        x, _w, y = _row_footprint(item.row, st.n_par, item.tiles, pool)
+        for reg, size in ((x_reg, x * item.tiles), (y_reg, y)):
+            if reg in hand:
+                reach = max(reach, layout[reg] + size)
+    return max(span, reach)
 
-    drain = sum(x.nbytes // st.n_par for x in _stage_xfers(st.idx))
-    drain += sum(int(_lane_bytes(t, st.n_par)) // st.tiles
-                 for t in _tensors('hout', st.idx))
-    return landing + drain // BYTES_PER_ELEM
+
+def _x_src_parity(st: Stage, pool: str) -> bool:
+    """Does this stage TRANSFER OUT OF its own hand-off landing zone?
+
+    Stages 2 and 3 do: their one inbound tensor IS the pinned region they hand on, updated
+    in place across the whole stage (see THE DISTRIBUTED Q/K/V/Z BUFFER).  Their compute
+    reads and writes the parity copy, so the push has to read the SAME copy -- handing it
+    the plain buffer base would ship the item the predecessor is still writing.
+
+    Stages 1, 4 and 5 do not: their outbound tensor sits above the landing zone, has one
+    copy, and must NOT be shifted.
+
+    ONE ANSWER PER STAGE, because main() hands both push helpers a single base.  A stage
+    whose sources STRADDLED the span would need two, so that is refused here rather than
+    shipped as a silent half-shift.
+    """
+    span = _x_parity_elems(st, pool)
+    offs = [_stage_src_off(st, x.name, pool) for x in _stage_xfers(st.idx)]
+    offs += [_stage_src_off(st, t.name, pool) for t in _tensors('hout', st.idx)]
+    inside = [o < span for o in offs]
+    if any(inside) and not all(inside):
+        raise ValueError(
+            f'stage {st.idx + 1} transfers out of BOTH its landing zone and the region '
+            f'above it (source offsets {offs}, landing zone [0, {span})).  main() hands '
+            f'lpddr_push and push_to_next one source base, so the parity shift is all or '
+            f'nothing; give the two sources separate bases before this can work')
+    return bool(inside and all(inside))
 
 
 def _l1_footprint(stages: List[Stage], mode: str, pool: str) -> Tuple[int, str]:
+    """(bytes, breakdown) of the per-cluster L1 the generated app declares.
+
+    NOT AN ESTIMATE -- it is what _render_scratch_buffers writes into the .l1 section, and
+    the two must be read together:
+
+      * ctt declares X_BUF[nx + par], the parity region being one landing zone.
+      * cwt declares X_BUF[2][nx], a whole second buffer.  THAT IS COARSER THAN IT NEEDS TO
+        BE and the emitter, not the model, is why: CELERE has no Y_BUF, so a stage's drain
+        source sits in the MIDDLE of X_BUF and partial doubling would need a second parity
+        span in one buffer, on top of the landing zone's.  cevit_pipeline._par_doubled gets
+        away with one span per buffer only because its outbound source lives in a separate
+        Y_BUF.  Charged here at what is declared, whatever a partial scheme would cost.
+    """
     nx, nw = _scratch_elems(stages, pool)
-    par = 0
+    # ONE X_BUF AND ONE PARITY REGION SERVE EVERY STAGE, so the declaration has to satisfy
+    # both maxima independently: X >= max(own) and parity >= max(parity).  That is
+    # max(own) + max(parity), an upper bound on max(own + parity) -- the two maxima fall on
+    # different stages, stage 1 owning the largest working set and stage 5 the largest
+    # landing zone.  Sizing to the tighter number would need a per-stage buffer, which the
+    # app does not have.
+    par = max((_x_parity_elems(st, pool) for st in stages), default=0)
+    par = ((par + 31) // 32) * 32
     if mode == 'cwt':
-        # ONE X_BUF AND ONE PARITY REGION SERVE EVERY STAGE, so the declaration has to
-        # satisfy both maxima independently: X >= max(own) and parity >= max(parity).  That
-        # is max(own) + max(parity), which is an upper bound on max(own + parity) and here
-        # exceeds it by about 385 KiB -- the two maxima fall on different stages (stage 1
-        # owns the largest working set, stage 5 the largest boundary pair).  Sizing to the
-        # tighter number would need a per-stage buffer, which the app does not have.
-        par = max((_parity_elems(st, pool) for st in stages), default=0)
-        par = ((par + 31) // 32) * 32
+        par = nx                       # X_BUF[2][X_ELEMS]; see the docstring
     geo = L1_GEOMETRY.get(pool, {'stacks': 0, 'align': 64})
     sizes = [(nx + par) * BYTES_PER_ELEM, nw * BYTES_PER_ELEM]
     at = geo['stacks']
@@ -1722,7 +1829,8 @@ def _l1_footprint(stages: List[Stage], mode: str, pool: str) -> Tuple[int, str]:
         at = ((at + geo['align'] - 1) // geo['align']) * geo['align'] + sz
     total = at - geo['stacks']
     parts = (f'X {nx * BYTES_PER_ELEM}B'
-             + (f' + parity {par * BYTES_PER_ELEM}B' if par else '')
+             + (f' + {"2nd copy" if mode == "cwt" else "landing-zone twin"} '
+                f'{par * BYTES_PER_ELEM}B' if par else '')
              + f' + W {nw * BYTES_PER_ELEM}B '
                f'+ {(total - sum(sizes)) / 1024:.0f} KiB align')
     return total, parts
@@ -1784,9 +1892,9 @@ def _render_stack_note(stages: List[Stage]) -> List[str]:
         '/* NO_INLINE: give this function ITS OWN STACK FRAME.',
         ' *',
         f' * A core gets STACK_SIZE bytes of stack ({PE_STACK_B} on both pools; see',
-        ' * config/*.mk) and _reset_vector leaves STACK_SIZE - 4 of them usable -- it starts',
-        ' * sp four bytes down and writes that limit into the stacklimit CSR.  Nothing in the',
-        ' * toolchain checks the depth against it.',
+        ' * the config makefile for each pool) and _reset_vector leaves STACK_SIZE - 4 of',
+        ' * them usable -- it starts sp four bytes down and writes that limit into the',
+        ' * stacklimit CSR.  Nothing in the toolchain checks the depth against it.',
         ' *',
         f' * INLINED, THE {n} STAGE BODIES SHARE ONE FRAME IN main(), and it is sized by the',
         ' * SUM of their spills rather than the largest of them.  That fit while every layout',
@@ -1926,7 +2034,8 @@ def _check_handoff_sizing(stages: List[Stage]) -> None:
                 f"{recv} B in, but the model bills {want_out:.0f} B and {want_in:.0f} B")
 
 
-def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str) -> List[str]:
+def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str,
+                         dbl: bool) -> List[str]:
     n_st = len(stages)
     bases, n_phys = _stage_bases(stages)
     n_work = sum(s.n_par for s in stages)
@@ -1972,6 +2081,15 @@ def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str) -> List[st
     A(f'static const uint8_t STAGE_TILES[N_STAGES + 1] = '
       f'{{ 0, {", ".join(str(s.tiles) for s in stages)} }};')
     A('')
+    if not dbl:
+        A('/* ctt parity of a stage\'s TRANSFER SOURCE, in X_ELEMS.  1 for a stage that')
+        A(' * hands on the very region its predecessor lands in -- stages 2 and 3 update')
+        A(' * the Z lattice in place and ship it -- so the push must read the copy the')
+        A(' * compute just wrote.  0 for a stage whose outbound tensor sits above the')
+        A(' * landing zone and has only one copy.  See _x_src_parity. */')
+        A(f'static const uint8_t STAGE_SRC_PAR[N_STAGES + 1] = '
+          f'{{ 0, {", ".join(str(int(_x_src_parity(s, pool))) for s in stages)} }};')
+        A('')
     A('/* One entry per tensor crossing a stage boundary, in the order the CONSUMER lays')
     A(' * them out.  A producer sends bytes/lanes and a consumer receives bytes/lanes_nx,')
     A(' * so every destination offset, stride, repetition count and lane step follows from')
@@ -2070,8 +2188,8 @@ def _render_stage_tables(stages: List[Stage], lpddr: dict, pool: str) -> List[st
     A(' * Here the front end takes two nodes per lane, the head one each, and stage 4')
     A(' * shares, two lanes to a node -- reaching sideways to node k/2 rather than')
     A(' * straight down. */')
-    A(f'#define LPDDR_EDGE_SOUTH  0u')
-    A(f'#define LPDDR_EDGE_NORTH  1u')
+    A('#define LPDDR_EDGE_SOUTH  0u')
+    A('#define LPDDR_EDGE_NORTH  1u')
     A('typedef struct {')
     A('    uint32_t lpddr_off, l1_off;')
     A('    uint32_t lane_step;  /* bytes into the node this sharer starts at; 0 when the')
@@ -2508,20 +2626,29 @@ def _render_item(item: Item, idx: int, st: Stage, pool: str, bench: bool, dbl: b
     stage's buffer layout; the offset a transfer later reads the result from goes through
     the same map, so the two cannot drift.  The B operand comes from _stage_w_layout,
     which gives every row its OWN region of W_BUF.
+
+    THE PARITY TERM, ctt only.  An operand bound to a HAND-OFF landing region reads the
+    copy whose parity matches the item, because the predecessor is writing the other one in
+    this very step; `+ par * X_ELEMS` is where that copy is (see _render_scratch_buffers).
+    Every other operand -- the LPDDR landing zones, the pinned intermediates, the arena,
+    the weights -- has exactly one copy and must NOT be shifted.  Under cwt the whole buffer
+    is doubled instead and X_BUF[buf] already carries the parity.
     """
     base = 'X_BUF[buf]' if dbl else 'X_BUF'
     x_elems, y_elems = _item_offsets(item, st, pool)
     off = lambda n: (f' + {n}u' if n else '')
-    xbuf = base + off(x_elems) + (f' + {x_off}' if x_off else '')
-    ybuf = base + off(y_elems)
+    row = item.row
+    x_reg, y_reg = BIND.get((st.idx, item.excel_row), ('', ''))
+    handed = {t.name for t in (_tensors('hand', st.idx - 1) if st.idx else [])}
+    jump = lambda reg: ('' if dbl or reg not in handed else ' + par * X_ELEMS')
+    xbuf = base + off(x_elems) + (f' + {x_off}' if x_off else '') + jump(x_reg)
+    ybuf = base + off(y_elems) + jump(y_reg)
     w_layout = st.w_layout or _stage_w_layout(st, pool)
     wbuf = 'W_BUF' + off(w_layout.get(idx, 0))
     work: List[str] = []
 
-    row = item.row
     sh = _row_shape(row, st.n_par, item.tiles)
     c = sh['cls']
-    x_reg, y_reg = BIND.get((st.idx, item.excel_row), ('', ''))
     where = ''
     if x_reg or y_reg:
         # Say which pinned region the operands are, so the emitted call can be read
@@ -2652,6 +2779,18 @@ _DRAIN_NODE_DECL = (
     f'  /* this cluster\'s {LPDDR_OUT_EDGE} neighbour */')
 
 
+def _names_cid_or_nt(body: List[str]) -> bool:
+    """Does this rendered stage body pass `cid` or `nt` to anything?
+
+    Read off the emitted C rather than off the item list, because it is the KERNEL SIGNATURE
+    that decides -- the core-parallel wrappers take the pair, RedMulE takes neither -- and only
+    the layer renderer knows which one a row lowered to.  Comments are stripped first: the
+    per-row notes name both freely and would keep a dead declaration alive.
+    """
+    code = re.sub(r'/\*.*?\*/', '', '\n'.join(body), flags=re.S)
+    return re.search(r'\b(?:cid|nt)\b', code) is not None
+
+
 def _tile_in_elems(st: Stage, pool: str) -> int:
     """One tile's input footprint for the first item of the tiled run, or 0.
 
@@ -2717,23 +2856,31 @@ def _render_compute_stage_fns(stages: List[Stage], pool: str, wait: bool,
         L.append('   and it alone is a mempool_wait() here.  pool runs pool_mean_f16p and')
         L.append('   every layout row is a permute_f16p, a hand-off descriptor or a view')
         L.append('   -- see LAYOUT ROWS in the generator\'s docstring for which is which. */')
-    arg = 'uint32_t buf' if dbl else 'void'
+    arg = 'uint32_t buf' if dbl else 'uint32_t par'
     for st in stages:
         work = ', '.join(i.label for i in st.items)
+        handed = bool(_tensors('hand', st.idx - 1) if st.idx else [])
         L.append(f'/* stage {st.idx + 1} : [{_c_comment(work)}] */')
         L.append(f'{_INLINE} compute_stage_{st.idx + 1}({arg})')
         L.append('{')
         if wait:
-            if dbl:
-                L.append('    (void)buf;   /* nothing is touched: this is the timing twin */')
+            L.append(f'    (void){"buf" if dbl else "par"};   '
+                     f'/* nothing is touched: this is the timing twin */')
             L.extend(_render_compute_body_wait(st, cycles_per_ms, dbl, pool))
         else:
-            L.append('    uint32_t cid = mempool_get_core_id();    /* in-cluster core id */')
-            L.append('    uint32_t nt  = mempool_get_core_count();  /* cores per cluster */')
-            L.append('    (void)cid; (void)nt;')
+            if not dbl and not handed:
+                # Stage 1 has no predecessor, so nothing of its X is doubled.
+                L.append('    (void)par;   /* nothing this stage reads is doubled */')
+            body = []
             if st.tiles > 1:
-                L.append(f'    {_DRAIN_NODE_DECL}')
-            L.extend(_render_compute_body_real(st, pool, bench, dbl, cycles_per_ms))
+                body.append(f'    {_DRAIN_NODE_DECL}')
+            body.extend(_render_compute_body_real(st, pool, bench, dbl, cycles_per_ms))
+            # cid/nt only where the body wants them: the core-parallel kernels take the pair
+            # and RedMulE takes neither, so an all-GEMM stage names them nowhere.
+            if _names_cid_or_nt(body):
+                L.append('    uint32_t cid = mempool_get_core_id();    /* in-cluster core id */')
+                L.append('    uint32_t nt  = mempool_get_core_count();  /* cores per cluster */')
+            L.extend(body)
         L.append('}')
         L.append('')
     return L
@@ -2745,14 +2892,32 @@ def _render_scratch_buffers(stages: List[Stage], pool: str, dbl: bool) -> List[s
     X is sized to the largest '@end' any stage's layout reports; every call site carries
     its own offset out of that same map, so there is no app-wide split point to keep in
     step.
+
+    THE SECOND COPY IS SHAPED DIFFERENTLY IN THE TWO MODES, and _l1_footprint charges
+    whichever this writes:
+
+      * ctt appends ONE PARITY REGION of X_PAR_ELEMS, the largest hand-off landing zone any
+        stage takes.  A region at element `o` inside a landing zone has its twin at
+        `o + X_ELEMS`, so a shifted access is `par * X_ELEMS` added to the offset it already
+        carries and XPAR_B is the same delta in bytes for the DMA side.
+      * cwt declares X_BUF[2], a whole second buffer, because its drain source sits in the
+        MIDDLE of X_BUF -- CELERE has no Y_BUF -- and a partial scheme would need a second
+        parity span.  cevit_pipeline gets away with one span per buffer only because its
+        outbound source lives in a Y_BUF of its own.
     """
     nx, nw = _scratch_elems(stages, pool)
-    d = '[2]' if dbl else ''
-    par = ('  Index [2] is the ITEM PARITY (compute uses one, the DMA the other).'
-           if dbl else '')
+    npar = max((_x_parity_elems(st, pool) for st in stages), default=0)
+    npar = ((npar + 31) // 32) * 32
     attr = '__attribute__((aligned(NUM_BANKS * sizeof(int32_t)), section(".l1")))'
     attr_w = ('__attribute__((aligned(NUM_BANKS * sizeof(int32_t)), '
               'section(".l1"), used))')
+    note = ([' * Index [2] of X_BUF is the ITEM PARITY: compute reads one copy while the',
+             ' * DMA fills the other. */']
+            if dbl else
+            [' * X_BUF CARRIES X_PAR_ELEMS MORE than any stage claims: the twin of the',
+             ' * hand-off landing zone, which a predecessor writes while this cluster is',
+             ' * still computing the previous item.  A region at element `o` inside a',
+             ' * landing zone has its twin at `o + X_ELEMS`. */'])
     return [
         '/* Per-cluster L1 (placeholder data -- only cycles are measured).',
         ' *',
@@ -2762,12 +2927,20 @@ def _render_scratch_buffers(stages: List[Stage], pool: str, dbl: bool) -> List[s
         ' * also the DMA endpoint at both ends.',
         ' * W_BUF holds operand B for every GEMM, resident and one region PER ROW, so the',
         ' * buffer is their SUM.  It does not divide by the cluster count -- the split is',
-        ' * over rows -- and it is not doubled in cwt, because nothing writes it.  On a',
+        ' * over rows -- and it is never doubled, because nothing writes it.  On a',
         ' * matmul row operand B is an ACTIVATION (K, V or UG) that this lowering reads',
-        f' * through W_BUF, so it is reserved here as well as arriving in X_BUF.{par} */',
+        ' * through W_BUF, so it is reserved here as well as arriving in X_BUF.',
+        ' *',
+    ] + note + [
         f'#define X_ELEMS     {nx}U',
         f'#define W_ELEMS     {nw}U',
-        f'static __fp16 X_BUF{d}[X_ELEMS] {attr};',
+    ] + ([
+        f'static __fp16 X_BUF[2][X_ELEMS] {attr};',
+    ] if dbl else [
+        f'#define X_PAR_ELEMS {npar}U  /* the landing-zone twin */',
+        '#define XPAR_B      (X_ELEMS * (uint32_t)sizeof(__fp16))',
+        f'static __fp16 X_BUF[X_ELEMS + X_PAR_ELEMS] {attr};',
+    ]) + [
         f'static __fp16 W_BUF[W_ELEMS] {attr_w};',
     ]
 
@@ -2775,11 +2948,12 @@ def _render_scratch_buffers(stages: List[Stage], pool: str, dbl: bool) -> List[s
 def _render_buffer_init(dbl: bool) -> List[str]:
     xb = 'X_BUF[b][i]' if dbl else 'X_BUF[i]'
     ind = '    ' if dbl else ''
+    end = 'X_ELEMS' if dbl else 'X_ELEMS + X_PAR_ELEMS'
     L = ['    /* Prime the buffers with fp16 1.0 before timing (avoids NaN/subnormal FP',
          '     * stalls; gives the normal-path cycle counts).  All cores, untimed. */']
     if dbl:
         L.append('    for (uint32_t b = 0; b < 2u; b++) {')
-    L += [f'{ind}    for (uint32_t i = mempool_get_core_id(); i < X_ELEMS; '
+    L += [f'{ind}    for (uint32_t i = mempool_get_core_id(); i < {end}; '
           f'i += mempool_get_core_count()) {xb} = (__fp16)1.0f;']
     if dbl:
         L.append('    }')
@@ -2938,6 +3112,20 @@ def _render_lpddr_asserts(stages: List[Stage]) -> List[str]:
     L: List[str] = []
     bases, _total = _stage_bases(stages)
     touches = sorted(set(_TABLES['hin']) | set(_TABLES['hout']))
+    # WHY THE CHECKS BELOW ARE WHAT THEY ARE, said once for the whole group rather than
+    # again over every stage: the rule does not vary by stage, only the numbers do.
+    if touches:
+        L += [
+            '',
+            '/* ---- LPDDR placement -------------------------------------------------',
+            ' *',
+            ' * The node index is derived from the LANE, not read off the cluster\'s',
+            ' * position, so a stage that touches LPDDR must START AT A COLUMN BOUNDARY for',
+            ' * the two to agree -- and it must not claim more nodes than the edge has.  It',
+            ' * does NOT have to lie in one grid row, and does not have to COVER the edge:',
+            ' * only a stage that owns its nodes one-per-lane gets that guarantee, so the',
+            ' * one-row assert is emitted for those stages alone. */',
+        ]
     for i in touches:
         st = stages[i]
         base = bases[i]
@@ -2960,13 +3148,7 @@ def _render_lpddr_asserts(stages: List[Stage]) -> List[str]:
                  f'each lane owns {nodes_per_lane} node(s)')
         L += [
             '',
-            f'/* Stage {i + 1} touches LPDDR ({legs} per node; {share}).',
-            ' * The node index is derived from the lane, not read off the cluster\'s',
-            ' * position, so the stage must START AT A COLUMN BOUNDARY for the two to',
-            ' * agree -- and it must not claim more nodes than the edge has.  It does NOT',
-            ' * have to lie in one grid row, and does not have to COVER the edge: only a',
-            ' * stage that owns its nodes one-per-lane gets that guarantee, and the check',
-            ' * below is emitted only for those. */',
+            f'/* Stage {i + 1}: {legs} per node; {share}. */',
             f'#define S{i + 1}_BASE_CID  {base}U',
             f'#define S{i + 1}_LANES     {st.n_par}U',
             f'#define S{i + 1}_NODES     {nodes_per_lane}U  /* nodes per lane */',
@@ -3003,7 +3185,7 @@ def _render_lpddr_asserts(stages: List[Stage]) -> List[str]:
     if last.tiles > 1:
         L += [
             '',
-            f'/* The last stage drains itself, one tile at a time, into its own node on',
+            '/* The last stage drains itself, one tile at a time, into its own node on',
             f' * the {LPDDR_OUT_EDGE.upper()} edge -- see _render_tile_drain.  Lying in the',
             f' * {LPDDR_OUT_EDGE} ROW is not required for correctness (the address is',
             ' * global) but it is what makes the drain a single hop, so it is asserted as',
@@ -3064,7 +3246,7 @@ def _render_prologue(pool: str, stages: List[Stage], cycles_per_ms: float,
         L.append(f'#define {k}  {v}U')
     L += _render_lpddr_asserts(stages)
     L.append('')
-    L += _render_stage_tables(stages, lpddr, pool)
+    L += _render_stage_tables(stages, lpddr, pool, dbl)
     L.append('')
     L.append(_render_dma_helper(bench))
     L.append(_render_push_helper())
@@ -3159,8 +3341,8 @@ def _render_ctt_c(pool: str, stages: List[Stage], cycles_per_ms: float,
         '     * STAGE 0 IS AN IDLE CLUSTER -- the pipeline leaves cids unused so that the',
         '     * stages touching LPDDR start on a column boundary.  There stage - 1u',
         '     * UNDERFLOWS to ~0u, so `phase <= step` is false at every step and the cluster',
-        '     * never computes or transfers.  It still reaches both global barriers, which',
-        '     * it MUST: they are collective over every cluster on the machine.  The row-0',
+        '     * never computes or transfers.  It still reaches the global barrier, which',
+        '     * it MUST: it is collective over every cluster on the machine.  The row-0',
         '     * entry in each stage-indexed table is the second net -- STAGE_XFER_FIRST[0]',
         '     * == STAGE_XFER_FIRST[1] and STAGE_TILES[0] == 0, so even a spuriously active',
         '     * idle cluster would move nothing. */',
@@ -3176,10 +3358,27 @@ def _render_ctt_c(pool: str, stages: List[Stage], cycles_per_ms: float,
         '    if (flex_get_core_id() == 0 && cid == 0) flex_timer_start();',
         '    flex_global_barrier_xy();',
         '',
+        '    /* COMPUTE THEN TRANSFER, ONE BARRIER A STEP.  A cluster serialises its own',
+        '     * two halves, but nothing orders one cluster against another inside a step: a',
+        '     * stage with a short compute reaches its push while a slower successor is',
+        '     * still computing.  THE DOUBLED LANDING ZONE IS WHAT MAKES THAT SAFE -- a',
+        '     * producer writes the copy whose parity matches the item in flight, which is',
+        '     * never the copy its consumer is reading.  The step therefore costs the',
+        '     * slowest stage\'s own compute + transfer, and NOT the slowest compute plus',
+        '     * the slowest transfer: two stages with different bottlenecks cover for each',
+        '     * other. */',
         '    for (uint32_t step = 0; step < N_ITER + N_STAGES - 1; step++) {',
         '        uint32_t active = (cid < N_CLUSTERS) && (phase <= step)',
         '                          && (step - phase < N_ITER);',
+        '        /* The item this stage works on this step, and its low bit.  THE SAME BIT',
+        '         * EVERYWHERE: a producer is one item AHEAD of its consumer in any given',
+        '         * step, so writing the copy of its OWN item can never be the copy the',
+        '         * consumer is reading; next step the consumer takes that item and reads',
+        '         * exactly this parity. */',
+        '        uint32_t par    = (step - phase) & 1u;',
         '        if (active) {',
+        '            /* This stage\'s OWN inbound read, blocking, of the item it is about to',
+        '             * compute -- which is why an LPDDR landing zone needs no second copy. */',
         '            if (flex_is_dm_core())',
         '                lpddr_pull(stage, lane, (uint64_t)(uintptr_t)X_BUF);',
         '            flex_intra_cluster_sync();   /* worker cores wait for the LPDDR load */',
@@ -3187,23 +3386,40 @@ def _render_ctt_c(pool: str, stages: List[Stage], cycles_per_ms: float,
     ]
     for st in stages:
         L.append(f'            case STAGE_{st.idx + 1}: '
-                 f'compute_stage_{st.idx + 1}(); break;')
+                 f'compute_stage_{st.idx + 1}(par); break;')
     L += [
         '            default: break;',
         '            }',
-        '        }',
-        '        flex_global_barrier_xy();   /* compute done before ANY transfer */',
         '',
-        '        if (flex_is_dm_core() && active) {',
-            '            /* Both helpers carry their own source offsets -- STAGE_XFER has',
-            '             * src_off per tensor and every LPDDR leg has l1_off -- so what',
-            '             * they are handed is the BUFFER BASE. */',
-        '            uint64_t out = (uint64_t)(uintptr_t)X_BUF;',
-        '            lpddr_push(stage, lane, out);',
-        '            if (stage < N_STAGES && STAGE_TILES[stage] == 1u)',
-        '                push_to_next(stage, lane, buf_off, out);',
+        '            /* NO BARRIER IN FRONT OF THIS: the dm_core leaves the switch above',
+        '             * with the rest of its cluster and pushes straight away.',
+        '             *',
+        '             * Both helpers carry their own source offsets -- STAGE_XFER has',
+        '             * src_off per tensor and every LPDDR leg has l1_off -- so what they',
+        '             * are handed is a BUFFER BASE.  BOTH ENDS CARRY A PARITY, and they are',
+        '             * decided separately:',
+        '             *',
+        '             *   destination -- always XPAR_B on an odd item.  A hand-off lands in',
+        '             *     the consumer\'s landing zone by definition, and that is the one',
+        '             *     region every stage doubles.',
+        '             *   source -- only for a stage that ships the very region its own',
+        '             *     predecessor lands in, which STAGE_SRC_PAR names.  Stages 2 and 3',
+        '             *     update the Z lattice in place and hand it on, so their push must',
+        '             *     read the copy their compute just wrote; stages 1, 4 and 5 ship',
+        '             *     from above the landing zone, where there is only one copy.',
+        '             *',
+        '             * BLOCKING helpers, so everything has landed before the barrier below',
+        '             * closes the step.  That is what lets the wavefront stay at m + s --',
+        '             * the consumer reads these bytes at the top of the next step. */',
+        '            if (flex_is_dm_core()) {',
+        '                uint64_t out = (uint64_t)(uintptr_t)X_BUF',
+        '                               + (uint64_t)(par * STAGE_SRC_PAR[stage]) * XPAR_B;',
+        '                lpddr_push(stage, lane, out);',
+        '                if (stage < N_STAGES && STAGE_TILES[stage] == 1u)',
+        '                    push_to_next(stage, lane, buf_off + par * XPAR_B, out);',
+        '            }',
         '        }',
-        '        flex_global_barrier_xy();   /* all transfers done before next compute */',
+        '        flex_global_barrier_xy();   /* one per step: compute AND transfer done */',
         '    }',
         '',
         '    if (flex_get_core_id() == 0 && cid == 0) flex_timer_end();',
@@ -3273,6 +3489,16 @@ def _render_cwt_c(pool: str, stages: List[Stage], cycles_per_ms: float,
             '        if (outbound_active && flex_is_dm_core()) {',
             '            uint64_t out = (uint64_t)(uintptr_t)X_BUF[obuf];',
             '            lpddr_push(stage, lane, out);',
+            '            /* KNOWN BUG, cwt ONLY: buf_off is the base of X_BUF[0], so this',
+            '             * pushes into the consumer\'s buffer 0 whatever the item parity',
+            '             * is, while the consumer computes out of X_BUF[cbuf].  This is the',
+            '             * "remote push targets a fixed buffer index" hazard recorded in',
+            '             * IIS/Estimate.txt: the 2-step skew half of that fix landed, the',
+            '             * destination-index half did not.  It does not move the modelled',
+            '             * timing -- the data is placeholder -- but it is wrong for real',
+            '             * data.  NOT FIXED because cwt does not fit L1 on either pool, so',
+            '             * the fix can be neither built nor run; see SCOPE.  ctt has no',
+            '             * such problem: its destination carries par explicitly. */',
             '            if (stage < N_STAGES && STAGE_TILES[stage] == 1u)',
             '                push_to_next_issue(stage, lane, buf_off, out);',
             '        }',
@@ -3298,6 +3524,12 @@ def _render_cwt_c(pool: str, stages: List[Stage], cycles_per_ms: float,
             '        if (outbound_active && flex_is_dm_core()) {',
             '            uint64_t out = (uint64_t)(uintptr_t)X_BUF[obuf];',
             '            lpddr_push(stage, lane, out);',
+            '            /* KNOWN BUG, cwt ONLY -- see the n_iter > 1 branch of',
+            '             * _render_cwt_c for the full note.  buf_off is the base of',
+            '             * X_BUF[0], so this pushes into the consumer\'s buffer 0 whatever',
+            '             * the item parity is, while the consumer computes out of',
+            '             * X_BUF[cbuf].  Wrong for real data; not fixed because cwt does',
+            '             * not fit L1 on either pool. */',
             '            if (stage < N_STAGES && STAGE_TILES[stage] == 1u)',
             '                push_to_next(stage, lane, buf_off, out);',
             '        }',
@@ -3353,6 +3585,10 @@ def generate_apps(res: Results, apps_dir: str, cycles_per_ms: float, mode: str,
         if l1 > budget:
             print(f'  [{pool}]  WARNING: {(l1 - budget) / 1024:.0f} KiB over budget -- '
                   f'this app will not link.')
+        # config= PICKS THE GRID, NOT THE POOL.  This partition is laid out on the 4x8 grid
+        # and asserts it, so BOTH flavours build under `tensorpool256` -- including the
+        # Terapool one, whose config is 4x3 and would trip the assert.  The pool in the app's
+        # name is the COST MODEL; the config is the machine it is placed on.
         print(f'  [{pool}]  build with:  make -C {apps_dir} '
               f'{app_name(mode, pool)} COMPILER=llvm config=tensorpool256')
 
@@ -3362,7 +3598,7 @@ def generate_apps(res: Results, apps_dir: str, cycles_per_ms: float, mode: str,
 # ---------------------------------------------------------------------------
 
 def write_summary(res: Results, path: str, csv_name: str) -> None:
-    lines = ['# CELERE pipeline summary  (read by latency_throughput_bars.py)',
+    lines = ['# CELERE pipeline summary',
              f'# csv: {csv_name}',
              '# columns: pool  mode  throughput_ms  n_stages  n_clusters  latency_ms']
     for mode, best, steps in (('ctt', res.best_throughput, 1),
@@ -3401,9 +3637,12 @@ def _plot_split(plt, pool: str, stages: List[Stage], overlap: bool,
     One x slot per STAGE, one BAR GROUP per CLUSTER inside it, which shows directly that a
     stage's wall is the height of one lane and not the sum of them.
 
-    ctt -- stacked bars: compute and transfer are barriered substages, so the wall is the
-           sum.  cwt -- grouped pair: they overlap, so the wall is the taller, standing on
+    ctt -- stacked bars: a cluster computes and then transfers, so its wall is the sum.
+           cwt -- grouped pair: they overlap, so the wall is the taller, standing on
            the hatched pedestal of the inbound LPDDR read (_overlap_wall).
+
+    THE PERIOD IS THE TALLEST BAR IN EITHER MODE, not the sum of two per-mode maxima: both
+    schedules close a step on one barrier.
 
     A self-draining stage carries its transfer INSIDE its compute term, so its green bar
     is legitimately zero; the tick label says so.
