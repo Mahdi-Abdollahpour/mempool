@@ -141,7 +141,7 @@
 #define CE_PE_FLOP_PER_CYCLE 280u
 #endif
 #ifndef CE_LHSM_STANDIN
-#define CE_LHSM_STANDIN 1      // 1: local_hub_softmax_f16p is a timed wait too
+#define CE_LHSM_STANDIN 0      // 1: local_hub_softmax_f16p is a timed wait too
 #endif
 
 #ifndef CE_LHSM_FLOP_PER_LOGIT
@@ -561,7 +561,7 @@ _Static_assert(N_CLUSTERS <= ARCH_NUM_CLUSTER, "the pipeline needs more clusters
 
 
 
-#include "baremetal/mempool_local_hub_softmax_f16p.h" // TODO
+#include "baremetal/mempool_local_hub_softmax_f16.h"
 
 /* CE_REGION { ... } marks a bench region: one row of a stage, or one copy.
  *
@@ -1043,7 +1043,7 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
                               E_PAIRS, CE_D_HEAD * E_KP);
     }
     CE_REGION {   // under the TEs: local logits on the unrotated q, k, + bias, softmax -> A_span, A_hub; no barrier (1.4 LHSM)
-        local_hub_softmax_f16p(&lhsm, cid, nt);
+        local_hub_softmax_f16(&lhsm, cid, nt);
     }
     CE_REGION {   // under the TEs: span v -> V_g [pair][152][128]; no barrier (1.7 VG)
         static const perm_level_t lv[] = {
@@ -1149,7 +1149,7 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
                               E_PAIRS, CE_D_HEAD * E_KP);
     }
     CE_REGION {   // local logits of the live pairs, + bias, softmax, while the TEs run; the summary is the only hub query; no barrier (2.4 LHSM)
-        local_hub_softmax_f16p(&lhsm, cid, nt);
+        local_hub_softmax_f16(&lhsm, cid, nt);
     }
     CE_REGION {   // gather v of spans and global probes into V_g, while the TEs run; no barrier (2.7 VG)
         static const perm_level_t lv[] = {
