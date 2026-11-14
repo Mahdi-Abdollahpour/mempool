@@ -746,3 +746,152 @@ def generate_ftranspose(my_type=np.float32, defines={}):
     A = np.reshape(A, (matrix_M * matrix_N), order='C')
     B = np.reshape(B, (matrix_M * matrix_N), order='C')
     return [A, B], defines
+
+
+# CELERE-Spectral's local pass: local_hub_softmax_f16.
+def generate_flocal_hub_softmax(my_type=np.float16, defines={}):
+    """Inputs and golden of local_hub_softmax_f16p, two calls as the
+    celere_spectral app makes them on one lane:
+
+      call 1, attention stage 1: two hub queries (S and L), and every local
+              probe is one constant row (l2_probe, steps 0);
+      call 2, attention stage 2: the summary is the only hub query, and each
+              window has its own local probe, read from the matrix.
+    """
+    L = defines['lhsm_LINES']
+    H = defines['lhsm_HEADS']
+    S = defines['lhsm_SPANS']
+    W = defines['lhsm_WIN']
+    D = defines['lhsm_DMODEL']
+    DH = defines['lhsm_DHEAD']
+    assert D == H * DH
+    NW = -(-S // W)
+    LAST = S - (NW - 1) * W
+    LW = W + 2
+    DQKV = 3 * D
+    ROW_S = L * S                    # first summary row
+    ROW_LG = ROW_S + L * NW          # first global probe row
+    ROW_LL = ROW_LG + L * NW         # first local probe row
+    ROWS = ROW_LL + L * NW
+    defines['lhsm_NWIN'] = NW
+    defines['lhsm_DQKV'] = DQKV
+    defines['lhsm_ROW_S'] = ROW_S
+    defines['lhsm_ROW_LG'] = ROW_LG
+    defines['lhsm_ROW_LL'] = ROW_LL
+    defines['lhsm_ROWS'] = ROWS
+    defines['lhsm_ASPAN_N'] = L * H * S * 3
+    defines['lhsm_AHUB1_N'] = L * H * NW * 2 * LW
+    defines['lhsm_AHUB2_N'] = L * H * NW * 1 * LW
+    defines['lhsm_BIAS1_N'] = H * 3 * 3 + H
+    defines['lhsm_BIAS2_N'] = H * 2 * 3 + H
+
+    rng = np.random.default_rng(1404)    # a fixed seed: the same header
+    qkv = rng.standard_normal((ROWS, DQKV)) * 0.3 * rng.uniform(
+        0.5, 2.0, (ROWS, 1))
+    probe = rng.standard_normal(DQKV) * 0.3
+    qkv, probe = (np.array([float('%+.4f' % v) for v in a.ravel()]).astype(
+        np.float16).reshape(a.shape) for a in (qkv, probe))
+    assert np.array_equal(np.array([float('%+.4f' % v) for v in qkv.ravel()])
+                          .astype(np.float16), qkv.ravel()), \
+        "print round trip is not stable"
+
+    # q and k: [line, head, row of the line, DH]
+    t = qkv.astype(np.float64).reshape(ROWS, 3, H, DH)
+    q, k = t[:ROW_S].reshape(L, S, 3, H, DH).transpose(2, 0, 3, 1, 4)[:2]
+    qs, ks = t[ROW_S:ROW_LG].reshape(L, NW, 3, H, DH).transpose(
+        2, 0, 3, 1, 4)[:2]
+
+    tid = np.array([0] * W + [2, 1])
+    neg = -3.0e4
+    hub = np.zeros((LW, LW))
+    hub[:W, :W] = neg
+    hub[np.arange(W), np.arange(W)] = 0.0
+    ego = np.zeros((LW, LW))
+    ego[np.arange(W), np.arange(W)] = 1.0
+    col_r = np.array([1.0] * W + [0.0, 0.0])
+    loc_c = np.array([[1.0, 1, 1], [W, 1, 1], [W, 1, 1]])
+    m = np.array([0, 2, 1])          # family (span, S, L) to type (R, P, S)
+
+    out = []
+    biases = []
+    for call, n_hub in ((1, 2), (2, 1)):
+        if call == 1:                # one constant probe row for every window
+            pr = probe.astype(np.float64).reshape(3, H, 1, DH)
+            ql = np.broadcast_to(pr[0], (L, H, NW, DH))
+            kl = np.broadcast_to(pr[1], (L, H, NW, DH))
+        else:
+            ql, kl = t[ROW_LL:].reshape(L, NW, 3, H, DH).transpose(
+                2, 0, 3, 1, 4)[:2]
+        loc_prior = rng.standard_normal((H, 3, 3))
+        beta = rng.uniform(0.5, 1.5, H)
+        lp = loc_prior - np.max(loc_prior, axis=-1, keepdims=True)
+        lp = lp - np.log(np.sum(np.exp(lp), axis=-1, keepdims=True))
+        # the offline fold of the contract
+        G = (lp[:, m][:, :, m] - np.log(loc_c[m][:, m])[None])[:, :1 + n_hub]
+        delta = -beta * np.log(LAST / W)
+        bias = np.array([float('%+.4f' % v) for v in np.r_[G.ravel(), delta]
+                         ]).astype(np.float16)
+        Gq = bias[:G.size].astype(np.float64).reshape(G.shape)
+        dq = bias[G.size:].astype(np.float64)
+
+        prior = lp - np.log(loc_c)[None]
+        ref_span = np.zeros((L, H, S, 3))
+        ref_hub = np.zeros((L, H, NW, n_hub, LW))
+        for ln in range(L):
+            for h in range(H):
+                for w in range(NW):
+                    live = min(W, S - w * W)
+                    qw = np.zeros((LW, DH))
+                    kw = np.zeros((LW, DH))
+                    qw[:live] = q[ln, h, w * W:w * W + live]
+                    kw[:live] = k[ln, h, w * W:w * W + live]
+                    qw[W], kw[W] = qs[ln, h, w], ks[ln, h, w]
+                    qw[W + 1], kw[W + 1] = ql[ln, h, w], kl[ln, h, w]
+                    x = qw @ kw.T + hub + prior[h][tid[:, None], tid[None, :]]
+                    shift = -beta[h] * np.log(max(live, 1) / W)
+                    x = x + shift * col_r[None, :] - shift * ego
+                    if live < W:
+                        x[:, live:W] += neg
+                    e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+                    a = e / np.sum(e, axis=-1, keepdims=True)
+                    for s in range(live):
+                        ref_span[ln, h, w * W + s] = a[s, [s, W, W + 1]]
+                    ref_hub[ln, h, w] = a[W:W + n_hub]
+
+        res = []
+        for Gx, dx in ((G, delta), (Gq, dq)):
+            c_span = np.zeros((L, H, S, 3))
+            c_hub = np.zeros((L, H, NW, n_hub, LW))
+            for ln in range(L):
+                for h in range(H):
+                    for i in range(S):
+                        w = i // W
+                        z = np.stack([k[ln, h, i], ks[ln, h, w],
+                                      kl[ln, h, w]]) @ q[ln, h, i] + Gx[h, 0]
+                        e = np.exp(z - np.max(z))
+                        c_span[ln, h, i] = e / np.sum(e)
+                    for w in range(NW):
+                        live = min(W, S - w * W)
+                        keys = np.concatenate([k[ln, h, w * W:w * W + live],
+                                               ks[ln, h, w:w + 1],
+                                               kl[ln, h, w:w + 1]])
+                        bj = np.r_[np.full(live, dx[h] if live < W else 0.0),
+                                   0.0, 0.0]
+                        for eta, qq in enumerate(
+                                (qs[ln, h, w], ql[ln, h, w])[:n_hub]):
+                            z = keys @ qq + (Gx[h, 1 + eta,
+                                                [0] * live + [1, 2]] + bj)
+                            e = np.exp(z - np.max(z))
+                            e = e / np.sum(e)
+                            c_hub[ln, h, w, eta, :live] = e[:live]
+                            c_hub[ln, h, w, eta, W:] = e[live:]
+            res.append((c_span, c_hub))
+        err = max(np.abs(ref_span - res[0][0]).max(),
+                  np.abs(ref_hub - res[0][1]).max())
+        assert err < 1e-9, "the fold does not match the model: %g" % err
+        biases.append(bias)
+        out += [np.array([float('%+.4f' % v) for v in a.ravel()]).astype(
+            np.float16).astype(my_type) for a in res[1]]
+
+    inputs = [qkv.reshape(-1), probe, biases[0], biases[1]]
+    return [a.astype(my_type) for a in inputs] + out, defines

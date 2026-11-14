@@ -633,6 +633,29 @@
     ]
   },
 
+  // CELERE-Spectral's local pass
+  "local_hub_softmax_f16": {
+    "type": "float16",
+    "defines": [
+      ("lhsm_LINES", 2)
+      ("lhsm_HEADS", 2)
+      ("lhsm_SPANS", 137)
+      ("lhsm_WIN", 12)
+      ("lhsm_DMODEL", 256)
+      ("lhsm_DHEAD", 128)
+    ]
+    "arrays": [
+      ("__fp16", "l2_qkv")
+      ("__fp16", "l2_probe")
+      ("__fp16", "l2_bias1")
+      ("__fp16", "l2_bias2")
+      ("__fp16", "l2_aspan1")
+      ("__fp16", "l2_ahub1")
+      ("__fp16", "l2_aspan2")
+      ("__fp16", "l2_ahub2")
+    ]
+  },
+
   "ofdm_f16": {
     "type": "float16",
     "defines": [
