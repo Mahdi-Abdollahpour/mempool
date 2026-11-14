@@ -101,7 +101,7 @@ int main(void) {
     for (uint32_t run = 1u; run <= 2u; run++) {
       const mempool_timer_t t0 = mempool_get_timer();
       mempool_start_benchmark();
-      local_hub_softmax_f16p(call == 1u ? &call1 : &call2, core_id, num_cores);
+      local_hub_softmax_f16(call == 1u ? &call1 : &call2, core_id, num_cores);
       mempool_barrier(num_cores);
       mempool_stop_benchmark();
       const mempool_timer_t t1 = mempool_get_timer();

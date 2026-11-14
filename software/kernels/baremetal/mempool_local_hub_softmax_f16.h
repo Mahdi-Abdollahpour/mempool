@@ -668,8 +668,8 @@ static inline void lhsm_hub_row(const lhsm_args_t *a, uint32_t r,
 
 // ==== the kernel ==========================================================
 
-void local_hub_softmax_f16p(const lhsm_args_t *a, uint32_t core_id,
-                            uint32_t num_cores) {
+void local_hub_softmax_f16(const lhsm_args_t *a, uint32_t core_id,
+                           uint32_t num_cores) {
   // windows a line, the short one too: 12
   const uint32_t n_win = (a->n_span + a->win - 1) / a->win;
   // hub rows: 96 in 1.4 (S, L), 48 in 2.4 (S)

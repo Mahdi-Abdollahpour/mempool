@@ -141,7 +141,7 @@
 #define CE_PE_FLOP_PER_CYCLE 280u
 #endif
 #ifndef CE_LHSM_STANDIN
-#define CE_LHSM_STANDIN 0      // 1: local_hub_softmax_f16p is a timed wait too
+#define CE_LHSM_STANDIN 0      // 1: local_hub_softmax_f16 is a timed wait too
 #endif
 
 #ifndef CE_LHSM_FLOP_PER_LOGIT
