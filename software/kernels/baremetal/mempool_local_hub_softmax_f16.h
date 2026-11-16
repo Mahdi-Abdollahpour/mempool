@@ -36,10 +36,12 @@ typedef struct {
 
 #define LHSM_LOG2E 0x3FB8AA3B // 1.44269504
 #define LHSM_TMIN 0xC2C80000  // -100: lower t, 2^t is far below any weight
-#define LHSM_C0 0x3F7FFB58    // 0.99992895
-#define LHSM_C1 0x3F317A8D    // 0.69327623
-#define LHSM_C2 0x3E786D32    // 0.24260405
-#define LHSM_C3 0x3D61A4AB    // 0.05508868
+// 2^f, |f| <= 1/2, is the cubic c0 + c1 f + c2 f^2 + c3 f^3 of least relative
+// error (minimax: 7.5e-5). The asm takes it over c3, as ((f + A) f + B) f + C
+// with A = c2 / c3, B = c1 / c3, C = c0 / c3; the 1 / c3 cancels in the sum
+#define LHSM_A 0x408CB763 // 4.39738607
+#define LHSM_B 0x41490C64 // 12.5655251
+#define LHSM_C 0x4190FDD5 // 18.1239414
 
 #define LHSM_DEAD (-1.0e30f)
 
@@ -120,7 +122,8 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
 
       // lets already do the softmax (14 logits)
       // t = max((x - max) log2(e), -100), n = round(t), f = t - n, |f| <= 1/2
-      // exp(x - max) = 2^n (((c3 f + c2) f + c1) f + c0), w = exp / sum of 14
+      // exp(x - max) / c3 = 2^n (((f + A) f + B) f + C), w = exp / sum of 14
+      // fmsub.s on a copy of max log2(e): the core takes the addend from rd
       "fmax.s %[q], %[s0], %[s1];"
       "fmax.s %[k], %[s2], %[s3];"
       "fmax.s %[ks], %[s4], %[s5];"
@@ -135,18 +138,20 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
       "fmax.s %[q], %[q], %[k];"
       "fmax.s %[ks], %[ks], %[kl];"
       "li x6, %[tmin];"           // -100
-      "li x7, %[c0];"             // the cubic of 2^f: c0 to c3
+      "li x7, %[cc];"             // the cubic: A, B, C
       "fmax.s %[q], %[q], %[ks];" // the max
-      "li x28, %[c1];"
-      "li x29, %[c2];"
-      "li x30, %[c3];"
-      "fmul.s x31, %[q], x5;"          // max . log2(e)
-      "fmsub.s %[s0], %[s0], x5, x31;" // t = x log2(e) - max log2(e).  [0,1,2]
-      "fmsub.s %[s1], %[s1], x5, x31;"
-      "fmsub.s %[s2], %[s2], x5, x31;"
-      "fmax.s %[s0], %[s0], x6;" // t, not below -100
-      "fmax.s %[s1], %[s1], x6;"
-      "fmax.s %[s2], %[s2], x6;"
+      "li x28, %[cb];"
+      "li x29, %[ca];"
+      "fmul.s x31, %[q], x5;" // max . log2(e)
+      "mv %[k], x31;"
+      "mv %[kl], x31;"
+      "mv %[back], x31;"
+      "fmsub.s %[k], %[s0], x5, %[k];" // t = x log2(e) - max log2(e).  [0,1,2]
+      "fmsub.s %[kl], %[s1], x5, %[kl];"
+      "fmsub.s %[back], %[s2], x5, %[back];"
+      "fmax.s %[s0], %[k], x6;" // t, not below -100
+      "fmax.s %[s1], %[kl], x6;"
+      "fmax.s %[s2], %[back], x6;"
       "fcvt.w.s %[q], %[s0], rne;" // n = round(t)
       "fcvt.w.s %[ks], %[s1], rne;"
       "fcvt.w.s %[step], %[s2], rne;"
@@ -156,27 +161,36 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
       "fsub.s %[s0], %[s0], %[k];" // f = t - n, in [-0.5, 0.5]
       "fsub.s %[s1], %[s1], %[kl];"
       "fsub.s %[s2], %[s2], %[back];"
-      "fmadd.s %[k], %[s0], x30, x29;" // c3 f + c2
-      "fmadd.s %[kl], %[s1], x30, x29;"
-      "fmadd.s %[back], %[s2], x30, x29;"
-      "fmadd.s %[k], %[k], %[s0], x28;" // (c3 f + c2) f + c1
-      "fmadd.s %[kl], %[kl], %[s1], x28;"
-      "fmadd.s %[back], %[back], %[s2], x28;"
-      "fmadd.s %[k], %[k], %[s0], x7;" // (..) f + c0: 2^f
-      "fmadd.s %[kl], %[kl], %[s1], x7;"
-      "fmadd.s %[back], %[back], %[s2], x7;"
+      "fadd.s %[k], %[s0], x29;" // f + A
+      "fadd.s %[kl], %[s1], x29;"
+      "fadd.s %[back], %[s2], x29;"
+      "fmul.s %[k], %[k], %[s0];" // (f + A) f + B
+      "fmul.s %[kl], %[kl], %[s1];"
+      "fmul.s %[back], %[back], %[s2];"
+      "fadd.s %[k], %[k], x28;"
+      "fadd.s %[kl], %[kl], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[k], %[k], %[s0];" // (..) f + C: 2^f / c3
+      "fmul.s %[kl], %[kl], %[s1];"
+      "fmul.s %[back], %[back], %[s2];"
+      "fadd.s %[k], %[k], x7;"
+      "fadd.s %[kl], %[kl], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[q], %[q], 23;" // n, into the exponent field
       "slli %[ks], %[ks], 23;"
       "slli %[step], %[step], 23;"
-      "add %[s0], %[k], %[q];" // exp(x - max) = 2^f 2^n
+      "add %[s0], %[k], %[q];" // exp(x - max) / c3 = 2^n (2^f / c3)
       "add %[s1], %[kl], %[ks];"
       "add %[s2], %[back], %[step];"
-      "fmsub.s %[s3], %[s3], x5, x31;"   // [3,4,5]
-      "fmsub.s %[s4], %[s4], x5, x31;"
-      "fmsub.s %[s5], %[s5], x5, x31;"
-      "fmax.s %[s3], %[s3], x6;"
-      "fmax.s %[s4], %[s4], x6;"
-      "fmax.s %[s5], %[s5], x6;"
+      "mv %[k], x31;" // [3,4,5]
+      "mv %[kl], x31;"
+      "mv %[back], x31;"
+      "fmsub.s %[k], %[s3], x5, %[k];"
+      "fmsub.s %[kl], %[s4], x5, %[kl];"
+      "fmsub.s %[back], %[s5], x5, %[back];"
+      "fmax.s %[s3], %[k], x6;"
+      "fmax.s %[s4], %[kl], x6;"
+      "fmax.s %[s5], %[back], x6;"
       "fcvt.w.s %[q], %[s3], rne;"
       "fcvt.w.s %[ks], %[s4], rne;"
       "fcvt.w.s %[step], %[s5], rne;"
@@ -186,27 +200,36 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
       "fsub.s %[s3], %[s3], %[k];"
       "fsub.s %[s4], %[s4], %[kl];"
       "fsub.s %[s5], %[s5], %[back];"
-      "fmadd.s %[k], %[s3], x30, x29;"
-      "fmadd.s %[kl], %[s4], x30, x29;"
-      "fmadd.s %[back], %[s5], x30, x29;"
-      "fmadd.s %[k], %[k], %[s3], x28;"
-      "fmadd.s %[kl], %[kl], %[s4], x28;"
-      "fmadd.s %[back], %[back], %[s5], x28;"
-      "fmadd.s %[k], %[k], %[s3], x7;"
-      "fmadd.s %[kl], %[kl], %[s4], x7;"
-      "fmadd.s %[back], %[back], %[s5], x7;"
+      "fadd.s %[k], %[s3], x29;"
+      "fadd.s %[kl], %[s4], x29;"
+      "fadd.s %[back], %[s5], x29;"
+      "fmul.s %[k], %[k], %[s3];"
+      "fmul.s %[kl], %[kl], %[s4];"
+      "fmul.s %[back], %[back], %[s5];"
+      "fadd.s %[k], %[k], x28;"
+      "fadd.s %[kl], %[kl], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[k], %[k], %[s3];"
+      "fmul.s %[kl], %[kl], %[s4];"
+      "fmul.s %[back], %[back], %[s5];"
+      "fadd.s %[k], %[k], x7;"
+      "fadd.s %[kl], %[kl], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[q], %[q], 23;"
       "slli %[ks], %[ks], 23;"
       "slli %[step], %[step], 23;"
       "add %[s3], %[k], %[q];"
       "add %[s4], %[kl], %[ks];"
       "add %[s5], %[back], %[step];"
-      "fmsub.s %[s6], %[s6], x5, x31;" // [6,7,8]
-      "fmsub.s %[s7], %[s7], x5, x31;"
-      "fmsub.s %[s8], %[s8], x5, x31;"
-      "fmax.s %[s6], %[s6], x6;"
-      "fmax.s %[s7], %[s7], x6;"
-      "fmax.s %[s8], %[s8], x6;"
+      "mv %[k], x31;" // [6,7,8]
+      "mv %[kl], x31;"
+      "mv %[back], x31;"
+      "fmsub.s %[k], %[s6], x5, %[k];"
+      "fmsub.s %[kl], %[s7], x5, %[kl];"
+      "fmsub.s %[back], %[s8], x5, %[back];"
+      "fmax.s %[s6], %[k], x6;"
+      "fmax.s %[s7], %[kl], x6;"
+      "fmax.s %[s8], %[back], x6;"
       "fcvt.w.s %[q], %[s6], rne;"
       "fcvt.w.s %[ks], %[s7], rne;"
       "fcvt.w.s %[step], %[s8], rne;"
@@ -216,27 +239,36 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
       "fsub.s %[s6], %[s6], %[k];"
       "fsub.s %[s7], %[s7], %[kl];"
       "fsub.s %[s8], %[s8], %[back];"
-      "fmadd.s %[k], %[s6], x30, x29;"
-      "fmadd.s %[kl], %[s7], x30, x29;"
-      "fmadd.s %[back], %[s8], x30, x29;"
-      "fmadd.s %[k], %[k], %[s6], x28;"
-      "fmadd.s %[kl], %[kl], %[s7], x28;"
-      "fmadd.s %[back], %[back], %[s8], x28;"
-      "fmadd.s %[k], %[k], %[s6], x7;"
-      "fmadd.s %[kl], %[kl], %[s7], x7;"
-      "fmadd.s %[back], %[back], %[s8], x7;"
+      "fadd.s %[k], %[s6], x29;"
+      "fadd.s %[kl], %[s7], x29;"
+      "fadd.s %[back], %[s8], x29;"
+      "fmul.s %[k], %[k], %[s6];"
+      "fmul.s %[kl], %[kl], %[s7];"
+      "fmul.s %[back], %[back], %[s8];"
+      "fadd.s %[k], %[k], x28;"
+      "fadd.s %[kl], %[kl], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[k], %[k], %[s6];"
+      "fmul.s %[kl], %[kl], %[s7];"
+      "fmul.s %[back], %[back], %[s8];"
+      "fadd.s %[k], %[k], x7;"
+      "fadd.s %[kl], %[kl], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[q], %[q], 23;"
       "slli %[ks], %[ks], 23;"
       "slli %[step], %[step], 23;"
       "add %[s6], %[k], %[q];"
       "add %[s7], %[kl], %[ks];"
       "add %[s8], %[back], %[step];"
-      "fmsub.s %[s9], %[s9], x5, x31;"        // [9,10,11]
-      "fmsub.s %[s10], %[s10], x5, x31;"
-      "fmsub.s %[s11], %[s11], x5, x31;"
-      "fmax.s %[s9], %[s9], x6;"
-      "fmax.s %[s10], %[s10], x6;"
-      "fmax.s %[s11], %[s11], x6;"
+      "mv %[k], x31;" // [9,10,11]
+      "mv %[kl], x31;"
+      "mv %[back], x31;"
+      "fmsub.s %[k], %[s9], x5, %[k];"
+      "fmsub.s %[kl], %[s10], x5, %[kl];"
+      "fmsub.s %[back], %[s11], x5, %[back];"
+      "fmax.s %[s9], %[k], x6;"
+      "fmax.s %[s10], %[kl], x6;"
+      "fmax.s %[s11], %[back], x6;"
       "fcvt.w.s %[q], %[s9], rne;"
       "fcvt.w.s %[ks], %[s10], rne;"
       "fcvt.w.s %[step], %[s11], rne;"
@@ -246,37 +278,49 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
       "fsub.s %[s9], %[s9], %[k];"
       "fsub.s %[s10], %[s10], %[kl];"
       "fsub.s %[s11], %[s11], %[back];"
-      "fmadd.s %[k], %[s9], x30, x29;"
-      "fmadd.s %[kl], %[s10], x30, x29;"
-      "fmadd.s %[back], %[s11], x30, x29;"
-      "fmadd.s %[k], %[k], %[s9], x28;"
-      "fmadd.s %[kl], %[kl], %[s10], x28;"
-      "fmadd.s %[back], %[back], %[s11], x28;"
-      "fmadd.s %[k], %[k], %[s9], x7;"
-      "fmadd.s %[kl], %[kl], %[s10], x7;"
-      "fmadd.s %[back], %[back], %[s11], x7;"
+      "fadd.s %[k], %[s9], x29;"
+      "fadd.s %[kl], %[s10], x29;"
+      "fadd.s %[back], %[s11], x29;"
+      "fmul.s %[k], %[k], %[s9];"
+      "fmul.s %[kl], %[kl], %[s10];"
+      "fmul.s %[back], %[back], %[s11];"
+      "fadd.s %[k], %[k], x28;"
+      "fadd.s %[kl], %[kl], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[k], %[k], %[s9];"
+      "fmul.s %[kl], %[kl], %[s10];"
+      "fmul.s %[back], %[back], %[s11];"
+      "fadd.s %[k], %[k], x7;"
+      "fadd.s %[kl], %[kl], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[q], %[q], 23;"
       "slli %[ks], %[ks], 23;"
       "slli %[step], %[step], 23;"
       "add %[s9], %[k], %[q];"
       "add %[s10], %[kl], %[ks];"
       "add %[s11], %[back], %[step];"
-      "fmsub.s %[s12], %[s12], x5, x31;"  // [12,13]
-      "fmsub.s %[s13], %[s13], x5, x31;"
-      "fmax.s %[s12], %[s12], x6;"
-      "fmax.s %[s13], %[s13], x6;"
+      "mv %[k], x31;" // [12,13]
+      "mv %[kl], x31;"
+      "fmsub.s %[k], %[s12], x5, %[k];"
+      "fmsub.s %[kl], %[s13], x5, %[kl];"
+      "fmax.s %[s12], %[k], x6;"
+      "fmax.s %[s13], %[kl], x6;"
       "fcvt.w.s %[q], %[s12], rne;"
       "fcvt.w.s %[ks], %[s13], rne;"
       "fcvt.s.w %[k], %[q];"
       "fcvt.s.w %[kl], %[ks];"
       "fsub.s %[s12], %[s12], %[k];"
       "fsub.s %[s13], %[s13], %[kl];"
-      "fmadd.s %[k], %[s12], x30, x29;"
-      "fmadd.s %[kl], %[s13], x30, x29;"
-      "fmadd.s %[k], %[k], %[s12], x28;"
-      "fmadd.s %[kl], %[kl], %[s13], x28;"
-      "fmadd.s %[k], %[k], %[s12], x7;"
-      "fmadd.s %[kl], %[kl], %[s13], x7;"
+      "fadd.s %[k], %[s12], x29;"
+      "fadd.s %[kl], %[s13], x29;"
+      "fmul.s %[k], %[k], %[s12];"
+      "fmul.s %[kl], %[kl], %[s13];"
+      "fadd.s %[k], %[k], x28;"
+      "fadd.s %[kl], %[kl], x28;"
+      "fmul.s %[k], %[k], %[s12];"
+      "fmul.s %[kl], %[kl], %[s13];"
+      "fadd.s %[k], %[k], x7;"
+      "fadd.s %[kl], %[kl], x7;"
       "slli %[q], %[q], 23;"
       "slli %[ks], %[ks], 23;"
       "add %[s12], %[k], %[q];"
@@ -333,8 +377,7 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
         [ks] "+&r"(ks), [kl] "+&r"(kl), [step] "+&r"(step), [back] "+&r"(back),
         [o] "+&r"(o5)
       : [end] "r"(end), [log2e] "i"(LHSM_LOG2E), [tmin] "i"(LHSM_TMIN),
-        [c0] "i"(LHSM_C0), [c1] "i"(LHSM_C1), [c2] "i"(LHSM_C2),
-        [c3] "i"(LHSM_C3)
+        [ca] "i"(LHSM_A), [cb] "i"(LHSM_B), [cc] "i"(LHSM_C)
       : "x6", "x7", "x28", "x29", "x30", "x31", "memory");
 }
 
@@ -382,7 +425,8 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
 
       // softmax, a row at a time: the max of 3, then 3 exps
       // t = max((x - max) log2(e), -100), n = round(t), f = t - n
-      // exp(x - max) = 2^n (((c3 f + c2) f + c1) f + c0)
+      // exp(x - max) / c3 = 2^n (((f + A) f + B) f + C)
+      // fmsub.s on a copy of max log2(e): the core takes the addend from rd
       "fmax.s x31, %[s0], %[s1];" // max, row 0
       "fmax.s x16, %[s3], %[s4];" // max, row 1
       "li x5, %[log2e];"
@@ -391,17 +435,19 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       "li x6, %[tmin];"
       "fmul.s x31, x31, x5;" // max log2(e), row 0
       "fmul.s x16, x16, x5;" // max log2(e), row 1
-      "li x7, %[c0];"
-      "li x28, %[c1];"
-      "li x29, %[c2];"
-      "li x30, %[c3];"
-      "fmsub.s %[s0], %[s0], x5, x31;" // t = x log2(e) - max log2(e)
-      "fmsub.s %[s1], %[s1], x5, x31;"
-      "fmsub.s %[s2], %[s2], x5, x31;"
+      "li x7, %[cc];"
+      "li x28, %[cb];"
+      "li x29, %[ca];"
+      "mv %[dm], x31;"
+      "mv %[nx], x31;"
+      "mv %[back], x31;"
+      "fmsub.s %[dm], %[s0], x5, %[dm];" // t = x log2(e) - max log2(e)
+      "fmsub.s %[nx], %[s1], x5, %[nx];"
+      "fmsub.s %[back], %[s2], x5, %[back];"
       "fmax.s x31, %[s6], %[s7];" // max, row 2
-      "fmax.s %[s0], %[s0], x6;"  // t, not below -100
-      "fmax.s %[s1], %[s1], x6;"
-      "fmax.s %[s2], %[s2], x6;"
+      "fmax.s %[s0], %[dm], x6;"  // t, not below -100
+      "fmax.s %[s1], %[nx], x6;"
+      "fmax.s %[s2], %[back], x6;"
       "fmax.s x31, x31, %[s8];"
       "fcvt.w.s %[p], %[s0], rne;" // n = round(t)
       "fcvt.w.s %[ks], %[s1], rne;"
@@ -413,28 +459,37 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       "fsub.s %[s0], %[s0], %[dm];" // f = t - n
       "fsub.s %[s1], %[s1], %[nx];"
       "fsub.s %[s2], %[s2], %[back];"
-      "fmadd.s %[dm], %[s0], x30, x29;" // 2^f, the cubic
-      "fmadd.s %[nx], %[s1], x30, x29;"
-      "fmadd.s %[back], %[s2], x30, x29;"
-      "fmadd.s %[dm], %[dm], %[s0], x28;"
-      "fmadd.s %[nx], %[nx], %[s1], x28;"
-      "fmadd.s %[back], %[back], %[s2], x28;"
-      "fmadd.s %[dm], %[dm], %[s0], x7;"
-      "fmadd.s %[nx], %[nx], %[s1], x7;"
-      "fmadd.s %[back], %[back], %[s2], x7;"
+      "fadd.s %[dm], %[s0], x29;" // 2^f / c3, the cubic
+      "fadd.s %[nx], %[s1], x29;"
+      "fadd.s %[back], %[s2], x29;"
+      "fmul.s %[dm], %[dm], %[s0];"
+      "fmul.s %[nx], %[nx], %[s1];"
+      "fmul.s %[back], %[back], %[s2];"
+      "fadd.s %[dm], %[dm], x28;"
+      "fadd.s %[nx], %[nx], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[dm], %[dm], %[s0];"
+      "fmul.s %[nx], %[nx], %[s1];"
+      "fmul.s %[back], %[back], %[s2];"
+      "fadd.s %[dm], %[dm], x7;"
+      "fadd.s %[nx], %[nx], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[p], %[p], 23;" // n, into the exponent field
       "slli %[ks], %[ks], 23;"
       "slli %[kl], %[kl], 23;"
-      "add %[s0], %[dm], %[p];" // exp(x - max) = 2^f 2^n
+      "add %[s0], %[dm], %[p];" // exp(x - max) / c3 = 2^n (2^f / c3)
       "add %[s1], %[nx], %[ks];"
       "add %[s2], %[back], %[kl];"
-      "fmsub.s %[s3], %[s3], x5, x16;" // row 1
-      "fmsub.s %[s4], %[s4], x5, x16;"
-      "fmsub.s %[s5], %[s5], x5, x16;"
+      "mv %[dm], x16;" // row 1
+      "mv %[nx], x16;"
+      "mv %[back], x16;"
+      "fmsub.s %[dm], %[s3], x5, %[dm];"
+      "fmsub.s %[nx], %[s4], x5, %[nx];"
+      "fmsub.s %[back], %[s5], x5, %[back];"
       "fmax.s x16, %[s9], %[s10];" // max, row 3
-      "fmax.s %[s3], %[s3], x6;"
-      "fmax.s %[s4], %[s4], x6;"
-      "fmax.s %[s5], %[s5], x6;"
+      "fmax.s %[s3], %[dm], x6;"
+      "fmax.s %[s4], %[nx], x6;"
+      "fmax.s %[s5], %[back], x6;"
       "fmax.s x16, x16, %[s11];"
       "fcvt.w.s %[p], %[s3], rne;"
       "fcvt.w.s %[ks], %[s4], rne;"
@@ -446,27 +501,36 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       "fsub.s %[s3], %[s3], %[dm];"
       "fsub.s %[s4], %[s4], %[nx];"
       "fsub.s %[s5], %[s5], %[back];"
-      "fmadd.s %[dm], %[s3], x30, x29;"
-      "fmadd.s %[nx], %[s4], x30, x29;"
-      "fmadd.s %[back], %[s5], x30, x29;"
-      "fmadd.s %[dm], %[dm], %[s3], x28;"
-      "fmadd.s %[nx], %[nx], %[s4], x28;"
-      "fmadd.s %[back], %[back], %[s5], x28;"
-      "fmadd.s %[dm], %[dm], %[s3], x7;"
-      "fmadd.s %[nx], %[nx], %[s4], x7;"
-      "fmadd.s %[back], %[back], %[s5], x7;"
+      "fadd.s %[dm], %[s3], x29;"
+      "fadd.s %[nx], %[s4], x29;"
+      "fadd.s %[back], %[s5], x29;"
+      "fmul.s %[dm], %[dm], %[s3];"
+      "fmul.s %[nx], %[nx], %[s4];"
+      "fmul.s %[back], %[back], %[s5];"
+      "fadd.s %[dm], %[dm], x28;"
+      "fadd.s %[nx], %[nx], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[dm], %[dm], %[s3];"
+      "fmul.s %[nx], %[nx], %[s4];"
+      "fmul.s %[back], %[back], %[s5];"
+      "fadd.s %[dm], %[dm], x7;"
+      "fadd.s %[nx], %[nx], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[p], %[p], 23;"
       "slli %[ks], %[ks], 23;"
       "slli %[kl], %[kl], 23;"
       "add %[s3], %[dm], %[p];"
       "add %[s4], %[nx], %[ks];"
       "add %[s5], %[back], %[kl];"
-      "fmsub.s %[s6], %[s6], x5, x31;" // row 2
-      "fmsub.s %[s7], %[s7], x5, x31;"
-      "fmsub.s %[s8], %[s8], x5, x31;"
-      "fmax.s %[s6], %[s6], x6;"
-      "fmax.s %[s7], %[s7], x6;"
-      "fmax.s %[s8], %[s8], x6;"
+      "mv %[dm], x31;" // row 2
+      "mv %[nx], x31;"
+      "mv %[back], x31;"
+      "fmsub.s %[dm], %[s6], x5, %[dm];"
+      "fmsub.s %[nx], %[s7], x5, %[nx];"
+      "fmsub.s %[back], %[s8], x5, %[back];"
+      "fmax.s %[s6], %[dm], x6;"
+      "fmax.s %[s7], %[nx], x6;"
+      "fmax.s %[s8], %[back], x6;"
       "fcvt.w.s %[p], %[s6], rne;"
       "fcvt.w.s %[ks], %[s7], rne;"
       "fcvt.w.s %[kl], %[s8], rne;"
@@ -476,27 +540,36 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       "fsub.s %[s6], %[s6], %[dm];"
       "fsub.s %[s7], %[s7], %[nx];"
       "fsub.s %[s8], %[s8], %[back];"
-      "fmadd.s %[dm], %[s6], x30, x29;"
-      "fmadd.s %[nx], %[s7], x30, x29;"
-      "fmadd.s %[back], %[s8], x30, x29;"
-      "fmadd.s %[dm], %[dm], %[s6], x28;"
-      "fmadd.s %[nx], %[nx], %[s7], x28;"
-      "fmadd.s %[back], %[back], %[s8], x28;"
-      "fmadd.s %[dm], %[dm], %[s6], x7;"
-      "fmadd.s %[nx], %[nx], %[s7], x7;"
-      "fmadd.s %[back], %[back], %[s8], x7;"
+      "fadd.s %[dm], %[s6], x29;"
+      "fadd.s %[nx], %[s7], x29;"
+      "fadd.s %[back], %[s8], x29;"
+      "fmul.s %[dm], %[dm], %[s6];"
+      "fmul.s %[nx], %[nx], %[s7];"
+      "fmul.s %[back], %[back], %[s8];"
+      "fadd.s %[dm], %[dm], x28;"
+      "fadd.s %[nx], %[nx], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[dm], %[dm], %[s6];"
+      "fmul.s %[nx], %[nx], %[s7];"
+      "fmul.s %[back], %[back], %[s8];"
+      "fadd.s %[dm], %[dm], x7;"
+      "fadd.s %[nx], %[nx], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[p], %[p], 23;"
       "slli %[ks], %[ks], 23;"
       "slli %[kl], %[kl], 23;"
       "add %[s6], %[dm], %[p];"
       "add %[s7], %[nx], %[ks];"
       "add %[s8], %[back], %[kl];"
-      "fmsub.s %[s9], %[s9], x5, x16;" // row 3
-      "fmsub.s %[s10], %[s10], x5, x16;"
-      "fmsub.s %[s11], %[s11], x5, x16;"
-      "fmax.s %[s9], %[s9], x6;"
-      "fmax.s %[s10], %[s10], x6;"
-      "fmax.s %[s11], %[s11], x6;"
+      "mv %[dm], x16;" // row 3
+      "mv %[nx], x16;"
+      "mv %[back], x16;"
+      "fmsub.s %[dm], %[s9], x5, %[dm];"
+      "fmsub.s %[nx], %[s10], x5, %[nx];"
+      "fmsub.s %[back], %[s11], x5, %[back];"
+      "fmax.s %[s9], %[dm], x6;"
+      "fmax.s %[s10], %[nx], x6;"
+      "fmax.s %[s11], %[back], x6;"
       "fcvt.w.s %[p], %[s9], rne;"
       "fcvt.w.s %[ks], %[s10], rne;"
       "fcvt.w.s %[kl], %[s11], rne;"
@@ -506,15 +579,21 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       "fsub.s %[s9], %[s9], %[dm];"
       "fsub.s %[s10], %[s10], %[nx];"
       "fsub.s %[s11], %[s11], %[back];"
-      "fmadd.s %[dm], %[s9], x30, x29;"
-      "fmadd.s %[nx], %[s10], x30, x29;"
-      "fmadd.s %[back], %[s11], x30, x29;"
-      "fmadd.s %[dm], %[dm], %[s9], x28;"
-      "fmadd.s %[nx], %[nx], %[s10], x28;"
-      "fmadd.s %[back], %[back], %[s11], x28;"
-      "fmadd.s %[dm], %[dm], %[s9], x7;"
-      "fmadd.s %[nx], %[nx], %[s10], x7;"
-      "fmadd.s %[back], %[back], %[s11], x7;"
+      "fadd.s %[dm], %[s9], x29;"
+      "fadd.s %[nx], %[s10], x29;"
+      "fadd.s %[back], %[s11], x29;"
+      "fmul.s %[dm], %[dm], %[s9];"
+      "fmul.s %[nx], %[nx], %[s10];"
+      "fmul.s %[back], %[back], %[s11];"
+      "fadd.s %[dm], %[dm], x28;"
+      "fadd.s %[nx], %[nx], x28;"
+      "fadd.s %[back], %[back], x28;"
+      "fmul.s %[dm], %[dm], %[s9];"
+      "fmul.s %[nx], %[nx], %[s10];"
+      "fmul.s %[back], %[back], %[s11];"
+      "fadd.s %[dm], %[dm], x7;"
+      "fadd.s %[nx], %[nx], x7;"
+      "fadd.s %[back], %[back], x7;"
       "slli %[p], %[p], 23;"
       "slli %[ks], %[ks], 23;"
       "slli %[kl], %[kl], 23;"
@@ -572,8 +651,7 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
         [p] "+&r"(p), [ks] "+&r"(ks), [kl] "+&r"(kl), [dm] "+&r"(dm),
         [nx] "+&r"(nx), [back] "+&r"(back)
       : [end] "r"(end), [log2e] "i"(LHSM_LOG2E), [tmin] "i"(LHSM_TMIN),
-        [c0] "i"(LHSM_C0), [c1] "i"(LHSM_C1), [c2] "i"(LHSM_C2),
-        [c3] "i"(LHSM_C3)
+        [ca] "i"(LHSM_A), [cb] "i"(LHSM_B), [cc] "i"(LHSM_C)
       : "x5", "x6", "x7", "x16", "x28", "x29", "x30", "x31", "memory");
   // rows skip to 3, as fp16, 3 a row
   if (skip == 0) {
