@@ -43,6 +43,15 @@ typedef struct {
 
 #define LHSM_DEAD (-1.0e30f)
 
+// fp16 to fp32 in one instruction: MemPool's LLVM turns the C cast into a
+// library call
+static inline float lhsm_f32(const __fp16 *h) {
+  const uint32_t b = *(const uint16_t *)h;
+  float f;
+  asm volatile("fcvt.s.h %[f], %[b];" : [f] "=r"(f) : [b] "r"(b));
+  return f;
+}
+
 
 
 // one hub query
@@ -545,6 +554,18 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       "fmul.s %[s9], %[s9], x30;"
       "fmul.s %[s10], %[s10], x30;"
       "fmul.s %[s11], %[s11], x30;"
+      "fcvt.h.s %[s0], %[s0];" // fp16, in the low half
+      "fcvt.h.s %[s1], %[s1];"
+      "fcvt.h.s %[s2], %[s2];"
+      "fcvt.h.s %[s3], %[s3];"
+      "fcvt.h.s %[s4], %[s4];"
+      "fcvt.h.s %[s5], %[s5];"
+      "fcvt.h.s %[s6], %[s6];"
+      "fcvt.h.s %[s7], %[s7];"
+      "fcvt.h.s %[s8], %[s8];"
+      "fcvt.h.s %[s9], %[s9];"
+      "fcvt.h.s %[s10], %[s10];"
+      "fcvt.h.s %[s11], %[s11];"
       : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
         [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
         [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
@@ -556,26 +577,26 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       : "x5", "x6", "x7", "x16", "x28", "x29", "x30", "x31", "memory");
   // rows skip to 3, as fp16, 3 a row
   if (skip == 0) {
-    o[0] = (__fp16)s0;
-    o[1] = (__fp16)s1;
-    o[2] = (__fp16)s2;
+    o[0] = *(__fp16 *)&s0;
+    o[1] = *(__fp16 *)&s1;
+    o[2] = *(__fp16 *)&s2;
     o += 3;
   }
   if (skip <= 1) {
-    o[0] = (__fp16)s3;
-    o[1] = (__fp16)s4;
-    o[2] = (__fp16)s5;
+    o[0] = *(__fp16 *)&s3;
+    o[1] = *(__fp16 *)&s4;
+    o[2] = *(__fp16 *)&s5;
     o += 3;
   }
   if (skip <= 2) {
-    o[0] = (__fp16)s6;
-    o[1] = (__fp16)s7;
-    o[2] = (__fp16)s8;
+    o[0] = *(__fp16 *)&s6;
+    o[1] = *(__fp16 *)&s7;
+    o[2] = *(__fp16 *)&s8;
     o += 3;
   }
-  o[0] = (__fp16)s9;
-  o[1] = (__fp16)s10;
-  o[2] = (__fp16)s11;
+  o[0] = *(__fp16 *)&s9;
+  o[1] = *(__fp16 *)&s10;
+  o[2] = *(__fp16 *)&s11;
 }
 
 
@@ -622,7 +643,7 @@ static inline void lhsm_span_batch(const lhsm_args_t *a, uint32_t b,
   // batch's own rows, i0 - r0 to 3, to o
   lhsm_span_weights(row + qo, (int32_t)(2 * a->d_model),
                     (int32_t)(2 * a->span_step), srow + ko, lrow + ko, d,
-                    (float)g[0], (float)g[1], (float)g[2], i0 - r0, o);
+                    lhsm_f32(g), lhsm_f32(g + 1), lhsm_f32(g + 2), i0 - r0, o);
 }
 
 static inline void lhsm_hub_row(const lhsm_args_t *a, uint32_t r,
@@ -654,15 +675,15 @@ static inline void lhsm_hub_row(const lhsm_args_t *a, uint32_t r,
   // G[h][1 + eta]: the 3 biases of this hub query
   const __fp16 *g = a->bias + (h * (1 + n_hub) + 1 + eta) * 3;
   // the bias of the span keys
-  float g_span = (float)g[0];
+  float g_span = lhsm_f32(g);
   // in the short last window, plus delta[h], stored after all of G
   if (n_live < win) {
-    g_span += (float)a->bias[n_heads * (1 + n_hub) * 3 + h];
+    g_span += lhsm_f32(a->bias + n_heads * (1 + n_hub) * 3 + h);
   }
 
   lhsm_hub_weights((eta ? lrow : srow) + qo, span0 + ko,
                    (int32_t)(2 * a->span_step), srow + ko, lrow + ko, d, n_live,
-                   g_span, (float)g[1], (float)g[2],
+                   g_span, lhsm_f32(g + 1), lhsm_f32(g + 2),
                    (uint16_t *)(a->a_hub + r * (win + 2)));
 }
 
