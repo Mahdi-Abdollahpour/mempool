@@ -634,7 +634,7 @@
   },
 
   // CELERE-Spectral's local pass
-  "local_hub_softmax_f16": {
+  "celere_lhsm_f16": {
     "type": "float16",
     "defines": [
       ("lhsm_LINES", 2)

@@ -12,7 +12,7 @@
 #include "runtime.h"
 #include "synchronization.h"
 
-#include "data_local_hub_softmax_f16.h"
+#include "data_celere_lhsm_f16.h"
 
 #include "baremetal/mempool_checks.h"
 #include "baremetal/mempool_celere_lhsm_f16.h" // lhsm_args_t and the kernel

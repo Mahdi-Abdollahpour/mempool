@@ -748,9 +748,9 @@ def generate_ftranspose(my_type=np.float32, defines={}):
     return [A, B], defines
 
 
-# CELERE-Spectral's local pass: local_hub_softmax_f16.
-def generate_flocal_hub_softmax(my_type=np.float16, defines={}):
-    """Inputs and golden of local_hub_softmax_f16, two calls as the
+# CELERE-Spectral's local pass: celere_lhsm_f16.
+def generate_fcelere_lhsm(my_type=np.float16, defines={}):
+    """Inputs and golden of celere_lhsm_f16, two calls as the
     celere_spectral app makes them on one lane:
 
       call 1, attention stage 1: two hub queries (S and L), and every local
