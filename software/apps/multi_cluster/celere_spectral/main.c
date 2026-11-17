@@ -5,11 +5,11 @@
 
 /* CELERE-Spectral channel estimator on multi-cluster TensorPool:
  *
- *   stage 1  front end                 2 lanes of 8 lines
- *   stage 2  attention stage 1          8 lanes of 2 lines
- *   stage 3  attention stage 2          8 lanes of 2 lines
- *   stage 4  FFN and patch decoder      8 lanes of 2 lines
- *   stage 5  Doppler head               4 lanes of 16 elements
+ *   stage 1  front end                 CE_S1_LANES lanes
+ *   stage 2  attention stage 1          CE_ENC_LANES lanes
+ *   stage 3  attention stage 2          CE_ENC_LANES lanes
+ *   stage 4  FFN and patch decoder      CE_S4_LANES lanes
+ *   stage 5  Doppler head               CE_S5_LANES lanes
  */
 
 #include "flex_runtime.h"
@@ -32,10 +32,10 @@
  *     make celere_spectral APP_DEFINES="-DCE_N_ITER=6 -DCE_BENCH=1"
  *
  * Units: element counts and offsets are fp16 elements; names ending in _B are
- * bytes; names ending in _M are GEMM rows, padded to a multiple of the 16 RedMulE
+ * bytes; names ending in _M are GEMM rows, padded to a multiple of the RedMulE
  * engines. "Per lane" means one cluster's share of a stage. Row ids (F.4, 1.8a,
- * H.4, ...) are the rows of the operation table (in docs).
- * Numbers in comments are the values for the default knobs. */
+ * H.4, ...) are the rows of the OP table (in docs).
+ */
 
 /* ==== knobs: each one a define with a default, which the build line can override */
 
@@ -52,7 +52,7 @@
 #ifndef CE_PILOT_SYMS
 #define CE_PILOT_SYMS   2u     // DMRS symbols in the input
 #endif
-/* the array: dual-polarized 4 x 8 UPA, 64 receive elements */
+/* the array: a dual-polarized UPA */
 #ifndef CE_N_POL
 #define CE_N_POL        2u     // polarizations
 #endif
@@ -91,8 +91,8 @@
 
 /* mapping: clusters per stage
  * Stage 1: front end | 2: attention stage 1 | 3: attention stage 2 | 4: FFN + decoder |
- * 5: Doppler head. Stages 1 to 4 split the 16 lattice lines, stage 5 the 64
- * elements; each lane count divides 16. */
+ * 5: Doppler head. Stages 1 to 4 split the lattice lines (CE_NL), stage 5 the
+ * elements (CE_N_EL); each lane count divides CE_NL. */
 #ifndef CE_S1_LANES
 #define CE_S1_LANES     2u     // front end
 #endif
@@ -106,7 +106,7 @@
 #define CE_S5_LANES     4u     // Doppler head
 #endif
 #ifndef CE_S5_TILES
-#define CE_S5_TILES     4u     // tiles of the head's output layer (H.4)
+#define CE_S5_TILES     4u     // tiles of the head's output layer (OP table H.4)
 #endif
 #ifndef CE_S5_DBUF
 #define CE_S5_DBUF      1      // 1: two output buffers, a drain runs under the next tile's GEMM;
@@ -135,8 +135,8 @@
 #endif
 
 /* stand-ins: rows without a kernel are timed waits (for the moment being). The wait
- * assumes the cores reach 280 FLOP per cycle (1 TFLOP/s at a PE utilization of 0.28,
- * at 1 GHz). */
+ * assumes the cores reach CE_PE_FLOP_PER_CYCLE FLOP per cycle (the peak FLOP rate times a PE
+ * utilization, over the clock). */
 #ifndef CE_PE_FLOP_PER_CYCLE
 #define CE_PE_FLOP_PER_CYCLE 280u
 #endif
@@ -148,8 +148,8 @@
 #define CE_LHSM_FLOP_PER_LOGIT 10u   // stand-in only: bias, max, exp, sum, divide
 #endif
 
-/* LPDDR nodes on each side, as hbm_chan_placement = [0,4,0,4] (west, north, east,
- * south) in the arch config */
+/* LPDDR nodes on each side, as hbm_chan_placement (west, north, east, south) in
+ * the arch config */
 #ifndef CE_LPDDR_SOUTH
 #define CE_LPDDR_SOUTH  4u     // model input, summary patches
 #endif
@@ -162,80 +162,80 @@
 #define CE_RUP(a, b)      (CE_CDIV(a, b) * (b))      // a rounded up to a multiple of b
 #define CE_MAX(a, b)      ((a) > (b) ? (a) : (b))
 #define CE_MAX3(a, b, c)  CE_MAX(CE_MAX(a, b), c)
-#define CE_LINE           32u   // one 64 B DMA line, in fp16 elements
+#define CE_LINE           32u   // one DMA line, in fp16 elements
 #define CE_BYTES          2u    // fp16
-#define CE_BANK_ROW       (NUM_BANKS * 4u / CE_BYTES)   // 4,096: one word in every bank, 8 KiB, group 0's banks first; X_BUF and W_BUF start on one
-#define CE_GRP_COPY       (CE_BANK_ROW / NUM_GROUPS)    // 1,024: from one group's banks to the next, 2 KiB
+#define CE_BANK_ROW       (NUM_BANKS * 4u / CE_BYTES)   // one word in every bank, group 0's banks first; X_BUF and W_BUF start on one
+#define CE_GRP_COPY       (CE_BANK_ROW / NUM_GROUPS)    // from one group's banks to the next
 
 /* ==== the network: what the knobs imply ==================================== */
 
 /* frequency: spans and windows of one line */
-#define CE_F            (CE_N_PRB * CE_SC_PER_PRB)                // 3276 subcarriers
-#define CE_SPAN_SC      (CE_SPAN_PRBS * CE_SC_PER_PRB)            // 24 subcarriers a span
-#define CE_N_SPAN       CE_CDIV(CE_F, CE_SPAN_SC)                 // 137 spans
-#define CE_FP           (CE_N_SPAN * CE_SPAN_SC)                  // 3288 subcarriers, padded to whole spans
-#define CE_N_WIN        CE_CDIV(CE_N_SPAN, CE_WIN_SPANS)          // 12 windows
-#define CE_LAST         (CE_N_SPAN - (CE_N_WIN - 1u) * CE_WIN_SPANS)   // 5 spans in the last
-#define CE_CROP         (CE_SPAN_PRBS * CE_N_SPAN - CE_N_PRB)     // 1 PRB cropped at the end: how many padding PRBs the last span has.
-#define CE_NRS          (CE_N_SPAN + CE_N_WIN)                    // 149 rows a line: spans, summaries
-#define CE_LG           (CE_N_SPAN + CE_N_WIN)                    // 149 keys of the global pass: spans, global probes
-#define CE_LW           (CE_WIN_SPANS + 2u)                       // 14 slots of a local window
-#define CE_LG_PAD       CE_RUP(CE_LG, 4u)                         // 152: CE_LG padded to a multiple of 4 (softmax)
+#define CE_F            (CE_N_PRB * CE_SC_PER_PRB)                // subcarriers
+#define CE_SPAN_SC      (CE_SPAN_PRBS * CE_SC_PER_PRB)            // subcarriers a span
+#define CE_N_SPAN       CE_CDIV(CE_F, CE_SPAN_SC)                 // spans
+#define CE_FP           (CE_N_SPAN * CE_SPAN_SC)                  // subcarriers, padded to whole spans
+#define CE_N_WIN        CE_CDIV(CE_N_SPAN, CE_WIN_SPANS)          // windows
+#define CE_LAST         (CE_N_SPAN - (CE_N_WIN - 1u) * CE_WIN_SPANS)   // spans in the last window
+#define CE_CROP         (CE_SPAN_PRBS * CE_N_SPAN - CE_N_PRB)     // padding PRBs of the last span, cropped at the end
+#define CE_NRS          (CE_N_SPAN + CE_N_WIN)                    // rows a line: spans, summaries
+#define CE_LG           (CE_N_SPAN + CE_N_WIN)                    // keys of the global pass: spans, global probes
+#define CE_LW           (CE_WIN_SPANS + 2u)                       // slots of a local window
+#define CE_LG_PAD       CE_RUP(CE_LG, 4u)                         // CE_LG padded to a multiple of 4 (softmax)
 
 /* space: elements, tiles, lines */
-#define CE_N_EL         (CE_N_POL * CE_UPA_V * CE_UPA_H)          // 64 elements
-#define CE_T_V          (CE_UPA_V / CE_TILE_V)                    // 2 tile rows
-#define CE_T_H          (CE_UPA_H / CE_TILE_H)                    // 4 tile columns
-#define CE_TILE_EL      (CE_TILE_V * CE_TILE_H)                   // 4 elements a tile
-#define CE_NL           (CE_N_EL / CE_TILE_EL)                    // 16 lattice lines
+#define CE_N_EL         (CE_N_POL * CE_UPA_V * CE_UPA_H)          // elements
+#define CE_T_V          (CE_UPA_V / CE_TILE_V)                    // tile rows
+#define CE_T_H          (CE_UPA_H / CE_TILE_H)                    // tile columns
+#define CE_TILE_EL      (CE_TILE_V * CE_TILE_H)                   // elements a tile
+#define CE_NL           (CE_N_EL / CE_TILE_EL)                    // lattice lines
 /* Element order of the input: a = (p, t_h, e_h, t_v, e_v). The head input and the
- * estimate go tile by tile instead, a = (p, t_h, t_v, e_h, e_v) (D.9), so any group
+ * estimate go tile by tile instead, a = (p, t_h, t_v, e_h, e_v) (OP table D.9), so any group
  * of lines is one contiguous block of elements. The step of each index of the input,
  * in elements: */
 #define CE_ST_EV        1u                                        // e_v
-#define CE_ST_TV        CE_TILE_V                                 // 2: t_v
-#define CE_ST_EH        CE_UPA_V                                  // 4: e_h
-#define CE_ST_TH        (CE_UPA_V * CE_TILE_H)                    // 8: t_h
-/* A lattice line is one tile (p, t_h, t_v) and holds its 4 elements (e_h, e_v). */
+#define CE_ST_TV        CE_TILE_V                                 // t_v
+#define CE_ST_EH        CE_UPA_V                                  // e_h
+#define CE_ST_TH        (CE_UPA_V * CE_TILE_H)                    // t_h
+/* A lattice line is one tile (p, t_h, t_v) and holds its elements (e_h, e_v). */
 
 /* widths */
-#define CE_RE           (CE_PILOT_SYMS * 2u)                      // 4 values a subcarrier: 2 pilot symbols x (re, im)
-#define CE_RUN          (CE_SC_PER_PRB * CE_RE)                   // 48 values: one PRB of one element (C_up)
-#define CE_C            (CE_SPAN_PRBS * CE_TILE_EL * CE_RUN)      // // 384 values a patch: 2 PRBs x 4 elements x 48; a multiple of CE_LINE, so offsets counted in patch rows sit on DMA lines
+#define CE_RE           (CE_PILOT_SYMS * 2u)                      // values a subcarrier: pilot symbols x (re, im)
+#define CE_RUN          (CE_SC_PER_PRB * CE_RE)                   // values: one PRB of one element (C_up)
+#define CE_C            (CE_SPAN_PRBS * CE_TILE_EL * CE_RUN)      // values a patch: span PRBs x tile elements x CE_RUN; a multiple of CE_LINE, so offsets counted in patch rows sit on DMA lines
 _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines"); // so every offset counted in patch rows (S1_WIN, S4_WIN) is on a DMA line
-#define CE_PER_EL       (CE_FP * CE_RE)                           // 13,152 values: the input of one element
-#define CE_D_HEAD       (CE_D_MODEL / CE_HEADS)                   // 128: width of a head
-#define CE_D_QKV        (3u * CE_D_MODEL)                         // 768: q|k|v of a row
-#define CE_C_OUT        (CE_SC_PER_PRB * CE_N_SYM * 2u)           // 336 values: the estimate of a PRB, 12 x 14 x (re, im)
-#define CE_NSUM_HR      (CE_SPAN_PRBS * CE_N_WIN)                 // 24 summary rows of the head an element: 12 windows x 2
+#define CE_PER_EL       (CE_FP * CE_RE)                           // values: the input of one element
+#define CE_D_HEAD       (CE_D_MODEL / CE_HEADS)                   // width of a head
+#define CE_D_QKV        (3u * CE_D_MODEL)                         // q|k|v of a row
+#define CE_C_OUT        (CE_SC_PER_PRB * CE_N_SYM * 2u)           // values: the estimate of a PRB, subcarriers x symbols x (re, im)
+#define CE_NSUM_HR      (CE_SPAN_PRBS * CE_N_WIN)                 // summary rows of the head an element: windows x span PRBs
 
 /* whole tensors that cross a stage or chip boundary, all lanes, in elements */
-#define CE_IN_ALL       (CE_N_EL * CE_PER_EL)                     // 841,728 model input
-#define CE_WIN_ALL      (CE_NL * CE_N_WIN * CE_C)                 // 73,728 summary patches
-#define CE_ZR_ALL       (CE_NL * CE_N_SPAN * CE_D_MODEL)          // 561,152 span tokens
-#define CE_ZS_ALL       (CE_NL * CE_N_WIN * CE_D_MODEL)           // 49,152 summary tokens (or one probe family)
-#define CE_HPRB_ALL     (CE_N_EL * CE_N_PRB * CE_RUN)             // 838,656 head input, PRB rows
-#define CE_HSUM_ALL     (CE_N_EL * CE_NSUM_HR * CE_RUN)           // 73,728 head input, summary rows
-#define CE_OUT_ALL      (CE_N_EL * CE_N_PRB * CE_C_OUT)           // 5,870,592 estimate
+#define CE_IN_ALL       (CE_N_EL * CE_PER_EL)                     // model input
+#define CE_WIN_ALL      (CE_NL * CE_N_WIN * CE_C)                 // summary patches
+#define CE_ZR_ALL       (CE_NL * CE_N_SPAN * CE_D_MODEL)          // span tokens
+#define CE_ZS_ALL       (CE_NL * CE_N_WIN * CE_D_MODEL)           // summary tokens (or one probe family)
+#define CE_HPRB_ALL     (CE_N_EL * CE_N_PRB * CE_RUN)             // head input, PRB rows
+#define CE_HSUM_ALL     (CE_N_EL * CE_NSUM_HR * CE_RUN)           // head input, summary rows
+#define CE_OUT_ALL      (CE_N_EL * CE_N_PRB * CE_C_OUT)           // estimate
 
 /* parameters, in elements (dense: matrix + bias) */
-#define CE_W_EMB        (CE_C * CE_D_MODEL)                       // 98,304 W_e
-#define CE_W_TT         (2u * CE_D_MODEL)                         // 512: the token-type rows b_e + t_R, b_e + t_S
-#define CE_W_LN         (2u * CE_D_MODEL)                         // 512: gamma, beta
-#define CE_W_QKV        (CE_D_MODEL * CE_D_QKV)                   // 196,608: W_qkv, no bias
-#define CE_W_WO         (CE_D_MODEL * CE_D_MODEL + CE_D_MODEL)    // 65,792: W_o, b_o
-#define CE_W_PQKV       (2u * CE_D_QKV)                           // 1,536: q|k|v of the two probe rows (1.cp)
-#define CE_W_PE         (2u * CE_D_MODEL)                         // 512: the probe embeddings e_g, e_l (1.cp)
-#define CE_W_ROPE1      (2u * CE_HEADS * CE_N_SPAN * (CE_D_HEAD / 2u))   // 35,072: cos, sin of the span rows (1.cr)
-#define CE_W_ROPE2      (2u * CE_HEADS * CE_LG * (CE_D_HEAD / 2u))       // 38,144: cos, sin of spans, global probes (2.cr)
-#define CE_W_LB1        (CE_HEADS * 3u * 3u + CE_HEADS)           // 20: local bias G [h][3][3], delta [h] (1.cl)
-#define CE_W_LB2        (CE_HEADS * 2u * 3u + CE_HEADS)           // 14: local bias G [h][2][3], delta [h] (2.cl)
-#define CE_W_FF1        (CE_D_MODEL * CE_FFN + CE_FFN)            // 131,584: W_1, b_1
-#define CE_W_FF2        (CE_FFN * CE_D_MODEL + CE_D_MODEL)        // 131,328: W_2, b_2
-#define CE_W_DEC        (CE_D_MODEL * CE_C + CE_C)                // 98,688: W_dec, b_dec
-#define CE_W_HX         (CE_RUN * CE_C_HID + CE_C_HID)            // 3,136 W_x, b_x
-#define CE_W_HS         (CE_RUN * CE_C_HID)                       // 3,072 W_s
-#define CE_W_HO         (CE_C_HID * CE_C_OUT + CE_C_OUT)          // 21,840 W_h, b_h
+#define CE_W_EMB        (CE_C * CE_D_MODEL)                       // W_e
+#define CE_W_TT         (2u * CE_D_MODEL)                         // the token-type rows b_e + t_R, b_e + t_S
+#define CE_W_LN         (2u * CE_D_MODEL)                         // gamma, beta
+#define CE_W_QKV        (CE_D_MODEL * CE_D_QKV)                   // W_qkv, no bias
+#define CE_W_WO         (CE_D_MODEL * CE_D_MODEL + CE_D_MODEL)    // W_o, b_o
+#define CE_W_PQKV       (2u * CE_D_QKV)                           // q|k|v of the two probe rows (OP table 1.cp)
+#define CE_W_PE         (2u * CE_D_MODEL)                         // the probe embeddings e_g, e_l (OP table 1.cp)
+#define CE_W_ROPE1      (2u * CE_HEADS * CE_N_SPAN * (CE_D_HEAD / 2u))   // cos, sin of the span rows (OP table 1.cr)
+#define CE_W_ROPE2      (2u * CE_HEADS * CE_LG * (CE_D_HEAD / 2u))       // cos, sin of spans, global probes (OP table 2.cr)
+#define CE_W_LB1        (CE_HEADS * 3u * 3u + CE_HEADS)           // local bias G [h][1 + A1_NHUB][3], delta [h] (OP table 1.cl)
+#define CE_W_LB2        (CE_HEADS * 2u * 3u + CE_HEADS)           // local bias G [h][1 + A2_NHUB][3], delta [h] (OP table 2.cl)
+#define CE_W_FF1        (CE_D_MODEL * CE_FFN + CE_FFN)            // W_1, b_1
+#define CE_W_FF2        (CE_FFN * CE_D_MODEL + CE_D_MODEL)        // W_2, b_2
+#define CE_W_DEC        (CE_D_MODEL * CE_C + CE_C)                // W_dec, b_dec
+#define CE_W_HX         (CE_RUN * CE_C_HID + CE_C_HID)            // W_x, b_x
+#define CE_W_HS         (CE_RUN * CE_C_HID)                       // W_s
+#define CE_W_HO         (CE_C_HID * CE_C_OUT + CE_C_OUT)          // W_h, b_h
 
 /* ==== stage maps: each stage's share, its X_BUF map and its W_BUF map ======
  *
@@ -244,8 +244,8 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines"); // 
  *     X_ELEMS further), then the stage's regions in row order. Every
  *     row writes a region of its own, so a row reads exactly what the row before
  *     it wrote, and nothing is overwritten while it is still needed.
- *   - every region is a whole number of 64 B DMA lines: CE_RUP(n, CE_LINE);
- *   - a GEMM's M is a multiple of the 16 RedMulE engines (the _M names), and its
+ *   - every region is a whole number of DMA lines: CE_RUP(n, CE_LINE);
+ *   - a GEMM's M is a multiple of the RedMulE engines (the _M names), and its
  *     regions are sized with the padded M;
  *   - W_BUF holds every row's parameters, one region each, resident.
  *
@@ -255,192 +255,192 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines"); // 
  * copies (one per family). */
 
 /* == stage 1: front end (block F) == */
-#define S1_LINES        (CE_NL / CE_S1_LANES)                     // 8 lines a lane
-#define S1_IN_N         (CE_IN_ALL / CE_S1_LANES)                 // 420,864: the input of the lane's 32 elements
-#define S1_XR_ROWS      (S1_LINES * CE_N_SPAN)                    // 1,096 span patches
-#define S1_XS_ROWS      (S1_LINES * CE_N_WIN)                     // 96 summary patches
-#define S1_TOK          (S1_XR_ROWS + S1_XS_ROWS)                 // 1,192 tokens: span and summary patches
-#define S1_TOK_M        CE_RUP(S1_TOK, NUM_REDMULE_TILES)         // 1,200: GEMM rows of the embedding (F.4)
-#define S1_WIN_N        (S1_XS_ROWS * CE_C)                       // 36,864: elements of the summary patches
-#define S1_TT_N         (S1_TOK * CE_D_MODEL)                     // 305,152: elements of all tokens (F.5)
+#define S1_LINES        (CE_NL / CE_S1_LANES)                     // lines a lane
+#define S1_IN_N         (CE_IN_ALL / CE_S1_LANES)                 // the input of the lane's elements
+#define S1_XR_ROWS      (S1_LINES * CE_N_SPAN)                    // span patches
+#define S1_XS_ROWS      (S1_LINES * CE_N_WIN)                     // summary patches
+#define S1_TOK          (S1_XR_ROWS + S1_XS_ROWS)                 // tokens: span and summary patches
+#define S1_TOK_M        CE_RUP(S1_TOK, NUM_REDMULE_TILES)         // GEMM rows of the embedding (OP table F.4)
+#define S1_WIN_N        (S1_XS_ROWS * CE_C)                       // elements of the summary patches
+#define S1_TT_N         (S1_TOK * CE_D_MODEL)                     // elements of all tokens (OP table F.5)
 /* X_BUF: [ IN | X: span patches, summary patches | Z: span tokens, summary tokens ]
  * Each name is the start of a region, in fp16 elements into X_BUF. */
-#define S1_IN           0u                                        // start of the model input of this lane (F.1)
-#define S1_X            (S1_IN + CE_RUP(S1_IN_N, CE_LINE))        // start of the patch matrix [span | summary] (F.2, F.3)
-#define S1_WIN          (S1_X + S1_XR_ROWS * CE_C)                // start of the summary patches, right after the span patches (F.3)
-#define S1_Z            (S1_X + CE_RUP(S1_TOK_M * CE_C, CE_LINE)) // start of the tokens [span | summary] (F.4, F.5)
+#define S1_IN           0u                                        // start of the model input of this lane (OP table F.1)
+#define S1_X            (S1_IN + CE_RUP(S1_IN_N, CE_LINE))        // start of the patch matrix [span | summary] (OP table F.2, F.3)
+#define S1_WIN          (S1_X + S1_XR_ROWS * CE_C)                // start of the summary patches, right after the span patches (OP table F.3)
+#define S1_Z            (S1_X + CE_RUP(S1_TOK_M * CE_C, CE_LINE)) // start of the tokens [span | summary] (OP table F.4, F.5)
 #define S1_ZS           (S1_Z + S1_XR_ROWS * CE_D_MODEL)          // start of the summary tokens, right after the span tokens
 #define S1_END          (S1_Z + CE_RUP(S1_TOK_M * CE_D_MODEL, CE_LINE))   // end of the stage 1 map
 /* W_BUF: each name is the start of a parameter region, in fp16 elements into W_BUF */
-#define S1_W_EMB        0u                                        // start of the embedding matrix W_e (F.4)
-#define S1_W_TT         (S1_W_EMB + CE_RUP(CE_W_EMB, CE_LINE))    // start of the two token-type rows (F.5)
+#define S1_W_EMB        0u                                        // start of the embedding matrix W_e (OP table F.4)
+#define S1_W_TT         (S1_W_EMB + CE_RUP(CE_W_EMB, CE_LINE))    // start of the two token-type rows (OP table F.5)
 #define S1_W_END        (S1_W_TT + CE_RUP(CE_W_TT, CE_LINE))      // end of the stage 1 weights
 
 /* == stages 2 and 3: attention stages 1 and 2 == */
-#define E_LINES         (CE_NL / CE_ENC_LANES)                    // 2 lines a lane
-#define E_PAIRS         (E_LINES * CE_HEADS)                      // 4 (line, head) pairs
-#define E_TE_PAIR       (NUM_REDMULE_TILES / E_PAIRS)             // 4 TEs a pair in the global pass
-#define E_R_ROWS        (E_LINES * CE_N_SPAN)                     // 274 span rows
-#define E_S_ROWS        (E_LINES * CE_N_WIN)                      // 24 rows of one family: S, Lg or Ll
-#define E_RS_ROWS       (E_R_ROWS + E_S_ROWS)                     // 298: span and summary rows
-#define E_ALL_ROWS      (E_RS_ROWS + 2u * E_S_ROWS)               // 346: all rows, probes too
+#define E_LINES         (CE_NL / CE_ENC_LANES)                    // lines a lane
+#define E_PAIRS         (E_LINES * CE_HEADS)                      // (line, head) pairs
+#define E_TE_PAIR       (NUM_REDMULE_TILES / E_PAIRS)             // TEs a pair in the global pass
+#define E_R_ROWS        (E_LINES * CE_N_SPAN)                     // span rows
+#define E_S_ROWS        (E_LINES * CE_N_WIN)                      // rows of one family: S, Lg or Ll
+#define E_RS_ROWS       (E_R_ROWS + E_S_ROWS)                     // span and summary rows
+#define E_ALL_ROWS      (E_RS_ROWS + 2u * E_S_ROWS)               // all rows, probes too
 /* where each row family of a lane starts, in rows; the lattice Z and the q|k|v
  * matrix QKV share this row order */
-#define E_ROW_S         E_R_ROWS                                  // 274: first summary row, after the 2 x 137 span rows
-#define E_ROW_LG        E_RS_ROWS                                 // 298: first global-probe row, after the 24 summaries
-#define E_ROW_LL        (E_RS_ROWS + E_S_ROWS)                    // 322: first local-probe row, after the 24 global probes
-#define E_RS_N          (E_RS_ROWS * CE_D_MODEL)                  // 76,288: elements of the span and summary rows, what arrives in stage 2 and leaves stage 3 (2.13)
-#define E_ALL_N         (E_ALL_ROWS * CE_D_MODEL)                 // 88,576: elements of the whole lattice of a lane, probes included (1.13)
-#define E_KP            CE_LG_PAD                                 // 152 keys of a pair in the global pass: 137 spans, 12 global probes, 3 pads with bias -inf (1.8a to 1.10a)
-#define E_ASPAN_N       (E_PAIRS * CE_N_SPAN * 3u)                // 1,644 local weights of the span queries: 4 pairs x 137 spans x 3 keys (itself, S_w, L_w) (1.4, 1.11)
-/* query rows of a pair in the global pass, padded to a multiple of its 4 TEs */
-#define A1_QR           CE_RUP(CE_LG, E_TE_PAIR)                  // 152: 137 spans and 12 global probes, 38 rows a TE (1.8a)
-#define A2_QR           CE_RUP(CE_N_SPAN, E_TE_PAIR)              // 140: 137 spans, 35 rows a TE; the global-probe queries are dead (2.8a)
+#define E_ROW_S         E_R_ROWS                                  // first summary row, after the span rows
+#define E_ROW_LG        E_RS_ROWS                                 // first global-probe row, after the summaries
+#define E_ROW_LL        (E_RS_ROWS + E_S_ROWS)                    // first local-probe row, after the global probes
+#define E_RS_N          (E_RS_ROWS * CE_D_MODEL)                  // elements of the span and summary rows, what arrives in stage 2 and leaves stage 3 (OP table 2.13)
+#define E_ALL_N         (E_ALL_ROWS * CE_D_MODEL)                 // elements of the whole lattice of a lane, probes included (OP table 1.13)
+#define E_KP            CE_LG_PAD                                 // keys of a pair in the global pass: spans, global probes, pads with bias -inf (OP table 1.8a to 1.10a)
+#define E_ASPAN_N       (E_PAIRS * CE_N_SPAN * 3u)                // local weights of the span queries: pairs x spans x 3 keys (itself, S_w, L_w) (OP table 1.4, 1.11)
+/* query rows of a pair in the global pass, padded to a multiple of its TEs */
+#define A1_QR           CE_RUP(CE_LG, E_TE_PAIR)                  // spans and global probes (OP table 1.8a)
+#define A2_QR           CE_RUP(CE_N_SPAN, E_TE_PAIR)              // spans; the global-probe queries are dead (OP table 2.8a)
 /* hub queries of a window in the local pass */
-#define A1_NHUB         2u                                        // S_w and L_w, both updated (1.4)
-#define A2_NHUB         1u                                        // S_w only: nothing reads an update of L_w after this stage (2.4)
-#define A1_AHUB_N       (E_PAIRS * CE_N_WIN * A1_NHUB * CE_LW)    // 1,344 local weights of the hub queries: 4 pairs x 12 windows x 2 hubs x 14 slots (1.4, 1.11)
-#define A2_AHUB_N       (E_PAIRS * CE_N_WIN * A2_NHUB * CE_LW)    // 672: the same with one hub (2.4, 2.11)
+#define A1_NHUB         2u                                        // S_w and L_w, both updated (OP table 1.4)
+#define A2_NHUB         1u                                        // S_w only: nothing reads an update of L_w after this stage (OP table 2.4)
+#define A1_AHUB_N       (E_PAIRS * CE_N_WIN * A1_NHUB * CE_LW)    // local weights of the hub queries: pairs x windows x hubs x slots (OP table 1.4, 1.11)
+#define A2_AHUB_N       (E_PAIRS * CE_N_WIN * A2_NHUB * CE_LW)    // the same with one hub (OP table 2.4, 2.11)
 /* live logits of the local pass in a lane: 3 for each span, 14 for each hub; they
  * set the time of the local-mix stand-in */
-#define A1_LOC          (E_PAIRS * (CE_N_SPAN * 3u + CE_N_WIN * A1_NHUB * CE_LW))   // 2,988 = 4 x (411 + 336) (1.11)
-#define A2_LOC          (E_PAIRS * (CE_N_SPAN * 3u + CE_N_WIN * A2_NHUB * CE_LW))   // 2,316 = 4 x (411 + 168) (2.11)
-/* stand-ins: RoPE turns each (j, j + 64) pair of q and k with 3 FLOP an element;
+#define A1_LOC          (E_PAIRS * (CE_N_SPAN * 3u + CE_N_WIN * A1_NHUB * CE_LW))   // OP table 1.11
+#define A2_LOC          (E_PAIRS * (CE_N_SPAN * 3u + CE_N_WIN * A2_NHUB * CE_LW))   // OP table 2.11
+/* stand-ins: RoPE turns each (j, j + d_head / 2) pair of q and k with 3 FLOP an element;
  * the local mix takes 2 FLOP for each weight and value element */
-#define A1_ROPE_WAIT    ((3u * 2u * E_PAIRS * CE_N_SPAN * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)        // 1,503 cycles
-#define A2_ROPE_WAIT    ((3u * E_PAIRS * (CE_N_SPAN + CE_LG) * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)   // 1,568
-#define A1_LAV_WAIT     ((2u * A1_LOC * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)                         // 2,731
-#define A2_LAV_WAIT     ((2u * A2_LOC * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)                         // 2,117
+#define A1_ROPE_WAIT    ((3u * 2u * E_PAIRS * CE_N_SPAN * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)        // cycles
+#define A2_ROPE_WAIT    ((3u * E_PAIRS * (CE_N_SPAN + CE_LG) * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)   // cycles
+#define A1_LAV_WAIT     ((2u * A1_LOC * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)                         // cycles
+#define A2_LAV_WAIT     ((2u * A2_LOC * CE_D_HEAD) / CE_PE_FLOP_PER_CYCLE)                         // cycles
 
 
 /* stage 2 (attention stage 1). Each name is the start of a region, in fp16 elements.
  * X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | WO out ]
  * Z is the lattice of the lane: the span and summary rows arrive from stage 1, the
- * probe rows are set from the probe embeddings (1.13), and Z leaves updated in place
+ * probe rows are set from the probe embeddings (OP table 1.13), and Z leaves updated in place
  * (1.14). The global-probe rows of Q_g, K_g^T and V_g are constants (1.cp), written
  * once before the run. */
-#define A1_Z            0u                                        // the lattice [R | S | Lg | Ll], 346 x 256; the landing zone, with its twin at + X_ELEMS
-#define A1_H_M          CE_RUP(E_RS_ROWS, NUM_REDMULE_TILES)      // 304: GEMM rows of the projection, 298 span and summary rows padded (1.2)
-#define A1_WO_M         CE_RUP(E_ALL_ROWS, NUM_REDMULE_TILES)     // 352: GEMM rows of the output projection, all 346 rows padded (1.12)
-#define A1_H            (A1_Z + CE_RUP(E_ALL_N, CE_LINE))         // layernorm output H [2*149 rup to 304][256]; the probes' LN is a constant (1.1, read by 1.2)
-#define A1_QKV          (A1_H + CE_RUP(A1_H_M * CE_D_MODEL, CE_LINE))     // q|k|v [304][768], unrotated (1.2, read by 1.4, 1.6, 1.7)
-#define A1_ASPAN        (A1_QKV + CE_RUP(A1_H_M * CE_D_QKV, CE_LINE))     // local weights of the span queries [pair][137][3] (1.4, read by 1.11)
-#define A1_AHUB         (A1_ASPAN + CE_RUP(E_ASPAN_N, CE_LINE))           // local weights of the hub queries [pair][12][2][14] (1.4, read by 1.11)
-#define A1_QG           (A1_AHUB + CE_RUP(A1_AHUB_N, CE_LINE))            // rotated queries Q_g [pair][152][128] (1.6, read by 1.8a)
-#define A1_KT           (A1_QG + CE_RUP(E_PAIRS * A1_QR * CE_D_HEAD, CE_LINE))   // rotated keys K_g^T [pair][128][152] (1.6, read by 1.8a)
-#define A1_VG           (A1_KT + CE_RUP(E_PAIRS * CE_D_HEAD * E_KP, CE_LINE))    // values V_g [pair][152][128] (1.7, read by 1.10a)
-#define A1_SG           (A1_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][152][152], bias added in place (1.8a, 1.9a)
-#define A1_AG           (A1_SG + CE_RUP(E_PAIRS * A1_QR * E_KP, CE_LINE))        // global weights A_g [pair][152][152] (1.9a, read by 1.10a)
-#define A1_UG           (A1_AG + CE_RUP(E_PAIRS * A1_QR * E_KP, CE_LINE))        // global output U_g [pair][152][128] (1.10a, read by 1.11)
-#define A1_U            (A1_UG + CE_RUP(E_PAIRS * A1_QR * CE_D_HEAD, CE_LINE))   // attention output U, heads merged [352][256] (1.11, read by 1.12)
-#define A1_WOUT         (A1_U + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))           // output projection [352][256] (1.12, added into Z by 1.13)
+#define A1_Z            0u                                        // the lattice [R | S | Lg | Ll] [E_ALL_ROWS][CE_D_MODEL]; the landing zone, with its twin at + X_ELEMS
+#define A1_H_M          CE_RUP(E_RS_ROWS, NUM_REDMULE_TILES)      // GEMM rows of the projection, the span and summary rows padded (OP table 1.2)
+#define A1_WO_M         CE_RUP(E_ALL_ROWS, NUM_REDMULE_TILES)     // GEMM rows of the output projection, all rows padded (OP table 1.12)
+#define A1_H            (A1_Z + CE_RUP(E_ALL_N, CE_LINE))         // layernorm output H [A1_H_M][CE_D_MODEL]; the probes' LN is a constant (OP table 1.1, read by 1.2)
+#define A1_QKV          (A1_H + CE_RUP(A1_H_M * CE_D_MODEL, CE_LINE))     // q|k|v [A1_H_M][CE_D_QKV], unrotated (OP table 1.2, read by 1.4, 1.6, 1.7)
+#define A1_ASPAN        (A1_QKV + CE_RUP(A1_H_M * CE_D_QKV, CE_LINE))     // local weights of the span queries [pair][CE_N_SPAN][3] (OP table 1.4, read by 1.11)
+#define A1_AHUB         (A1_ASPAN + CE_RUP(E_ASPAN_N, CE_LINE))           // local weights of the hub queries [pair][CE_N_WIN][A1_NHUB][CE_LW] (OP table 1.4, read by 1.11)
+#define A1_QG           (A1_AHUB + CE_RUP(A1_AHUB_N, CE_LINE))            // rotated queries Q_g [pair][A1_QR][CE_D_HEAD] (OP table 1.6, read by 1.8a)
+#define A1_KT           (A1_QG + CE_RUP(E_PAIRS * A1_QR * CE_D_HEAD, CE_LINE))   // rotated keys K_g^T [pair][CE_D_HEAD][E_KP] (OP table 1.6, read by 1.8a)
+#define A1_VG           (A1_KT + CE_RUP(E_PAIRS * CE_D_HEAD * E_KP, CE_LINE))    // values V_g [pair][E_KP][CE_D_HEAD] (OP table 1.7, read by 1.10a)
+#define A1_SG           (A1_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][A1_QR][E_KP], bias added in place (OP table 1.8a, 1.9a)
+#define A1_AG           (A1_SG + CE_RUP(E_PAIRS * A1_QR * E_KP, CE_LINE))        // global weights A_g [pair][A1_QR][E_KP] (OP table 1.9a, read by 1.10a)
+#define A1_UG           (A1_AG + CE_RUP(E_PAIRS * A1_QR * E_KP, CE_LINE))        // global output U_g [pair][A1_QR][CE_D_HEAD] (OP table 1.10a, read by 1.11)
+#define A1_U            (A1_UG + CE_RUP(E_PAIRS * A1_QR * CE_D_HEAD, CE_LINE))   // attention output U, heads merged [A1_WO_M][CE_D_MODEL] (OP table 1.11, read by 1.12)
+#define A1_WOUT         (A1_U + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))           // output projection [A1_WO_M][CE_D_MODEL] (OP table 1.12, added into Z by 1.13)
 #define A1_END          (A1_WOUT + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))        // end of the stage 2 map
 /* W_BUF: each name is the start of a parameter region, in fp16 elements */
 /* W_BUF: [ LN | W_qkv | probe q|k|v | probe embeddings | cos, sin | B_g | G, delta | W_o | Ll copies ] */
-#define A1_W_LN         0u                                        // layernorm gamma, beta (1.1)
-#define A1_W_QKV        (A1_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [256][768] (1.2)
-#define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // constant q|k|v of the probes: the Lg row, then the Ll row (1.cp)
-#define A1_W_PE         (A1_W_PQKV + CE_RUP(CE_W_PQKV, CE_LINE))  // probe embeddings: e_g, then e_l, copied into Z by 1.13 (1.cp)
-#define A1_W_ROPE       (A1_W_PE + CE_RUP(CE_W_PE, CE_LINE))      // cos, sin of the span rows; not read while the rotation is a stand-in (1.cr)
-#define A1_W_GB         (A1_W_ROPE + CE_RUP(CE_W_ROPE1, CE_LINE)) // global bias [h][152][152], the same for every line, pad keys at -inf (1.cg, read by 1.9a)
-#define A1_W_LB         (A1_W_GB + CE_RUP(CE_HEADS * A1_QR * E_KP, CE_LINE))     // local bias G [h][3][3], delta [h] (1.cl, read by 1.4)
-#define A1_W_WO         (A1_W_LB + CE_RUP(CE_W_LB1, CE_LINE))     // W_o, b_o (1.12)
-#define A1_W_LLC        CE_RUP(A1_W_WO + CE_RUP(CE_W_WO, CE_LINE), CE_BANK_ROW)   // the Ll row once per group, CE_GRP_COPY apart, on a row of banks: 1.4 reads the copy in its own group (1.cp)
+#define A1_W_LN         0u                                        // layernorm gamma, beta (OP table 1.1)
+#define A1_W_QKV        (A1_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [CE_D_MODEL][CE_D_QKV] (OP table 1.2)
+#define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // constant q|k|v of the probes: the Lg row, then the Ll row (OP table 1.cp)
+#define A1_W_PE         (A1_W_PQKV + CE_RUP(CE_W_PQKV, CE_LINE))  // probe embeddings: e_g, then e_l, copied into Z by OP table 1.13 (1.cp)
+#define A1_W_ROPE       (A1_W_PE + CE_RUP(CE_W_PE, CE_LINE))      // cos, sin of the span rows; not read while the rotation is a stand-in (OP table 1.cr)
+#define A1_W_GB         (A1_W_ROPE + CE_RUP(CE_W_ROPE1, CE_LINE)) // global bias [h][A1_QR][E_KP], the same for every line, pad keys at -inf (OP table 1.cg, read by 1.9a)
+#define A1_W_LB         (A1_W_GB + CE_RUP(CE_HEADS * A1_QR * E_KP, CE_LINE))     // local bias G [h][1 + A1_NHUB][3], delta [h] (OP table 1.cl, read by 1.4)
+#define A1_W_WO         (A1_W_LB + CE_RUP(CE_W_LB1, CE_LINE))     // W_o, b_o (OP table 1.12)
+#define A1_W_LLC        CE_RUP(A1_W_WO + CE_RUP(CE_W_WO, CE_LINE), CE_BANK_ROW)   // the Ll row once per group, CE_GRP_COPY apart, on a row of banks: OP table 1.4 reads the copy in its own group (1.cp)
 #define A1_W_END        (A1_W_LLC + CE_BANK_ROW)                  // end of the stage 2 weights
 
 /* stage 3 (attention stage 2). Each name is the start of a region, in fp16 elements.
  * X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | WO out ]
  * The regions of stage 2, in the same order. Attention stage 1 updated the probes,
- * so Z arrives whole, the layernorm and the projection take all 346 rows, and the
+ * so Z arrives whole, the layernorm and the projection take all rows, and the
  * probes are keys and values only: their queries are dead. Only the span and
- * summary rows are updated, and only they leave (2.14). */
-#define A2_Z            0u                                        // the lattice [R | S | Lg | Ll], 346 x 256; the landing zone, with its twin at + X_ELEMS
-#define A2_H_M          CE_RUP(E_ALL_ROWS, NUM_REDMULE_TILES)     // 352: GEMM rows of the projection, all 346 rows padded (2.2)
-#define A2_WO_M         CE_RUP(E_RS_ROWS, NUM_REDMULE_TILES)      // 304: GEMM rows of the output projection, 298 span and summary rows padded (2.12)
-#define A2_H            (A2_Z + CE_RUP(E_ALL_N, CE_LINE))         // layernorm output H: 346 rows of 256, sized 352 for the TEs (2.1, read by 2.2)
-#define A2_QKV          (A2_H + CE_RUP(A2_H_M * CE_D_MODEL, CE_LINE))     // q|k|v of all 346 rows, unrotated, sized [352][768] (2.2, read by 2.4, 2.6, 2.7)
-#define A2_ASPAN        (A2_QKV + CE_RUP(A2_H_M * CE_D_QKV, CE_LINE))     // local weights of the span queries [pair][137][3] (2.4, read by 2.11)
-#define A2_AHUB         (A2_ASPAN + CE_RUP(E_ASPAN_N, CE_LINE))           // local weights of the one hub query S_w [pair][12][14] (2.4, read by 2.11)
-#define A2_QG           (A2_AHUB + CE_RUP(A2_AHUB_N, CE_LINE))            // rotated span queries Q_g [pair][140][128], 137 real (2.6, read by 2.8a)
-#define A2_KT           (A2_QG + CE_RUP(E_PAIRS * A2_QR * CE_D_HEAD, CE_LINE))   // rotated keys K_g^T [pair][128][152]: spans, then global probes (2.6, read by 2.8a)
-#define A2_VG           (A2_KT + CE_RUP(E_PAIRS * CE_D_HEAD * E_KP, CE_LINE))    // values V_g [pair][152][128]: spans, then global probes (2.7, read by 2.10a)
-#define A2_SG           (A2_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][140][152], bias added in place (2.8a, 2.9a)
-#define A2_AG           (A2_SG + CE_RUP(E_PAIRS * A2_QR * E_KP, CE_LINE))        // global weights A_g [pair][140][152] (2.9a, read by 2.10a)
-#define A2_UG           (A2_AG + CE_RUP(E_PAIRS * A2_QR * E_KP, CE_LINE))        // global output U_g [pair][140][128], spans only (2.10a, read by 2.11)
-#define A2_U            (A2_UG + CE_RUP(E_PAIRS * A2_QR * CE_D_HEAD, CE_LINE))   // attention output U, heads merged: 298 span and summary rows, sized 304 (2.11, read by 2.12)
-#define A2_WOUT         (A2_U + CE_RUP(A2_WO_M * CE_D_MODEL, CE_LINE))           // output projection, 298 rows sized [304][256] (2.12, added into Z by 2.13)
+ * summary rows are updated, and only they leave (OP table 2.14). */
+#define A2_Z            0u                                        // the lattice [R | S | Lg | Ll] [E_ALL_ROWS][CE_D_MODEL]; the landing zone, with its twin at + X_ELEMS
+#define A2_H_M          CE_RUP(E_ALL_ROWS, NUM_REDMULE_TILES)     // GEMM rows of the projection, all rows padded (OP table 2.2)
+#define A2_WO_M         CE_RUP(E_RS_ROWS, NUM_REDMULE_TILES)      // GEMM rows of the output projection, the span and summary rows padded (OP table 2.12)
+#define A2_H            (A2_Z + CE_RUP(E_ALL_N, CE_LINE))         // layernorm output H: all rows, sized [A2_H_M][CE_D_MODEL] for the TEs (OP table 2.1, read by 2.2)
+#define A2_QKV          (A2_H + CE_RUP(A2_H_M * CE_D_MODEL, CE_LINE))     // q|k|v of all rows, unrotated, sized [A2_H_M][CE_D_QKV] (OP table 2.2, read by 2.4, 2.6, 2.7)
+#define A2_ASPAN        (A2_QKV + CE_RUP(A2_H_M * CE_D_QKV, CE_LINE))     // local weights of the span queries [pair][CE_N_SPAN][3] (OP table 2.4, read by 2.11)
+#define A2_AHUB         (A2_ASPAN + CE_RUP(E_ASPAN_N, CE_LINE))           // local weights of the one hub query S_w [pair][CE_N_WIN][CE_LW] (OP table 2.4, read by 2.11)
+#define A2_QG           (A2_AHUB + CE_RUP(A2_AHUB_N, CE_LINE))            // rotated span queries Q_g [pair][A2_QR][CE_D_HEAD], CE_N_SPAN real (OP table 2.6, read by 2.8a)
+#define A2_KT           (A2_QG + CE_RUP(E_PAIRS * A2_QR * CE_D_HEAD, CE_LINE))   // rotated keys K_g^T [pair][CE_D_HEAD][E_KP]: spans, then global probes (OP table 2.6, read by 2.8a)
+#define A2_VG           (A2_KT + CE_RUP(E_PAIRS * CE_D_HEAD * E_KP, CE_LINE))    // values V_g [pair][E_KP][CE_D_HEAD]: spans, then global probes (OP table 2.7, read by 2.10a)
+#define A2_SG           (A2_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][A2_QR][E_KP], bias added in place (OP table 2.8a, 2.9a)
+#define A2_AG           (A2_SG + CE_RUP(E_PAIRS * A2_QR * E_KP, CE_LINE))        // global weights A_g [pair][A2_QR][E_KP] (OP table 2.9a, read by 2.10a)
+#define A2_UG           (A2_AG + CE_RUP(E_PAIRS * A2_QR * E_KP, CE_LINE))        // global output U_g [pair][A2_QR][CE_D_HEAD], spans only (OP table 2.10a, read by 2.11)
+#define A2_U            (A2_UG + CE_RUP(E_PAIRS * A2_QR * CE_D_HEAD, CE_LINE))   // attention output U, heads merged: the span and summary rows, sized A2_WO_M (OP table 2.11, read by 2.12)
+#define A2_WOUT         (A2_U + CE_RUP(A2_WO_M * CE_D_MODEL, CE_LINE))           // output projection, sized [A2_WO_M][CE_D_MODEL] (OP table 2.12, added into Z by 2.13)
 #define A2_END          (A2_WOUT + CE_RUP(A2_WO_M * CE_D_MODEL, CE_LINE))        // end of the stage 3 map
 /* W_BUF: [ LN | W_qkv | cos, sin | B_g | G, delta | W_o ] */
-#define A2_W_LN         0u                                        // layernorm gamma, beta (2.1)
-#define A2_W_QKV        (A2_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [256][768] (2.2)
-#define A2_W_ROPE       (A2_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // cos, sin of the span and global-probe rows; not read while the rotation is a stand-in (2.cr)
-#define A2_W_GB         (A2_W_ROPE + CE_RUP(CE_W_ROPE2, CE_LINE)) // global bias [h][140][152], the same for every line, pad keys at -inf (2.cg, read by 2.9a)
-#define A2_W_LB         (A2_W_GB + CE_RUP(CE_HEADS * A2_QR * E_KP, CE_LINE))     // local bias G [h][2][3], delta [h] (2.cl, read by 2.4)
-#define A2_W_WO         (A2_W_LB + CE_RUP(CE_W_LB2, CE_LINE))     // W_o, b_o (2.12)
+#define A2_W_LN         0u                                        // layernorm gamma, beta (OP table 2.1)
+#define A2_W_QKV        (A2_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [CE_D_MODEL][CE_D_QKV] (OP table 2.2)
+#define A2_W_ROPE       (A2_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // cos, sin of the span and global-probe rows; not read while the rotation is a stand-in (OP table 2.cr)
+#define A2_W_GB         (A2_W_ROPE + CE_RUP(CE_W_ROPE2, CE_LINE)) // global bias [h][A2_QR][E_KP], the same for every line, pad keys at -inf (OP table 2.cg, read by 2.9a)
+#define A2_W_LB         (A2_W_GB + CE_RUP(CE_HEADS * A2_QR * E_KP, CE_LINE))     // local bias G [h][1 + A2_NHUB][3], delta [h] (OP table 2.cl, read by 2.4)
+#define A2_W_WO         (A2_W_LB + CE_RUP(CE_W_LB2, CE_LINE))     // W_o, b_o (OP table 2.12)
 #define A2_W_END        (A2_W_WO + CE_RUP(CE_W_WO, CE_LINE))      // end of the stage 3 weights
 
 /* == stage 4: FFN and patch decoder (block D) ==
  * Each name is the start of a region, in elements.
  * X_BUF: [ Z | BASE: X, S | H | F1 | F2 | D | head input: PRB rows, summary rows ]
  * Z (spans and summaries) arrives from stage 3. The FFN and the decoder run on all
- * 298 rows in one launch each, then D.9 cuts the decoded patches into per-PRB rows
+ * rows in one launch each, then OP table D.9 cuts the decoded patches into per-PRB rows
  * of each element, the input of the head (D.10). */
-#define S4_LINES        (CE_NL / CE_S4_LANES)                     // 2 lines a lane
-#define S4_EL           (CE_N_EL / CE_S4_LANES)                   // 8 elements a lane: 2 lines x 4 elements a tile
-#define S4_R_ROWS       (S4_LINES * CE_N_SPAN)                    // 274 span rows
-#define S4_ROWS         (S4_LINES * CE_NRS)                       // 298 span and summary rows
-#define S4_M            CE_RUP(S4_ROWS, NUM_REDMULE_TILES)        // 304: GEMM rows, the 298 rows padded (D.2, D.4, D.7)
-#define S4_Z_N          (S4_ROWS * CE_D_MODEL)                    // 76,288: elements of the lattice that arrives from stage 3
+#define S4_LINES        (CE_NL / CE_S4_LANES)                     // lines a lane
+#define S4_EL           (CE_N_EL / CE_S4_LANES)                   // elements a lane: lines x elements a tile
+#define S4_R_ROWS       (S4_LINES * CE_N_SPAN)                    // span rows
+#define S4_ROWS         (S4_LINES * CE_NRS)                       // span and summary rows
+#define S4_M            CE_RUP(S4_ROWS, NUM_REDMULE_TILES)        // GEMM rows, the rows padded (OP table D.2, D.4, D.7)
+#define S4_Z_N          (S4_ROWS * CE_D_MODEL)                    // elements of the lattice that arrives from stage 3
 // #define S4_XB_N         (CE_IN_ALL / CE_S4_LANES)                 // 105,216: the lane's input share from LPDDR (D.6)
-#define S4_XB_N         (S4_R_ROWS * CE_C)                          // 105,216: X, the lane's span patches from LPDDR, 274 x 384 (D.6)
-#define S4_WIN_N        (CE_WIN_ALL / CE_S4_LANES)                // 9,216: the lane's summary patches from LPDDR (D.6)
-#define S4_BASE_N       (S4_ROWS * CE_C)                          // 114,432: the decoder residual [X | S], 298 x 384 (D.6, D.8)
-#define S4_HPRB_N       (S4_EL * CE_N_PRB * CE_RUN)               // 104,832: head input, PRB rows, 8 x 273 x 48 (D.9)
-#define S4_HSUM_N       (S4_EL * CE_NSUM_HR * CE_RUN)             // 9,216: head input, summary rows, 8 x 24 x 48 (D.9)
-#define S4_Z            0u                                        // the lattice [R | S], 298 x 256; the landing zone, with its twin at + X_ELEMS
-#define S4_XB           (S4_Z + CE_RUP(S4_Z_N, CE_LINE))          // the decoder residual BASE = [X | S] starts here, X first (D.6)
-#define S4_WIN          (S4_XB + S4_XB_N)                         // S, right after X, so BASE is one tensor (D.6)
-#define S4_H            (S4_WIN + CE_RUP(S4_WIN_N, CE_LINE))      // layernorm output H: 298 rows of 256, sized 304 (D.1, read by D.2)
-#define S4_F1           (S4_H + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))       // FFN hidden [304][512], GELU in place (D.2, D.3, read by D.4)
-#define S4_F2           (S4_F1 + CE_RUP(S4_M * CE_FFN, CE_LINE))          // FFN output [304][256], + Z in place (D.4, D.5, read by D.7)
-#define S4_D            (S4_F2 + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))      // decoded patches [304][384], + BASE in place (D.7, D.8, read by D.9)
-#define S4_BLK          (S4_D + CE_RUP(S4_M * CE_C, CE_LINE))             // head input, PRB rows [element][273][48] (D.9, sent by D.10)
-#define S4_BLK_S        (S4_BLK + S4_HPRB_N)                              // head input, summary rows [element][24][48], right after (D.9, sent by D.10)
+#define S4_XB_N         (S4_R_ROWS * CE_C)                          // X, the lane's span patches from LPDDR, [S4_R_ROWS][CE_C] (OP table D.6)
+#define S4_WIN_N        (CE_WIN_ALL / CE_S4_LANES)                // the lane's summary patches from LPDDR (OP table D.6)
+#define S4_BASE_N       (S4_ROWS * CE_C)                          // the decoder residual [X | S] [S4_ROWS][CE_C] (OP table D.6, D.8)
+#define S4_HPRB_N       (S4_EL * CE_N_PRB * CE_RUN)               // head input, PRB rows [S4_EL][CE_N_PRB][CE_RUN] (OP table D.9)
+#define S4_HSUM_N       (S4_EL * CE_NSUM_HR * CE_RUN)             // head input, summary rows [S4_EL][CE_NSUM_HR][CE_RUN] (OP table D.9)
+#define S4_Z            0u                                        // the lattice [R | S] [S4_ROWS][CE_D_MODEL]; the landing zone, with its twin at + X_ELEMS
+#define S4_XB           (S4_Z + CE_RUP(S4_Z_N, CE_LINE))          // the decoder residual BASE = [X | S] starts here, X first (OP table D.6)
+#define S4_WIN          (S4_XB + S4_XB_N)                         // S, right after X, so BASE is one tensor (OP table D.6)
+#define S4_H            (S4_WIN + CE_RUP(S4_WIN_N, CE_LINE))      // layernorm output H [S4_M][CE_D_MODEL] (OP table D.1, read by D.2)
+#define S4_F1           (S4_H + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))       // FFN hidden [S4_M][CE_FFN], GELU in place (OP table D.2, D.3, read by D.4)
+#define S4_F2           (S4_F1 + CE_RUP(S4_M * CE_FFN, CE_LINE))          // FFN output [S4_M][CE_D_MODEL], + Z in place (OP table D.4, D.5, read by D.7)
+#define S4_D            (S4_F2 + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))      // decoded patches [S4_M][CE_C], + BASE in place (OP table D.7, D.8, read by D.9)
+#define S4_BLK          (S4_D + CE_RUP(S4_M * CE_C, CE_LINE))             // head input, PRB rows [element][CE_N_PRB][CE_RUN] (OP table D.9, sent by D.10)
+#define S4_BLK_S        (S4_BLK + S4_HPRB_N)                              // head input, summary rows [element][CE_NSUM_HR][CE_RUN], right after (OP table D.9, sent by D.10)
 #define S4_END          (S4_BLK_S + CE_RUP(S4_HSUM_N, CE_LINE))           // end of the stage 4 map
 /* W_BUF: [ LN | W_1 | W_2 | W_dec ]; each name is the start of a parameter region */
-#define S4_W_LN         0u                                        // layernorm gamma, beta (D.1)
-#define S4_W_FF1        (S4_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_1, b_1 (D.2, D.3)
-#define S4_W_FF2        (S4_W_FF1 + CE_RUP(CE_W_FF1, CE_LINE))    // W_2, b_2 (D.4)
-#define S4_W_DEC        (S4_W_FF2 + CE_RUP(CE_W_FF2, CE_LINE))    // W_dec, b_dec (D.7)
+#define S4_W_LN         0u                                        // layernorm gamma, beta (OP table D.1)
+#define S4_W_FF1        (S4_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_1, b_1 (OP table D.2, D.3)
+#define S4_W_FF2        (S4_W_FF1 + CE_RUP(CE_W_FF1, CE_LINE))    // W_2, b_2 (OP table D.4)
+#define S4_W_DEC        (S4_W_FF2 + CE_RUP(CE_W_FF2, CE_LINE))    // W_dec, b_dec (OP table D.7)
 #define S4_W_END        (S4_W_DEC + CE_RUP(CE_W_DEC, CE_LINE))    // end of the stage 4 weights
 
 /* == stage 5: Doppler head (block H) ==
  * Each name is the start of a region, in elements.
  * X_BUF: [ x_in | h | OUT[0] | OUT[1] ]
- * x_in, the head input [PRB rows | summary rows][48], arrives from stage 4. H.1 to
+ * x_in, the head input [PRB rows | summary rows][CE_RUN], arrives from stage 4. OP table H.1 to
  * H.3 write h only, H.4 writes OUT one tile at a time, and only the drain to LPDDR
  * (H.5) reads OUT, so an item's last drain can run under the next item's H.1 to
  * H.3. With two OUT buffers this is the largest map, and it sets the size of X_BUF. */
-#define S5_EL           (CE_N_EL / CE_S5_LANES)                   // 16 elements a lane
-#define S5_XR_M         (S5_EL * CE_N_PRB)                        // 4,368 PRB rows: 16 elements x 273 PRBs, 273 rows a TE (H.1)
-#define S5_XS_M         (S5_EL * CE_NSUM_HR)                      // 384 summary rows: 16 elements x 24, 24 rows a TE (H.1)
-#define S5_X_N          ((S5_XR_M + S5_XS_M) * CE_RUN)            // 228,096: elements of the head input that arrives from stage 4
-#define S5_HX_N         (S5_XR_M * CE_C_HID)                      // 279,552: elements of h for the PRB rows, 4,368 x 64 (H.2, H.3)
-#define S5_H_N          ((S5_XR_M + S5_XS_M) * CE_C_HID)          // 304,128: elements of h, PRB and summary rows
-#define S5_Y_ROWS       (S5_XR_M / CE_S5_TILES)                   // 1,092 PRB rows a tile of the output layer: 4 elements (H.4)
-#define S5_Y_M          CE_RUP(S5_Y_ROWS, NUM_REDMULE_TILES)      // 1,104: GEMM rows of a tile, the 1,092 padded (H.4)
-#define S5_TILE_X       (S5_Y_ROWS * CE_C_HID)                    // 69,888: step from one tile's rows of h to the next (H.4)
-#define S5_OUT_N        CE_RUP(S5_Y_M * CE_C_OUT, CE_LINE)        // 370,944: one OUT buffer, a tile's estimate sized [1,104][336] (H.4)
+#define S5_EL           (CE_N_EL / CE_S5_LANES)                   // elements a lane
+#define S5_XR_M         (S5_EL * CE_N_PRB)                        // PRB rows: elements x PRBs (OP table H.1)
+#define S5_XS_M         (S5_EL * CE_NSUM_HR)                      // summary rows: elements x CE_NSUM_HR (OP table H.1)
+#define S5_X_N          ((S5_XR_M + S5_XS_M) * CE_RUN)            // elements of the head input that arrives from stage 4
+#define S5_HX_N         (S5_XR_M * CE_C_HID)                      // elements of h for the PRB rows [S5_XR_M][CE_C_HID] (OP table H.2, H.3)
+#define S5_H_N          ((S5_XR_M + S5_XS_M) * CE_C_HID)          // elements of h, PRB and summary rows
+#define S5_Y_ROWS       (S5_XR_M / CE_S5_TILES)                   // PRB rows a tile of the output layer (OP table H.4)
+#define S5_Y_M          CE_RUP(S5_Y_ROWS, NUM_REDMULE_TILES)      // GEMM rows of a tile, S5_Y_ROWS padded (OP table H.4)
+#define S5_TILE_X       (S5_Y_ROWS * CE_C_HID)                    // step from one tile's rows of h to the next (OP table H.4)
+#define S5_OUT_N        CE_RUP(S5_Y_M * CE_C_OUT, CE_LINE)        // one OUT buffer, a tile's estimate sized [S5_Y_M][CE_C_OUT] (OP table H.4)
 #define S5_NBUF         (CE_S5_DBUF ? 2u : 1u)                    // OUT buffers: 2 lets a drain run under the next tile's GEMM
-#define S5_TILE_B       (S5_Y_ROWS * CE_C_OUT * CE_BYTES)         // 733,824 B: the real rows of a tile, what one drain sends to LPDDR (H.5)
+#define S5_TILE_B       (S5_Y_ROWS * CE_C_OUT * CE_BYTES)         // the real rows of a tile, what one drain sends to LPDDR (OP table H.5)
 #define S5_X            0u                                        // the head input x_in; the landing zone, with its twin at + X_ELEMS
-#define S5_H            (S5_X + CE_RUP(S5_X_N, CE_LINE))          // hidden layer h [PRB rows | summary rows][64] (H.1 to H.3, read by H.4)
-#define S5_OUT          (S5_H + CE_RUP(S5_H_N, CE_LINE))          // 532,224: OUT[0], with OUT[1] right after (H.4, read by H.5)
-#define S5_END          (S5_OUT + S5_NBUF * S5_OUT_N)             // 1,274,112: end of the stage 5 map
+#define S5_H            (S5_X + CE_RUP(S5_X_N, CE_LINE))          // hidden layer h [PRB rows | summary rows][CE_C_HID] (OP table H.1 to H.3, read by H.4)
+#define S5_OUT          (S5_H + CE_RUP(S5_H_N, CE_LINE))          // OUT[0], with OUT[1] right after (OP table H.4, read by H.5)
+#define S5_END          (S5_OUT + S5_NBUF * S5_OUT_N)             // end of the stage 5 map
 /* W_BUF: [ W_x | W_s | W_h ]; each name is the start of a parameter region */
-#define S5_W_HX         0u                                        // W_x [48][64], b_x: hidden layer of the PRB rows (H.1, b_x in H.2)
-#define S5_W_HS         (S5_W_HX + CE_RUP(CE_W_HX, CE_LINE))      // W_s [48][64]: hidden layer of the summary rows, the window term (H.1)
-#define S5_W_HO         (S5_W_HS + CE_RUP(CE_W_HS, CE_LINE))      // W_h [64][336], b_h: the output layer (H.4)
+#define S5_W_HX         0u                                        // W_x [CE_RUN][CE_C_HID], b_x: hidden layer of the PRB rows (OP table H.1, b_x in H.2)
+#define S5_W_HS         (S5_W_HX + CE_RUP(CE_W_HX, CE_LINE))      // W_s [CE_RUN][CE_C_HID]: hidden layer of the summary rows, the window term (OP table H.1)
+#define S5_W_HO         (S5_W_HS + CE_RUP(CE_W_HS, CE_LINE))      // W_h [CE_C_HID][CE_C_OUT], b_h: the output layer (OP table H.4)
 #define S5_W_END        (S5_W_HO + CE_RUP(CE_W_HO, CE_LINE))      // end of the stage 5 weights
 /* ==== the two buffers ========================================================
  * X_BUF holds the largest stage map, its twin the largest landing zone, W_BUF
@@ -455,13 +455,13 @@ enum { CE_W_ELEMS = CE_RUP(CE_MAX3(CE_MAX(S1_W_END, A1_W_END), CE_MAX(A2_W_END, 
 * it, and stage 4 reads both back for the residual sum. North node j: the
 * estimate of the head lane in column j, tile after tile. */
 #define LP_IN_OFF       0u                                       // start of the model input in a south node, and of the span patches written over it
-#define LP_IN_B         (CE_IN_ALL * CE_BYTES / CE_LPDDR_SOUTH)  // a quarter of the model input, 16 elements (F.1); then the span patches of 4 lines, written over it (F.6, read by D.6)
-#define LP_WIN_OFF      CE_RUP(LP_IN_OFF + LP_IN_B, 64u)         // start of the summary patches, right after the input, on a 64 B line
-#define LP_WIN_B        (CE_WIN_ALL * CE_BYTES / CE_LPDDR_SOUTH) // 36,864 B: the summary patches of 4 lines; stage 1 writes them (F.6), stage 4 reads them (D.6)
-#define LP_SOUTH_B      (LP_WIN_OFF + LP_WIN_B)                  // 457,728 B: all a south node holds
-#define LP_OUT_B        (CE_OUT_ALL * CE_BYTES / CE_LPDDR_NORTH) // 2,935,296 B: the estimate of one head lane, 16 elements, in its north node
+#define LP_IN_B         (CE_IN_ALL * CE_BYTES / CE_LPDDR_SOUTH)  // the node's share of the model input (OP table F.1); then the span patches of its lines, written over it (F.6, read by D.6)
+#define LP_WIN_OFF      CE_RUP(LP_IN_OFF + LP_IN_B, 64u)         // start of the summary patches, right after the input, on a DMA line
+#define LP_WIN_B        (CE_WIN_ALL * CE_BYTES / CE_LPDDR_SOUTH) // the summary patches of the node's lines; stage 1 writes them (OP table F.6), stage 4 reads them (D.6)
+#define LP_SOUTH_B      (LP_WIN_OFF + LP_WIN_B)                  // all a south node holds
+#define LP_OUT_B        (CE_OUT_ALL * CE_BYTES / CE_LPDDR_NORTH) // the estimate of one head lane, in its north node
 #define LPDDR_OUTPUT_OFFSET 0u                                   // start of the estimate in a north node
-#define TILE_OUT_BYTES  S5_TILE_B                                // 733,824 B: one tile of the estimate, one drain; tile t lands at LPDDR_OUTPUT_OFFSET + t x TILE_OUT_BYTES (H.5)
+#define TILE_OUT_BYTES  S5_TILE_B                                // one tile of the estimate, one drain; tile t lands at LPDDR_OUTPUT_OFFSET + t x TILE_OUT_BYTES (OP table H.5)
 
 #define CE_NODES(lanes, edge)    ((lanes) <= (edge) ? (edge) / (lanes) : 1u)   // nodes per lane
 #define CE_SHARERS(lanes, edge)  ((lanes) <= (edge) ? 1u : (lanes) / (edge))   // lanes per node
@@ -475,10 +475,10 @@ enum { CE_W_ELEMS = CE_RUP(CE_MAX3(CE_MAX(S1_W_END, A1_W_END), CE_MAX(A2_W_END, 
 #define S4_BASE_CID     (S3_BASE_CID + CE_ENC_LANES + CE_S3_PAD)
 #define S5_BASE_CID     (S4_BASE_CID + CE_S4_LANES + CE_S4_PAD)
 #define N_CLUSTERS      (S5_BASE_CID + CE_S5_LANES)               // cids the pipeline occupies
-#define S1_NODES        CE_NODES(CE_S1_LANES, CE_LPDDR_SOUTH)     // 2 nodes a lane
+#define S1_NODES        CE_NODES(CE_S1_LANES, CE_LPDDR_SOUTH)     // nodes a lane
 #define S1_SHARERS      CE_SHARERS(CE_S1_LANES, CE_LPDDR_SOUTH)
 #define S4_NODES        CE_NODES(CE_S4_LANES, CE_LPDDR_SOUTH)
-#define S4_SHARERS      CE_SHARERS(CE_S4_LANES, CE_LPDDR_SOUTH)   // 2 lanes a node
+#define S4_SHARERS      CE_SHARERS(CE_S4_LANES, CE_LPDDR_SOUTH)   // lanes a node
 #define S5_NODES        CE_NODES(CE_S5_LANES, CE_LPDDR_NORTH)
 #define S5_SHARERS      CE_SHARERS(CE_S5_LANES, CE_LPDDR_NORTH)
 
@@ -526,7 +526,7 @@ _Static_assert(E_RS_N % CE_LINE == 0u && S4_Z_N % CE_LINE == 0u
 /* stage 5 */
 _Static_assert(S5_XR_M % CE_S5_TILES == 0u, "stage 5: the tiles must split the PRB rows evenly");
 
-/* L1: X_BUF (with its twin, rounded up to its 8 KiB alignment) and W_BUF fit */
+/* L1: X_BUF (with its twin, rounded up to its alignment) and W_BUF fit */
 #define CE_L1_BUDGET_B  ((uint32_t)NUM_BANKS * L1_BANK_SIZE - (uint32_t)NUM_CORES * STACK_SIZE \
                          - (2u * NUM_BANKS * 4u + 2u * NUM_BANKS + 64u))
 _Static_assert(CE_RUP((CE_X_ELEMS + CE_X_PAR_ELEMS) * CE_BYTES, NUM_BANKS * 4u)
@@ -555,7 +555,7 @@ _Static_assert(S1_BASE_CID / ARCH_NUM_CLUSTER_X == (S1_BASE_CID + CE_S1_LANES - 
 _Static_assert(S5_BASE_CID / ARCH_NUM_CLUSTER_X == ARCH_NUM_CLUSTER_Y - 1u,
                "the self-draining head is not in the north row, so its drain is not one hop");
 _Static_assert(LP_SOUTH_B <= ARCH_HBM_NODE_ADDR_SPACE && LP_OUT_B <= ARCH_HBM_NODE_ADDR_SPACE,
-               "per-node LPDDR data does not fit one node"); // a node's address window is 8 MiB; past it the address lands in the next node
+               "per-node LPDDR data does not fit one node"); // a node's address window is ARCH_HBM_NODE_ADDR_SPACE; past it the address lands in the next node
 _Static_assert(CE_S5_LANES == CE_LPDDR_NORTH && CE_S5_TILES * TILE_OUT_BYTES == LP_OUT_B,
                "the head drains each lane into the north node of its column: one lane per north node");
 _Static_assert(LPDDR_OUTPUT_OFFSET + CE_S5_TILES * TILE_OUT_BYTES <= ARCH_HBM_NODE_ADDR_SPACE,
@@ -601,7 +601,7 @@ _Static_assert(N_CLUSTERS <= ARCH_NUM_CLUSTER, "the pipeline needs more clusters
                         + ((c) - S4_BASE_CID) * CID_IN(c, S4_BASE_CID, CE_S4_LANES)    \
                         + ((c) - S5_BASE_CID) * CID_IN(c, S5_BASE_CID, CE_S5_LANES))
 
-// Stage (1 to 5, 0 = idle) of clusters 0 to 31, one grid row per line
+// Stage (1 to 5, 0 = idle) of every cluster, one grid row per line
 #define CID_STAGE_LIST  CID_STAGE_OF(0u),  CID_STAGE_OF(1u),  CID_STAGE_OF(2u),  CID_STAGE_OF(3u),   \
                         CID_STAGE_OF(4u),  CID_STAGE_OF(5u),  CID_STAGE_OF(6u),  CID_STAGE_OF(7u),   \
                         CID_STAGE_OF(8u),  CID_STAGE_OF(9u),  CID_STAGE_OF(10u), CID_STAGE_OF(11u),  \
@@ -675,7 +675,7 @@ _Static_assert(S4_R_ROWS * CE_D_MODEL == CE_ZR_ALL / CE_S4_LANES && S4_Z_N == (C
 _Static_assert(S5_XR_M * CE_RUN == CE_HPRB_ALL / CE_S5_LANES && S5_X_N == (CE_HPRB_ALL + CE_HSUM_ALL) / CE_S5_LANES,
                "stage 5: the head input is not where the hand-off puts it");
 /* the smallest share the lane rules allow: one line of the lattice; the head input
- * of one tile, 4 elements */
+ * of one tile */
 _Static_assert((CE_ZR_ALL * CE_BYTES / CE_NL) % 64u == 0u && (CE_ZS_ALL * CE_BYTES / CE_NL) % 64u == 0u
                && (CE_HPRB_ALL * CE_BYTES / CE_NL) % 64u == 0u && (CE_HSUM_ALL * CE_BYTES / CE_NL) % 64u == 0u,
                "a share of a hand-off is not whole 64 B DMA lines");
@@ -684,8 +684,8 @@ _Static_assert((CE_ZR_ALL * CE_BYTES / CE_NL) % 64u == 0u && (CE_ZS_ALL * CE_BYT
  * The copies between L1 and LPDDR, one entry per tensor (the head writes its own
  * output, in compute_stage_5). Stage 1 reads the model input from the south nodes
  * and writes the summary patches next to it; stage 4 reads both again, for the
- * decoder residual. A lane spans `nodes` nodes (stage 1: 2), or `lanes_per_node`
- * lanes share one node (stage 4: 2). The n-th copy of a lane (n < nodes):
+ * decoder residual. A lane spans `nodes` nodes, or `lanes_per_node` lanes
+ * share one node. The n-th copy of a lane (n < nodes):
  *
  *     node = (lane / lanes_per_node) * nodes + n
  *     off  = lpddr_off + (lane % lanes_per_node) * lane_step   (inside the node) */
@@ -708,8 +708,8 @@ typedef struct {
     uint32_t l1_stride;       // step between runs in L1; has no effect while reps = 1
     uint32_t reps;            // runs in one copy; 1 today, so each copy is one plain block
     uint32_t edge;            // side of the chip: LPDDR_EDGE_SOUTH or LPDDR_EDGE_NORTH
-    uint32_t nodes;           // nodes one lane reads or writes, one copy each (stage 1: 2)
-    uint32_t lanes_per_node;  // lanes that share one node (stage 4: 2)
+    uint32_t nodes;           // nodes one lane reads or writes, one copy each
+    uint32_t lanes_per_node;  // lanes that share one node
 } lpddr_xfer_t;
 
 
@@ -722,8 +722,8 @@ typedef struct {
 
 static const lpddr_xfer_t LPDDR_IN_XFER[2] = {
     // LPDDR_LEG(LP_IN_OFF,  S1_IN * CE_BYTES,  LP_IN_B,  LPDDR_EDGE_SOUTH, S1_NODES, S1_SHARERS),  // stage 1: model input (F.1) // moved to stage 1 explicitly
-    LPDDR_LEG(LP_IN_OFF,  S4_XB * CE_BYTES,  LP_IN_B,  LPDDR_EDGE_SOUTH, S4_NODES, S4_SHARERS),  // stage 4: span patches, written by stage 1 over its input (D.6)
-    LPDDR_LEG(LP_WIN_OFF, S4_WIN * CE_BYTES, LP_WIN_B, LPDDR_EDGE_SOUTH, S4_NODES, S4_SHARERS),  // stage 4: summary patches (D.6)
+    LPDDR_LEG(LP_IN_OFF,  S4_XB * CE_BYTES,  LP_IN_B,  LPDDR_EDGE_SOUTH, S4_NODES, S4_SHARERS),  // stage 4: span patches, written by stage 1 over its input (OP table D.6)
+    LPDDR_LEG(LP_WIN_OFF, S4_WIN * CE_BYTES, LP_WIN_B, LPDDR_EDGE_SOUTH, S4_NODES, S4_SHARERS),  // stage 4: summary patches (OP table D.6)
 };
 
 /* stage s reads the legs LPDDR_IN_FIRST[s] to LPDDR_IN_FIRST[s + 1] - 1, and writes
@@ -843,7 +843,7 @@ static __fp16 W_BUF[W_ELEMS] __attribute__((aligned(NUM_BANKS * sizeof(int32_t))
 
 
 // ==== small kernels of this app ===============================================
-/* Starts G GEMMs at once, Y_g += X_g . W_g for g = 0 .. G-1, with 16 / G TEs each.
+/* Starts G GEMMs at once, Y_g += X_g . W_g for g = 0 .. G-1, with NUM_REDMULE_TILES / G TEs each.
  * X, Y and W are the bases; product g uses
  *   X_g = X + g * (M/G) * N    [M/G][N], so the G blocks lie back to back in X
  *   Y_g = Y + g * (M/G) * P    [M/G][P], likewise in Y
@@ -900,18 +900,18 @@ static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lan
     (void)par;   // stage 1 reads from LPDDR: no twin (not used without warning)
     uint32_t cid = mempool_get_core_id();     // in-cluster core id
     uint32_t nt  = mempool_get_core_count();  // cores per cluster
-    uint32_t node = lane * S1_NODES;           // the lane's first south node; it has S1_NODES, 4 lines each
+    uint32_t node = lane * S1_NODES;           // the lane's first south node, of its S1_NODES
 
 
-    if (flex_is_dm_core())   // the model input, from each of the lane's south nodes (F.1 IN)
+    if (flex_is_dm_core())   // the model input, from each of the lane's south nodes (OP table F.1 IN)
         for (uint32_t n = 0; n < S1_NODES; n++)
             dma_2d((uint64_t)(uintptr_t)(X_BUF + S1_IN) + n * LP_IN_B, hbm_south(node + n, LP_IN_OFF), LP_IN_B);
     flex_intra_cluster_sync();   // the other cores waits for the input
 
 
-    CE_REGION {   // patching: one patch per span and 2x2 tile; x -> X [line][span][384] (F.2 PAT)
-        /* x: the lane's input, elements in order (p, t_h, e_h, t_v, e_v), each [3288 subcarriers][2 pilots][re, im].
-         * X: lines in (p, t_h, t_v) order; a patch is [PRB of the span][e_h][e_v][48], 48 = one PRB of one element. */
+    CE_REGION {   // patching: one patch per span and tile; x -> X [line][span][CE_C] (OP table F.2 PAT)
+        /* x: the lane's input, elements in order (p, t_h, e_h, t_v, e_v), each [CE_FP subcarriers][CE_PILOT_SYMS pilots][re, im].
+         * X: lines in (p, t_h, t_v) order; a patch is [PRB of the span][e_h][e_v][CE_RUN], CE_RUN = one PRB of one element. */
         static const perm_level_t lv[] = {
             { CE_TILE_V,          CE_ST_EV * CE_PER_EL,     CE_RUN },                           // e_v
             { CE_TILE_H,          CE_ST_EH * CE_PER_EL,     CE_TILE_V * CE_RUN },               // e_h
@@ -924,57 +924,57 @@ static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lan
         flex_intra_cluster_sync();
     }
 
-    CE_REGION {   // summary patch = mean of the window's spans; 32 cores per line, all lines at once (F.3 WIN)
-        uint32_t per = nt / S1_LINES;   // 32 cores a line; the pool keeps 24 of them busy (384 / 16)
+    CE_REGION {   // summary patch = mean of the window's spans; nt / S1_LINES cores per line, all lines at once (OP table F.3 WIN)
+        uint32_t per = nt / S1_LINES;   // cores a line; the pool keeps CE_C / 16 of them busy
         uint32_t l   = cid / per;
 
-        /* line l = cid / per, so each 32-core group pools one line; core cid % per of the group
-         * takes 16 columns (from 384). Elements from X_BUF:
-         *   src  X_BUF + S1_X   + l * 137 * 384   span patches of line l, [137 spans][384]
-         *   dst  X_BUF + S1_WIN + l * 12  * 384   summary patches of line l, [12 windows][384]
-         *   CE_N_SPAN     n_in:  137 span rows of the line
-         *   CE_N_WIN      n_out: 12 windows
-         *   CE_WIN_SPANS  win:   12 spans a window (also the divisor)
-         *   CE_C          lane:  384 values a row; each column is averaged on its own
+        /* line l = cid / per, so each group of per cores pools one line; core cid % per of the group
+         * takes 16 columns (of CE_C). Elements from X_BUF:
+         *   src  X_BUF + S1_X   + l * CE_N_SPAN * CE_C   span patches of line l, [CE_N_SPAN][CE_C]
+         *   dst  X_BUF + S1_WIN + l * CE_N_WIN  * CE_C   summary patches of line l, [CE_N_WIN][CE_C]
+         *   CE_N_SPAN     n_in:  span rows of the line
+         *   CE_N_WIN      n_out: windows
+         *   CE_WIN_SPANS  win:   spans a window (also the divisor)
+         *   CE_C          lane:  values a row; each column is averaged on its own
          *   cid % per, per   core id and core count inside the group
-         * Window w averages rows 12w to 12w + 11 of src into row w of dst. */
+         * Window w averages rows win w to win (w + 1) - 1 of src into row w of dst. */
         pool_mean_f16p(X_BUF + S1_X + l * CE_N_SPAN * CE_C, X_BUF + S1_WIN + l * CE_N_WIN * CE_C,
                     CE_N_SPAN, CE_N_WIN, CE_WIN_SPANS, CE_C, cid % per, per);
         flex_intra_cluster_sync();
     }
 
 
-    /* F.6 under F.4: the TEs start the embedding without the DM core, which joins at
+    /* OP table F.6 under F.4: the TEs start the embedding without the DM core, which joins at
      * its closing barrier, so these copies cost no time. */
-    if (flex_is_dm_core())   // span patches overide the input they came from, summary patches after it, into each south node (F.6 OUT)
+    if (flex_is_dm_core())   // span patches overide the input they came from, summary patches after it, into each south node (OP table F.6 OUT)
         for (uint32_t n = 0; n < S1_NODES; n++) {
             dma_2d(hbm_south(node + n, LP_IN_OFF),  (uint64_t)(uintptr_t)(X_BUF + S1_X) + n * LP_IN_B,    LP_IN_B);
             dma_2d(hbm_south(node + n, LP_WIN_OFF), (uint64_t)(uintptr_t)(X_BUF + S1_WIN) + n * LP_WIN_B, LP_WIN_B);
         }
 
 
-    CE_REGION {   // embedding: tokens Z = [X; S] . W_e, spans and summaries in one launch on the 16 TEs (F.4 EMB)
-        /* TE t takes rows t * M/16 to (t + 1) * M/16 - 1 of X and Y and all of W; the cores
+    CE_REGION {   // embedding: tokens Z = [X; S] . W_e, spans and summaries in one launch on all TEs (OP table F.4 EMB)
+        /* TE t takes rows t * M/T to (t + 1) * M/T - 1 of X and Y (T TEs) and all of W; the cores
          * meet in a barrier inside the kernel. Offsets in fp16 elements from X_BUF, W_BUF:
-         *   X_BUF + S1_X      X: [X; S], 1,096 span patches then 96 summary patches, rows of 384
-         *   W_BUF + S1_W_EMB  W: W_e [384][256]
-         *   X_BUF + S1_Z      Y: tokens [1,200][256], span tokens, then summary tokens from S1_ZS
-         *   S1_TOK_M          M: 1,192 rows padded to 1,200, 75 per TE; the 8 pad rows are never read
-         *   CE_C              N: 384, a patch
-         *   CE_D_MODEL        P: 256, a token
+         *   X_BUF + S1_X      X: [X; S], S1_XR_ROWS span patches then S1_XS_ROWS summary patches, rows of CE_C
+         *   W_BUF + S1_W_EMB  W: W_e [CE_C][CE_D_MODEL]
+         *   X_BUF + S1_Z      Y: tokens [S1_TOK_M][CE_D_MODEL], span tokens, then summary tokens from S1_ZS
+         *   S1_TOK_M          M: S1_TOK rows, padded; the pad rows are never read
+         *   CE_C              N: a patch
+         *   CE_D_MODEL        P: a token
          *   GEMM, false, 0    the operation; no column rotation between TEs */
         redmule_synch_parallel(X_BUF + S1_X, W_BUF + S1_W_EMB, X_BUF + S1_Z, S1_TOK_M, CE_C, CE_D_MODEL, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
 
-    CE_REGION {   // token type: + (b_e + t_R) on spans, + (b_e + t_S) on summaries, Y += X; X stands in for the broadcast bias rows (F.5 TT)
+    CE_REGION {   // token type: + (b_e + t_R) on spans, + (b_e + t_S) on summaries, Y += X; X stands in for the broadcast bias rows (OP table F.5 TT)
         axpy_f16vecp_local_unrolled4(0x3C00u, X_BUF + S1_X, X_BUF + S1_Z, S1_TT_N);
     }
 }
 
 
 
-/* Stage 2, attention stage 1 (1.1 to 1.13). The global pass runs on the TEs while
+/* Stage 2, attention stage 1 (OP table 1.1 to 1.13). The global pass runs on the TEs while
  * the local pass runs on the cores:
  *
  *     cores:  1.6 Q_g, K_g^T | 1.4 LHSM, 1.7 V_g | wait | 1.9a ...
@@ -988,7 +988,7 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
     uint32_t cid = mempool_get_core_id();      // in-cluster core id
     uint32_t nt  = mempool_get_core_count();   // cores per cluster
     __fp16 *z = X_BUF + par * X_ELEMS + A1_Z;  // this item's lattice
-    /* 1.4 reads spans and summaries from the projection; the local probe is one
+    /* OP table 1.4 reads spans and summaries from the projection; the local probe is one
      * constant row (1.cp), so its steps are 0, and each group reads its own copy */
     static const lhsm_args_t lhsm = {
         .span = X_BUF + A1_QKV,                       .span_line = CE_N_SPAN * CE_D_QKV, .span_step = CE_D_QKV,
@@ -999,31 +999,31 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         .n_lines = E_LINES, .n_heads = CE_HEADS, .n_hub = A1_NHUB,
         .n_span = CE_N_SPAN, .win = CE_WIN_SPANS, .d_model = CE_D_MODEL, .d_head = CE_D_HEAD,
     };
-    CE_REGION {   // layernorm of the span and summary rows; Z -> H; the probes' LN is a constant (1.1 LN)
+    CE_REGION {   // layernorm of the span and summary rows; Z -> H; the probes' LN is a constant (OP table 1.1 LN)
         layernorm_parallel_2x4_f16vec(z, X_BUF + A1_H, E_RS_ROWS, CE_D_MODEL, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // projection H . W_qkv -> q|k|v [304][768] (1.2 QKV)
+    CE_REGION {   // projection H . W_qkv -> q|k|v [A1_H_M][CE_D_QKV] (OP table 1.2 QKV)
         redmule_synch_parallel(X_BUF + A1_H, W_BUF + A1_W_QKV, X_BUF + A1_QKV, A1_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // q, k, v per head: a view, no code (1.3 SPLIT)
+    CE_REGION {   // q, k, v per head: a view, no code (OP table 1.3 SPLIT)
     }
     /* TODO: one kernel to replace the next two regions (the copy and the RoPE wait).
-     *  in:   q|k|v [304][768] at X_BUF + A1_QKV; row l * 137 + i is span i of line l;
-     *        head h: q in columns h*128 .. h*128+127, k in 256 + h*128 .. 256 + h*128+127
-     *        cos|sin table [head][137][128] at W_BUF + A1_W_ROPE: per row 64 cos, then 64 sin
-     *  do:   rotate each q and k vector of a span by its row of the table, pairs (x[j], x[j+64]):
+     *  in:   q|k|v [A1_H_M][CE_D_QKV] at X_BUF + A1_QKV; row l * CE_N_SPAN + i is span i of line l;
+     *        head h: q in columns h*D .. h*D+D-1, k in M + h*D .. M + h*D+D-1 (D = CE_D_HEAD, M = CE_D_MODEL)
+     *        cos|sin table [head][CE_N_SPAN][D] at W_BUF + A1_W_ROPE: per row D/2 cos, then D/2 sin
+     *  do:   rotate each q and k vector of a span by its row of the table, pairs (x[j], x[j+D/2]):
      *        lo' = lo*cos - hi*sin, hi' = hi*cos + lo*sin, each product and sum rounded to fp16
-     *  out:  Q_g   [pair][152][128] at X_BUF + A1_QG: row i = rotated q of span i (i < 137)
-     *        K_g^T [pair][128][152] at X_BUF + A1_KT: column i = rotated k of span i (i < 137)
-     *        pair = line * 2 + head; rows / columns 137-151 left as they are
-     *  keep: q|k|v unchanged (1.4 reads the unrotated q, k); no barrier inside
+     *  out:  Q_g   [pair][A1_QR][D] at X_BUF + A1_QG: row i = rotated q of span i (i < CE_N_SPAN)
+     *        K_g^T [pair][D][E_KP] at X_BUF + A1_KT: column i = rotated k of span i (i < CE_N_SPAN)
+     *        pair = line * CE_HEADS + head; the rows / columns past the spans left as they are
+     *  keep: q|k|v unchanged (OP table 1.4 reads the unrotated q, k); no barrier inside
      *  rope_gather_f16p (mempool_rope_f16.h) is written to this spec; it still needs its GVSoC run.
-     * TODO (numerics only): Q_g and V_g rows 137-148 and K_g^T columns 137-148 (global-probe
-     * q, k, v, the same every item), and rows / columns 149-151 (padding, must be 0), are
+     * TODO (numerics only): the rows of Q_g and V_g and the columns of K_g^T of the global probes
+     * (q, k, v, the same every item), and the pad rows / columns (must be 0), are
      * never written; write them once at start-up. */
-    CE_REGION {   // span q -> Q_g [pair][152][128], span k -> K_g [pair][152][128], not transposed yet (1.6 ROPE)
+    CE_REGION {   // span q -> Q_g [pair][A1_QR][CE_D_HEAD], span k -> K_g [pair][E_KP][CE_D_HEAD], not transposed yet (OP table 1.6 ROPE)
         static const perm_level_t lq[] = {
             { CE_N_SPAN, CE_D_QKV,              CE_D_HEAD },                        // span
             { CE_HEADS,  CE_D_HEAD,             A1_QR * CE_D_HEAD },                // head
@@ -1038,18 +1038,18 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         permute_f16p(X_BUF + A1_QKV + CE_D_MODEL, X_BUF + A1_KT, CE_D_HEAD, lk, 3u, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // rotate q, k by position in Q_g, K_g^T; a timed wait, no RoPE kernel yet (1.6 ROPE)
+    CE_REGION {   // rotate q, k by position in Q_g, K_g^T; a timed wait, no RoPE kernel yet (OP table 1.6 ROPE)
         mempool_wait(A1_ROPE_WAIT);
         flex_intra_cluster_sync();   // Q_g, K_g^T complete before the TEs read them
     }
-    CE_REGION {   // start S_g = Q_g . K_g^T, one product per pair on 4 TEs -> S_g [pair][152][152]; no wait, no barrier (1.8a GQK)
+    CE_REGION {   // start S_g = Q_g . K_g^T, one product per pair on E_TE_PAIR TEs -> S_g [pair][A1_QR][E_KP]; no wait, no barrier (OP table 1.8a GQK)
         redmule_grouped_start(X_BUF + A1_QG, X_BUF + A1_KT, X_BUF + A1_SG, E_PAIRS * A1_QR, CE_D_HEAD, E_KP,
                               E_PAIRS, CE_D_HEAD * E_KP);
     }
-    CE_REGION {   // under the TEs: local logits on the unrotated q, k, + bias, softmax -> A_span, A_hub; no barrier (1.4 LHSM)
+    CE_REGION {   // under the TEs: local logits on the unrotated q, k, + bias, softmax -> A_span, A_hub; no barrier (OP table 1.4 LHSM)
         celere_lhsm_f16(&lhsm, cid, nt);
     }
-    CE_REGION {   // under the TEs: span v -> V_g [pair][152][128]; no barrier (1.7 VG)
+    CE_REGION {   // under the TEs: span v -> V_g [pair][E_KP][CE_D_HEAD]; no barrier (OP table 1.7 VG)
         static const perm_level_t lv[] = {
             { CE_N_SPAN, CE_D_QKV,              CE_D_HEAD },                        // span
             { CE_HEADS,  CE_D_HEAD,             E_KP * CE_D_HEAD },                 // head
@@ -1057,33 +1057,33 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         };
         permute_f16p(X_BUF + A1_QKV + 2u * CE_D_MODEL, X_BUF + A1_VG, CE_D_HEAD, lv, 3u, cid, nt);
     }
-    CE_REGION {   // the hosts wait for their TEs, then all cores meet (1.8a GQK)
+    CE_REGION {   // the hosts wait for their TEs, then all cores meet (OP table 1.8a GQK)
         wait_redmule();
         flex_intra_cluster_sync();   // S_g, A_span, A_hub, V_g complete
     }
-    CE_REGION {   // + global bias, the same for every line; pad keys get -inf (1.9a GSM, 1.cg)
+    CE_REGION {   // + global bias, the same for every line; pad keys get -inf (OP table 1.9a GSM, 1.cg)
         for (uint32_t l = 0; l < E_LINES; l++)
             axpy_f16vecp_local_unrolled4(0x3C00u, W_BUF + A1_W_GB, X_BUF + A1_SG + l * CE_HEADS * A1_QR * E_KP,
                                          CE_HEADS * A1_QR * E_KP);
     }
-    CE_REGION {   // softmax over the 152 keys of each row, S_g -> A_g (1.9a GSM)
+    CE_REGION {   // softmax over the E_KP keys of each row, S_g -> A_g (OP table 1.9a GSM)
         softmax_parallel_2x4_f16vec(X_BUF + A1_SG, X_BUF + A1_AG, E_PAIRS * A1_QR, E_KP, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // U_g = A_g . V_g, one product per pair on 4 TEs -> U_g [pair][152][128] (1.10a GAV)
+    CE_REGION {   // U_g = A_g . V_g, one product per pair on E_TE_PAIR TEs -> U_g [pair][A1_QR][CE_D_HEAD] (OP table 1.10a GAV)
         redmule_grouped_parallel(X_BUF + A1_AG, X_BUF + A1_VG, X_BUF + A1_UG, E_PAIRS * A1_QR, E_KP, CE_D_HEAD,
                                  E_PAIRS, E_KP * CE_D_HEAD);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // local mix and head merge -> U [352][256]; a timed wait, no kernel yet (1.11 LAV)
+    CE_REGION {   // local mix and head merge -> U [A1_WO_M][CE_D_MODEL]; a timed wait, no kernel yet (OP table 1.11 LAV)
         mempool_wait(A1_LAV_WAIT);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // output projection U . W_o, all 346 rows (1.12 WO)
+    CE_REGION {   // output projection U . W_o, all rows (OP table 1.12 WO)
         redmule_synch_parallel(X_BUF + A1_U, W_BUF + A1_W_WO, X_BUF + A1_WOUT, A1_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // probe rows reset to e_g, e_l, then the residual Z += WO out (1.13 RES)
+    CE_REGION {   // probe rows reset to e_g, e_l, then the residual Z += WO out (OP table 1.13 RES)
         probe_reset(z + E_ROW_LG * CE_D_MODEL, W_BUF + A1_W_PE, cid, nt);
         flex_intra_cluster_sync();
         axpy_f16vecp_local_unrolled4(0x3C00u, X_BUF + A1_WOUT, z, E_ALL_N);
@@ -1094,7 +1094,7 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
 
 
 
-/* Stage 3, attention stage 2 (rows 2.1 to 2.13): the rows of stage 2 with the
+/* Stage 3, attention stage 2 (OP table rows 2.1 to 2.13): the rows of stage 2 with the
  * second weight set, in the same order (2.4 and 2.7 under 2.8a). The probes arrive
  * with the lattice now; their queries are dead, the global probes are keys and
  * values, the local probes keys. */
@@ -1112,17 +1112,17 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
         .n_lines = E_LINES, .n_heads = CE_HEADS, .n_hub = A2_NHUB,
         .n_span = CE_N_SPAN, .win = CE_WIN_SPANS, .d_model = CE_D_MODEL, .d_head = CE_D_HEAD,
     };
-    CE_REGION {   // layernorm over d, all 346 rows; X: the lattice, Y: H (2.1 LN)
+    CE_REGION {   // layernorm over d, all rows; X: the lattice, Y: H (OP table 2.1 LN)
         layernorm_parallel_2x4_f16vec(z, X_BUF + A2_H, E_ALL_ROWS, CE_D_MODEL, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // projection H . W_qkv, all rows in one launch; the probe q columns are dead but cost no extra 32-row block (2.2 QKV)
+    CE_REGION {   // projection H . W_qkv, all rows in one launch; the probe q columns are dead but cost no extra block of GEMM rows (OP table 2.2 QKV)
         redmule_synch_parallel(X_BUF + A2_H, W_BUF + A2_W_QKV, X_BUF + A2_QKV, A2_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // q, k, v per head: a view, no code (2.3 SPLIT)
+    CE_REGION {   // q, k, v per head: a view, no code (OP table 2.3 SPLIT)
     }
-    CE_REGION {   // gather span q into Q_g, span and global-probe k into K_g^T, out of place (2.6 ROPE)
+    CE_REGION {   // gather span q into Q_g, span and global-probe k into K_g^T, out of place (OP table 2.6 ROPE)
         static const perm_level_t lq[] = {
             { CE_N_SPAN, CE_D_QKV,              CE_D_HEAD },
             { CE_HEADS,  CE_D_HEAD,             A2_QR * CE_D_HEAD },
@@ -1133,7 +1133,7 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
             { CE_HEADS,  CE_D_HEAD,             E_KP * CE_D_HEAD },
             { E_LINES,   CE_N_SPAN * CE_D_QKV,  CE_HEADS * E_KP * CE_D_HEAD },
         };
-        static const perm_level_t lg[] = {       // its 12 global-probe rows, after them
+        static const perm_level_t lg[] = {       // its global-probe rows, after them
             { CE_N_WIN,  CE_D_QKV,              CE_D_HEAD },
             { CE_HEADS,  CE_D_HEAD,             E_KP * CE_D_HEAD },
             { E_LINES,   CE_N_WIN * CE_D_QKV,   CE_HEADS * E_KP * CE_D_HEAD },
@@ -1144,18 +1144,18 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
                      CE_D_HEAD, lg, 3u, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // rotate span q, span and global-probe k; a timed wait, as there is no RoPE kernel yet (2.6 ROPE)
+    CE_REGION {   // rotate span q, span and global-probe k; a timed wait, as there is no RoPE kernel yet (OP table 2.6 ROPE)
         mempool_wait(A2_ROPE_WAIT);
         flex_intra_cluster_sync();   // Q_g, K_g^T complete before the TEs read them
     }
-    CE_REGION {   // start the global logits Q_g . K_g^T, span queries, one product per (line, head) on 4 TEs; no wait, no barrier (2.8a GQK)
+    CE_REGION {   // start the global logits Q_g . K_g^T, span queries, one product per (line, head) on E_TE_PAIR TEs; no wait, no barrier (OP table 2.8a GQK)
         redmule_grouped_start(X_BUF + A2_QG, X_BUF + A2_KT, X_BUF + A2_SG, E_PAIRS * A2_QR, CE_D_HEAD, E_KP,
                               E_PAIRS, CE_D_HEAD * E_KP);
     }
-    CE_REGION {   // local logits of the live pairs, + bias, softmax, while the TEs run; the summary is the only hub query; no barrier (2.4 LHSM)
+    CE_REGION {   // local logits of the live pairs, + bias, softmax, while the TEs run; the summary is the only hub query; no barrier (OP table 2.4 LHSM)
         celere_lhsm_f16(&lhsm, cid, nt);
     }
-    CE_REGION {   // gather v of spans and global probes into V_g, while the TEs run; no barrier (2.7 VG)
+    CE_REGION {   // gather v of spans and global probes into V_g, while the TEs run; no barrier (OP table 2.7 VG)
         static const perm_level_t lv[] = {
             { CE_N_SPAN, CE_D_QKV,              CE_D_HEAD },
             { CE_HEADS,  CE_D_HEAD,             E_KP * CE_D_HEAD },
@@ -1170,74 +1170,74 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
         permute_f16p(X_BUF + A2_QKV + E_ROW_LG * CE_D_QKV + 2u * CE_D_MODEL, X_BUF + A2_VG + CE_N_SPAN * CE_D_HEAD,
                      CE_D_HEAD, lg, 3u, cid, nt);
     }
-    CE_REGION {   // end of the global logits: the hosts wait for their TEs, then all cores meet (2.8a GQK)
+    CE_REGION {   // end of the global logits: the hosts wait for their TEs, then all cores meet (OP table 2.8a GQK)
         wait_redmule();
         flex_intra_cluster_sync();   // S_g, A_span, A_hub and V_g complete
     }
-    CE_REGION {   // + global bias, Y += X (2.9a GSM, bias 2.cg)
+    CE_REGION {   // + global bias, Y += X (OP table 2.9a GSM, bias 2.cg)
         for (uint32_t l = 0; l < E_LINES; l++)
             axpy_f16vecp_local_unrolled4(0x3C00u, W_BUF + A2_W_GB, X_BUF + A2_SG + l * CE_HEADS * A2_QR * E_KP,
                                          CE_HEADS * A2_QR * E_KP);
     }
-    CE_REGION {   // softmax over the 152 key columns (2.9a GSM)
+    CE_REGION {   // softmax over the E_KP key columns (OP table 2.9a GSM)
         softmax_parallel_2x4_f16vec(X_BUF + A2_SG, X_BUF + A2_AG, E_PAIRS * A2_QR, E_KP, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // global mix A_g . V_g (2.10a GAV)
+    CE_REGION {   // global mix A_g . V_g (OP table 2.10a GAV)
         redmule_grouped_parallel(X_BUF + A2_AG, X_BUF + A2_VG, X_BUF + A2_UG, E_PAIRS * A2_QR, E_KP, CE_D_HEAD,
                                  E_PAIRS, E_KP * CE_D_HEAD);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // local mix and head merge, spans and summaries; a timed wait, as there is no kernel yet (2.11 LAV)
+    CE_REGION {   // local mix and head merge, spans and summaries; a timed wait, as there is no kernel yet (OP table 2.11 LAV)
         mempool_wait(A2_LAV_WAIT);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // output projection U . W_o, spans and summaries; the probe rows are dead (2.12 WO)
+    CE_REGION {   // output projection U . W_o, spans and summaries; the probe rows are dead (OP table 2.12 WO)
         redmule_synch_parallel(X_BUF + A2_U, W_BUF + A2_W_WO, X_BUF + A2_WOUT, A2_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // residual Z += WO out, spans and summaries; Y: the lattice (2.13 RES)
+    CE_REGION {   // residual Z += WO out, spans and summaries; Y: the lattice (OP table 2.13 RES)
         axpy_f16vecp_local_unrolled4(0x3C00u, X_BUF + A2_WOUT, z, E_RS_N);
     }
 }
 
 /* Stage 4, output path: FFN, patch decoder, decoder residual, per-PRB vectors
- * (rows D.1 to D.9). D.6 is its LPDDR read, D.10 its hand-off. */
+ * (OP table rows D.1 to D.9). D.6 is its LPDDR read, D.10 its hand-off. */
 static __attribute__((noinline)) void compute_stage_4(uint32_t par)
 {
     uint32_t cid = mempool_get_core_id();
     uint32_t nt  = mempool_get_core_count();
     __fp16 *z = X_BUF + par * X_ELEMS + S4_Z;
-    CE_REGION {   // layernorm over d; X: the lattice [span rows | summary rows], Y: H (D.1 LN)
+    CE_REGION {   // layernorm over d; X: the lattice [span rows | summary rows], Y: H (OP table D.1 LN)
         layernorm_parallel_2x4_f16vec(z, X_BUF + S4_H, S4_ROWS, CE_D_MODEL, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // FFN up, H . W_1 (D.2 FF1)
+    CE_REGION {   // FFN up, H . W_1 (OP table D.2 FF1)
         redmule_synch_parallel(X_BUF + S4_H, W_BUF + S4_W_FF1, X_BUF + S4_F1, S4_M, CE_D_MODEL, CE_FFN, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // GELU phi(. + b_1), in place (D.3 GELU)
+    CE_REGION {   // GELU phi(. + b_1), in place (OP table D.3 GELU)
         gelu_f16(X_BUF + S4_F1, S4_ROWS * CE_FFN, cid, nt);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // FFN down, . W_2 (D.4 FF2)
+    CE_REGION {   // FFN down, . W_2 (OP table D.4 FF2)
         redmule_synch_parallel(X_BUF + S4_F1, W_BUF + S4_W_FF2, X_BUF + S4_F2, S4_M, CE_FFN, CE_D_MODEL, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // residual FFN out += Z; X: the lattice (D.5 RES)
+    CE_REGION {   // residual FFN out += Z; X: the lattice (OP table D.5 RES)
         axpy_f16vecp_local_unrolled4(0x3C00u, z, X_BUF + S4_F2, S4_Z_N);
     }
-    CE_REGION {   // the decoder residual [X | S] from LPDDR, one tensor: a view, no code (D.6 BASE)
+    CE_REGION {   // the decoder residual [X | S] from LPDDR, one tensor: a view, no code (OP table D.6 BASE)
     }
-    CE_REGION {   // patch decoder . W_dec, spans and summaries (D.7 DEC)
+    CE_REGION {   // patch decoder . W_dec, spans and summaries (OP table D.7 DEC)
         redmule_synch_parallel(X_BUF + S4_F2, W_BUF + S4_W_DEC, X_BUF + S4_D, S4_M, CE_D_MODEL, CE_C, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // decoder residual + [X | S], Y += X; X: BASE (D.8 RES2)
+    CE_REGION {   // decoder residual + [X | S], Y += X; X: BASE (OP table D.8 RES2)
         axpy_f16vecp_local_unrolled4(0x3C00u, X_BUF + S4_XB, X_BUF + S4_D, S4_BASE_N);
     }
-    CE_REGION {   // per-PRB vectors of each element, 274 PRBs cropped to 273; Y: [element][PRB][48], [element][24][48] (D.9 BLK)
-        /* a row is [PRB of the span][e_h][e_v][48]; the lane's elements go tile by tile,
+    CE_REGION {   // per-PRB vectors of each element, the span PRBs cropped to CE_N_PRB; Y: [element][PRB][CE_RUN], [element][CE_NSUM_HR][CE_RUN] (OP table D.9 BLK)
+        /* a row is [PRB of the span][e_h][e_v][CE_RUN]; the lane's elements go tile by tile,
          * element a' = (line, e_h, e_v) of the lane */
         static const perm_level_t lb[] = {       // span rows, whole spans
             { CE_TILE_V,          CE_RUN,                       CE_N_PRB * CE_RUN },                // e_v
@@ -1269,10 +1269,10 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par)
     }
 }
 
-/* Stage 5, Doppler head (rows H.1 to H.5).
+/* Stage 5, Doppler head (OP table rows H.1 to H.5).
  *
  * H.1 to H.3 write h only. The output layer H.4 runs in CE_S5_TILES tiles of
- * S5_Y_ROWS rows (4 elements each); tile t of item k goes to OUT[b], b the parity
+ * S5_Y_ROWS rows (S5_EL / CE_S5_TILES elements each); tile t of item k goes to OUT[b], b the parity
  * of k * tiles + t (it runs on across items), and the DM core drains it to the
  * north node (H.5) without waiting.
  *
@@ -1291,20 +1291,20 @@ static __attribute__((noinline)) void compute_stage_5(uint32_t par, uint32_t ite
     uint32_t cid = mempool_get_core_id();
     uint32_t nt  = mempool_get_core_count();
     uint32_t hbm_node = get_pos(flex_get_cluster_id()).x;   // the north node of this column
-    __fp16 *x = X_BUF + par * X_ELEMS + S5_X;              // [PRB rows | summary rows][48]
-    CE_REGION {   // hidden layer, PRB rows . W_x; Y: h, PRB rows (H.1 HXS)
+    __fp16 *x = X_BUF + par * X_ELEMS + S5_X;              // [PRB rows | summary rows][CE_RUN]
+    CE_REGION {   // hidden layer, PRB rows . W_x; Y: h, PRB rows (OP table H.1 HXS)
         redmule_synch_parallel(x, W_BUF + S5_W_HX, X_BUF + S5_H, S5_XR_M, CE_RUN, CE_C_HID, GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // hidden layer, summary rows . W_s; Y: h, summary rows (H.1 HXS)
+    CE_REGION {   // hidden layer, summary rows . W_s; Y: h, summary rows (OP table H.1 HXS)
         redmule_synch_parallel(x + S5_XR_M * CE_RUN, W_BUF + S5_W_HS, X_BUF + S5_H + S5_HX_N, S5_XS_M, CE_RUN, CE_C_HID,
                                GEMM, false, 0);
         flex_intra_cluster_sync();
     }
-    CE_REGION {   // + window term and b_x; a stand-in, h += h, as the broadcast add has no kernel (H.2 HP)
+    CE_REGION {   // + window term and b_x; a stand-in, h += h, as the broadcast add has no kernel (OP table H.2 HP)
         axpy_f16vecp_local_unrolled4(0x3C00u, X_BUF + S5_H, X_BUF + S5_H, S5_HX_N);
     }
-    CE_REGION {   // GELU phi, in place (H.3 GELU)
+    CE_REGION {   // GELU phi, in place (OP table H.3 GELU)
         gelu_f16(X_BUF + S5_H, S5_HX_N, cid, nt);
         flex_intra_cluster_sync();
     }
@@ -1312,19 +1312,19 @@ static __attribute__((noinline)) void compute_stage_5(uint32_t par, uint32_t ite
         __fp16 *out = X_BUF + S5_OUT + (CE_S5_DBUF ? ((item * CE_S5_TILES + t) & 1u) : 0u) * S5_OUT_N;
 #if !CE_S5_DBUF
         if (flex_is_dm_core()) {
-            CE_REGION {   // wait until the drain that reads the one buffer is done (H.5 OUT)
+            CE_REGION {   // wait until the drain that reads the one buffer is done (OP table H.5 OUT)
                 flex_dma_async_wait_all();
             }
         }
         flex_intra_cluster_sync();
 #endif
-        CE_REGION {   // output layer, one tile of h . W_h; Y: OUT (H.4 HO)
+        CE_REGION {   // output layer, one tile of h . W_h; Y: OUT (OP table H.4 HO)
             redmule_synch_parallel(X_BUF + S5_H + t * S5_TILE_X, W_BUF + S5_W_HO, out, S5_Y_M, CE_C_HID, CE_C_OUT,
                                    GEMM, false, 0);
             flex_intra_cluster_sync();
         }
         if (flex_is_dm_core()) {
-            CE_REGION {   // start this tile's drain to the north node; with two buffers, first wait for the drains before it (H.5 OUT)
+            CE_REGION {   // start this tile's drain to the north node; with two buffers, first wait for the drains before it (OP table H.5 OUT)
 #if CE_S5_DBUF
                 flex_dma_async_wait_all();
 #endif
@@ -1354,7 +1354,7 @@ int main(void)
     flex_global_barrier_xy();
     /* Fill both buffers with fp16 1.0 before timing, so no NaN or subnormal slows
      * the arithmetic; this also stands for the constants written once at start
-     * (1.cp, the global-probe rows of Q_g, K_g^T, V_g). Not timed. */
+     * (OP table 1.cp, the global-probe rows of Q_g, K_g^T, V_g). Not timed. */
     for (uint32_t i = mempool_get_core_id(); i < X_ELEMS + X_PAR_ELEMS; i += mempool_get_core_count()) X_BUF[i] = (__fp16)1.0f;
     for (uint32_t i = mempool_get_core_id(); i < W_ELEMS; i += mempool_get_core_count()) W_BUF[i] = (__fp16)1.0f;
     flex_intra_cluster_sync();
@@ -1390,7 +1390,7 @@ int main(void)
              * item's copy only for stages 2 and 3 (STAGE_SRC_PAR). */
             if (flex_is_dm_core()) {
                 if (stage == STAGE_5 && item == CE_N_ITER - 1u) {
-                    CE_REGION {   // the last item's last drain lands before the run ends (H.5 OUT)
+                    CE_REGION {   // the last item's last drain lands before the run ends (OP table H.5 OUT)
                         flex_dma_async_wait_all();
                     }
                 }

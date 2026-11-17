@@ -13,47 +13,42 @@
 // The arguments
 typedef struct {
   const __fp16 *span; // address of the q|k|v matrix: X_BUF + A{1,2}_QKV
-  uint32_t span_line; // step to the next line: 137 * 768
-  uint32_t span_step; // step to the next span: 768
-  const __fp16 *sum;  // address of the summary rows: span + 274 * 768
-  uint32_t sum_line;  // step to the next line: 12 * 768
-  uint32_t sum_step;  // step to the next window: 768
-  const __fp16 *lpr;  // address of the local probes: span + 322 * 768 in 2.4
-  uint32_t lpr_line;  // step to the next line: 12 * 768 in 2.4, 0 in 1.4
-  uint32_t lpr_step;  // step to the next window: 768 in 2.4, 0 in 1.4
-  uint32_t lpr_copy;  // step to the next group's copy: 1024 in 1.4, 0 in 2.4
+  uint32_t span_line; // step to the next line
+  uint32_t span_step; // step to the next span
+  const __fp16 *sum;  // address of the summary rows
+  uint32_t sum_line;  // step to the next line
+  uint32_t sum_step;  // step to the next window
+  const __fp16 *lpr;  // address of the local probes
+  uint32_t lpr_line;  // step to the next line, 0 in OP table 1.4
+  uint32_t lpr_step;  // step to the next window, 0 in OP table 1.4
+  uint32_t lpr_copy;  // step to the next group's copy, 0 in OP table 2.4
   const __fp16 *bias; // address of G, then delta: W_BUF + A{1,2}_W_LB
   __fp16 *a_span;     // out, span weights: X_BUF + A{1,2}_ASPAN
   __fp16 *a_hub;      // out, hub weights: X_BUF + A{1,2}_AHUB
-  uint32_t n_lines;   // lines: 2
-  uint32_t n_heads;   // heads: 2
-  uint32_t n_hub;     // hubs that query: 2 in 1.4 (S, L), 1 in 2.4 (S)
-  uint32_t n_span;    // spans in a line: 137
-  uint32_t win;       // spans in a window: 12
-  uint32_t d_model;   // model width: 256; k starts here in a row
-  uint32_t d_head;    // head width: 128
+  uint32_t n_lines;   // lines
+  uint32_t n_heads;   // heads
+  uint32_t n_hub;     // hubs that query: S, L in OP table 1.4, S in 2.4
+  uint32_t n_span;    // spans in a line
+  uint32_t win;       // spans in a window
+  uint32_t d_model;   // model width; k starts here in a row
+  uint32_t d_head;    // head width
 } lhsm_args_t;
 
 
 #define LHSM_LOG2E 0x3FB8AA3B // 1.44269504
 #define LHSM_TMIN 0xC2C80000  // -100: lower t, 2^t is far below any weight
-// 2^f, |f| <= 1/2, is the cubic c0 + c1 f + c2 f^2 + c3 f^3 of least relative
-// error (minimax: 7.5e-5). The asm takes it over c3, as ((f + A) f + B) f + C
-// with A = c2 / c3, B = c1 / c3, C = c0 / c3; the 1 / c3 cancels in the sum
+// 2^f, |f| <= 1/2, is the cubic c0 + c1 f + c2 f^2 + c3 f^3.
 #define LHSM_A 0x408CB763 // 4.39738607
 #define LHSM_B 0x41490C64 // 12.5655251
 #define LHSM_C 0x4190FDD5 // 18.1239414
 
 #define LHSM_DEAD (-1.0e30f)
 
-// LHSM_PIPELINED 1 (default): a hub row's logits in two software-pipelined
-// passes of 7, each key loaded a step before its use; 0: one pass over the 14
 #ifndef LHSM_PIPELINED
 #define LHSM_PIPELINED 1
 #endif
 
-// fp16 to fp32 in one instruction: MemPool's LLVM turns the C cast into a
-// library call
+// fp16 to fp32 
 static inline float lhsm_f32(const __fp16 *h) {
   const uint32_t b = *(const uint16_t *)h;
   float f;
@@ -86,8 +81,8 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
 
 #if LHSM_PIPELINED
   // two passes of 7 logits, spans 0 to 6, then spans 7 to 11, S and L: each
-  // key has its own register, loaded a step before its use, and the next word
-  // of q its own too
+  // key has its own register, loaded a step before its use
+
   // after span 6: back to span 0, one word on (pass A)
   int32_t back_a = 4 - 6 * step;
   // after span 11: back to span 7, one word on (pass B)
@@ -858,7 +853,7 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
 static inline __attribute__((always_inline)) void
 lhsm_span_batch(const lhsm_args_t *a, const __fp16 *lpr, uint32_t b,
                 uint32_t n_win) {
-  // heads (2), window (12), head width (128)
+  // heads, window, head width
   const uint32_t n_heads = a->n_heads, win = a->win, d = a->d_head;
   // t = (l * n_heads + h) * n_win + w
   const uint32_t t = b / 3;
@@ -866,17 +861,17 @@ lhsm_span_batch(const lhsm_args_t *a, const __fp16 *lpr, uint32_t b,
   const uint32_t part = b - 3 * t;
   // u = l * n_heads + h
   const uint32_t u = t / n_win;
-  // w: the window, 0 to 11
+  // w: the window
   const uint32_t w = t - u * n_win;
-  // l: the line, 0 or 1
+  // l: the line
   const uint32_t l = u / n_heads;
-  // h: the head, 0 or 1
+  // h: the head
   const uint32_t h = u - l * n_heads;
-  // live spans of the window: 12, 5 in the last one
+  // live spans of the window: win, fewer in the last one
   const uint32_t n_live = (w == n_win - 1) ? a->n_span - w * win : win;
   // the first row this batch stores
   const uint32_t i0 = 4 * part;
-  // part 2 of the short window: no rows
+  // a part past the short window's live spans: no rows
   if (i0 >= n_live) {
     return;
   }
@@ -889,7 +884,7 @@ lhsm_span_batch(const lhsm_args_t *a, const __fp16 *lpr, uint32_t b,
       a->span + l * a->span_line + (w * win + r0) * a->span_step;
   // the summary row S_w of line l
   const __fp16 *srow = a->sum + l * a->sum_line + w * a->sum_step;
-  // the local-probe row L_w (constant in 1.4)
+  // the local-probe row L_w (constant in OP table 1.4)
   const __fp16 *lrow = lpr + l * a->lpr_line + w * a->lpr_step;
   // G[h][0][0..2]: the biases of a span query
   const __fp16 *g = a->bias + h * (1 + a->n_hub) * 3;
@@ -913,19 +908,19 @@ lhsm_hub_row(const lhsm_args_t *a, const __fp16 *lpr, uint32_t r,
   const uint32_t eta = r - t * n_hub;
   // u = l * n_heads + h
   uint32_t u = t / n_win;
-  // w: the window, 0 to 11
+  // w: the window
   const uint32_t w = t - u * n_win;
-  // l: the line, 0 or 1
+  // l: the line
   const uint32_t l = u / n_heads;
-  // h: the head, 0 or 1
+  // h: the head
   const uint32_t h = u - l * n_heads;
-  // live spans: 12, 5 in the last window, which is padded to 12
+  // live spans: win, fewer in the last window, which is padded to win
   const uint32_t n_live = (w == n_win - 1) ? a->n_span - w * win : win;
   // where q and k of head h start in a row
   const uint32_t qo = h * d, ko = a->d_model + h * d;
   // the summary row S_w of line l
   const __fp16 *srow = a->sum + l * a->sum_line + w * a->sum_step;
-  // the local-probe row L_w (constant in 1.4)
+  // the local-probe row L_w (constant in OP table 1.4)
   const __fp16 *lrow = lpr + l * a->lpr_line + w * a->lpr_step;
   // the first span row of window w
   const __fp16 *span0 = a->span + l * a->span_line + w * win * a->span_step;
@@ -946,19 +941,19 @@ lhsm_hub_row(const lhsm_args_t *a, const __fp16 *lpr, uint32_t r,
 
 // ==== the kernel ==========================================================
 
-// Always inlined: with a static const a, as in the apps, every field is a
+// Always inlined: with a static const a, every field is a
 // constant in the code, and nothing is loaded from the struct (in L2)
 static inline __attribute__((always_inline)) void
 celere_lhsm_f16(const lhsm_args_t *a, uint32_t core_id,
                 uint32_t num_cores) {
-  // the local probes of this core's group: in 1.4 every core reads the same
-  // row, so the app keeps one copy of it in the banks of each group
+  // the local probes of this core's group: in OP table 1.4 every core reads
+  // the same row, so the app keeps one copy of it in the banks of each group
   const __fp16 *lpr = a->lpr + (core_id / NUM_CORES_PER_GROUP) * a->lpr_copy;
-  // windows a line, the short one too: 12
+  // windows a line, the short one too
   const uint32_t n_win = (a->n_span + a->win - 1) / a->win;
-  // hub rows: 96 in 1.4 (S, L), 48 in 2.4 (S)
+  // hub rows: one per line, head, window and querying hub
   const uint32_t n_hr = a->n_lines * a->n_heads * n_win * a->n_hub;
-  // span batches, 3 a window: 2 lines x 2 heads x 12 x 3 = 144, 4 empty
+  // span batches, 3 a window; those past the short window's spans are empty
   const uint32_t n_sb = a->n_lines * a->n_heads * n_win * 3;
   // more cores than hub rows, as in the app
   if (num_cores > n_hr) {
@@ -966,7 +961,7 @@ celere_lhsm_f16(const lhsm_args_t *a, uint32_t core_id,
     if (core_id < n_hr) {
       lhsm_hub_row(a, lpr, core_id, n_win);
     } else {
-      // the others (160 in 1.4, 208 in 2.4) take the span batches roundrobin
+      // the others take the span batches roundrobin
       for (uint32_t b = core_id - n_hr; b < n_sb; b += num_cores - n_hr) {
         lhsm_span_batch(a, lpr, b, n_win);
       }
