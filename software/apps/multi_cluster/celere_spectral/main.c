@@ -141,7 +141,7 @@
 #define CE_PE_FLOP_PER_CYCLE 280u
 #endif
 #ifndef CE_LHSM_STANDIN
-#define CE_LHSM_STANDIN 0      // 1: local_hub_softmax_f16 is a timed wait too
+#define CE_LHSM_STANDIN 0      // 1: celere_lhsm_f16 is a timed wait too
 #endif
 
 #ifndef CE_LHSM_FLOP_PER_LOGIT
@@ -164,6 +164,8 @@
 #define CE_MAX3(a, b, c)  CE_MAX(CE_MAX(a, b), c)
 #define CE_LINE           32u   // one 64 B DMA line, in fp16 elements
 #define CE_BYTES          2u    // fp16
+#define CE_BANK_ROW       (NUM_BANKS * 4u / CE_BYTES)   // 4,096: one word in every bank, 8 KiB, group 0's banks first; X_BUF and W_BUF start on one
+#define CE_GRP_COPY       (CE_BANK_ROW / NUM_GROUPS)    // 1,024: from one group's banks to the next, 2 KiB
 
 /* ==== the network: what the knobs imply ==================================== */
 
@@ -334,16 +336,17 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines"); // 
 #define A1_WOUT         (A1_U + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))           // output projection [352][256] (1.12, added into Z by 1.13)
 #define A1_END          (A1_WOUT + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))        // end of the stage 2 map
 /* W_BUF: each name is the start of a parameter region, in fp16 elements */
-/* W_BUF: [ LN | W_qkv | probe q|k|v | probe embeddings | cos, sin | B_g | G, delta | W_o ] */
+/* W_BUF: [ LN | W_qkv | probe q|k|v | probe embeddings | cos, sin | B_g | G, delta | W_o | Ll copies ] */
 #define A1_W_LN         0u                                        // layernorm gamma, beta (1.1)
 #define A1_W_QKV        (A1_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [256][768] (1.2)
-#define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // constant q|k|v of the probes: the Lg row, then the Ll row, a local key of 1.4 (1.cp)
+#define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // constant q|k|v of the probes: the Lg row, then the Ll row (1.cp)
 #define A1_W_PE         (A1_W_PQKV + CE_RUP(CE_W_PQKV, CE_LINE))  // probe embeddings: e_g, then e_l, copied into Z by 1.13 (1.cp)
 #define A1_W_ROPE       (A1_W_PE + CE_RUP(CE_W_PE, CE_LINE))      // cos, sin of the span rows; not read while the rotation is a stand-in (1.cr)
 #define A1_W_GB         (A1_W_ROPE + CE_RUP(CE_W_ROPE1, CE_LINE)) // global bias [h][152][152], the same for every line, pad keys at -inf (1.cg, read by 1.9a)
 #define A1_W_LB         (A1_W_GB + CE_RUP(CE_HEADS * A1_QR * E_KP, CE_LINE))     // local bias G [h][3][3], delta [h] (1.cl, read by 1.4)
 #define A1_W_WO         (A1_W_LB + CE_RUP(CE_W_LB1, CE_LINE))     // W_o, b_o (1.12)
-#define A1_W_END        (A1_W_WO + CE_RUP(CE_W_WO, CE_LINE))      // end of the stage 2 weights
+#define A1_W_LLC        CE_RUP(A1_W_WO + CE_RUP(CE_W_WO, CE_LINE), CE_BANK_ROW)   // the Ll row once per group, CE_GRP_COPY apart, on a row of banks: 1.4 reads the copy in its own group (1.cp)
+#define A1_W_END        (A1_W_LLC + CE_BANK_ROW)                  // end of the stage 2 weights
 
 /* stage 3 (attention stage 2). Each name is the start of a region, in fp16 elements.
  * X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | WO out ]
@@ -513,6 +516,7 @@ _Static_assert(S1_TT_N % 8u == 0u && E_ALL_N % 8u == 0u && E_RS_N % 8u == 0u && 
                && (CE_HEADS * A1_QR * E_KP) % 8u == 0u && (CE_HEADS * A2_QR * E_KP) % 8u == 0u,
                "axpy and gelu: length a multiple of 8");
 _Static_assert(S1_TOK_M < 65536u && S5_XR_M < 65536u, "RedMulE: M, N, P below 65,536");
+_Static_assert(CE_D_QKV <= CE_GRP_COPY, "1.4: a copy of the Ll row must stay in the banks of its group");
 
 /* the landing zones and what stays put */
 _Static_assert(CE_D_MODEL % CE_LINE == 0u, "a token row is not whole 64 B lines");
@@ -561,7 +565,7 @@ _Static_assert(N_CLUSTERS <= ARCH_NUM_CLUSTER, "the pipeline needs more clusters
 
 
 
-#include "baremetal/mempool_local_hub_softmax_f16.h"
+#include "baremetal/mempool_celere_lhsm_f16.h"
 
 /* CE_REGION { ... } marks a bench region: one row of a stage, or one copy.
  *
@@ -985,11 +989,11 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
     uint32_t nt  = mempool_get_core_count();   // cores per cluster
     __fp16 *z = X_BUF + par * X_ELEMS + A1_Z;  // this item's lattice
     /* 1.4 reads spans and summaries from the projection; the local probe is one
-     * constant row (1.cp), so its steps are 0 */
+     * constant row (1.cp), so its steps are 0, and each group reads its own copy */
     static const lhsm_args_t lhsm = {
         .span = X_BUF + A1_QKV,                       .span_line = CE_N_SPAN * CE_D_QKV, .span_step = CE_D_QKV,
         .sum  = X_BUF + A1_QKV + E_ROW_S * CE_D_QKV,  .sum_line  = CE_N_WIN * CE_D_QKV,  .sum_step  = CE_D_QKV,
-        .lpr  = W_BUF + A1_W_PQKV + CE_D_QKV,         .lpr_line  = 0u,                   .lpr_step  = 0u,
+        .lpr  = W_BUF + A1_W_LLC,                     .lpr_line  = 0u,                   .lpr_step  = 0u,       .lpr_copy = CE_GRP_COPY,
         .bias = W_BUF + A1_W_LB,
         .a_span = X_BUF + A1_ASPAN, .a_hub = X_BUF + A1_AHUB,
         .n_lines = E_LINES, .n_heads = CE_HEADS, .n_hub = A1_NHUB,
@@ -1043,7 +1047,7 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
                               E_PAIRS, CE_D_HEAD * E_KP);
     }
     CE_REGION {   // under the TEs: local logits on the unrotated q, k, + bias, softmax -> A_span, A_hub; no barrier (1.4 LHSM)
-        local_hub_softmax_f16(&lhsm, cid, nt);
+        celere_lhsm_f16(&lhsm, cid, nt);
     }
     CE_REGION {   // under the TEs: span v -> V_g [pair][152][128]; no barrier (1.7 VG)
         static const perm_level_t lv[] = {
@@ -1102,7 +1106,7 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
     static const lhsm_args_t lhsm = {
         .span = X_BUF + A2_QKV,                        .span_line = CE_N_SPAN * CE_D_QKV, .span_step = CE_D_QKV,
         .sum  = X_BUF + A2_QKV + E_ROW_S * CE_D_QKV,   .sum_line  = CE_N_WIN * CE_D_QKV,  .sum_step  = CE_D_QKV,
-        .lpr  = X_BUF + A2_QKV + E_ROW_LL * CE_D_QKV,  .lpr_line  = CE_N_WIN * CE_D_QKV,  .lpr_step  = CE_D_QKV,
+        .lpr  = X_BUF + A2_QKV + E_ROW_LL * CE_D_QKV,  .lpr_line  = CE_N_WIN * CE_D_QKV,  .lpr_step  = CE_D_QKV,  .lpr_copy = 0u,
         .bias = W_BUF + A2_W_LB,
         .a_span = X_BUF + A2_ASPAN, .a_hub = X_BUF + A2_AHUB,
         .n_lines = E_LINES, .n_heads = CE_HEADS, .n_hub = A2_NHUB,
@@ -1149,7 +1153,7 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
                               E_PAIRS, CE_D_HEAD * E_KP);
     }
     CE_REGION {   // local logits of the live pairs, + bias, softmax, while the TEs run; the summary is the only hub query; no barrier (2.4 LHSM)
-        local_hub_softmax_f16(&lhsm, cid, nt);
+        celere_lhsm_f16(&lhsm, cid, nt);
     }
     CE_REGION {   // gather v of spans and global probes into V_g, while the TEs run; no barrier (2.7 VG)
         static const perm_level_t lv[] = {
