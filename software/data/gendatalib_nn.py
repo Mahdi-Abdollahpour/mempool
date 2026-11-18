@@ -895,3 +895,32 @@ def generate_fcelere_lhsm(my_type=np.float16, defines={}):
 
     inputs = [qkv.reshape(-1), probe, biases[0], biases[1]]
     return [a.astype(my_type) for a in inputs] + out, defines
+
+
+# CELERE-Spectral's window term: celere_wterm_f16.
+def generate_fcelere_wterm(my_type=np.float16, defines={}):
+    """y[e][r] += ys[e][r // win][r % span] on one lane of the Doppler head
+    (_add_window_term in celere_spectral.py). l2_h is [y | ys], as h in the
+    app;
+    """
+    E = defines['wterm_EL']
+    P = defines['wterm_PRB']
+    W = defines['wterm_WIN']
+    G = defines['wterm_SPAN']
+    C = defines['wterm_C']
+    NS = -(-P // W) * G
+    defines['wterm_NSUM'] = NS
+
+    rng = np.random.default_rng(2611)   
+    y = rng.integers(-64, 64, (E, P, C)) / 16.0
+    ys = rng.integers(-64, 64, (E, NS, C)) / 16.0
+    r = np.arange(P)
+    gold = y + ys[:, r // W * G + r % G]
+
+    h = np.concatenate([y.ravel(), ys.ravel()])
+    h_gold = np.concatenate([gold.ravel(), ys.ravel()])
+    for a in (h, h_gold):
+        assert np.array_equal(a.astype(np.float16).astype(np.float64), a) \
+            and np.array_equal(np.array([float('%+.4f' % v) for v in a]), a), \
+            "fp16 or print round trip is not exact"
+    return [h.astype(my_type), h_gold.astype(my_type)], defines

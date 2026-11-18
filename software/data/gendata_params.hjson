@@ -656,6 +656,22 @@
     ]
   },
 
+  // CELERE-Spectral's window term, one lane of the Doppler head
+  "celere_wterm_f16": {
+    "type": "float16",
+    "defines": [
+      ("wterm_EL", 16)
+      ("wterm_PRB", 273)
+      ("wterm_WIN", 24)
+      ("wterm_SPAN", 2)
+      ("wterm_C", 64)
+    ]
+    "arrays": [
+      ("__fp16", "l2_h")
+      ("__fp16", "l2_gold")
+    ]
+  },
+
   "ofdm_f16": {
     "type": "float16",
     "defines": [

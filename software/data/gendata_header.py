@@ -263,6 +263,7 @@ if __name__ == '__main__':
         "permute_f16": {"func": datalib_nn.generate_fpermute},
         "pool_f16": {"func": datalib_nn.generate_fpool},
         "celere_lhsm_f16": {"func": datalib_nn.generate_fcelere_lhsm},
+        "celere_wterm_f16": {"func": datalib_nn.generate_fcelere_wterm},
         "transpose_f16": {"func": datalib_nn.generate_ftranspose},
         "ofdm_f16": {"func": datalib.generate_fofdm},
         "softmax_f8": {"func": datalib_nn.generate_fsoftmax},
