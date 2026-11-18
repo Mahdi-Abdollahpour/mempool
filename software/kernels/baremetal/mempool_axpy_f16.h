@@ -125,3 +125,60 @@ void axpy_f16vecp_local_unrolled4(uint32_t a, __fp16 *in_x, __fp16 *in_y,
 
   return;
 }
+
+/* Parallel axpy, in_y += a * in_x, with loads and stores only in local memory.
+ * with BANKING_FACTOR 8 and a Len that is a multiple of 2 * BANKING_FACTOR. */
+#if BANKING_FACTOR == 8
+void axpy_f16vecp_local_unrolled8(uint32_t a, __fp16 *in_x, __fp16 *in_y,
+                                  uint32_t Len) {
+
+  uint32_t core_id = mempool_get_core_id();
+
+  uint32_t aa = (a << 16U) | a;
+  v2h x01, x23, x45, x67, x89, xab, xcd, xef;
+  v2h y01, y23, y45, y67, y89, yab, ycd, yef;
+  for (uint32_t i = 2 * core_id * BANKING_FACTOR; i < Len; i += 2 * NUM_BANKS) {
+    x01 = (*(v2h *)&in_x[i]);
+    x23 = (*(v2h *)&in_x[i + 2]);
+    x45 = (*(v2h *)&in_x[i + 4]);
+    x67 = (*(v2h *)&in_x[i + 6]);
+    x89 = (*(v2h *)&in_x[i + 8]);
+    xab = (*(v2h *)&in_x[i + 10]);
+    xcd = (*(v2h *)&in_x[i + 12]);
+    xef = (*(v2h *)&in_x[i + 14]);
+    y01 = (*(v2h *)&in_y[i]);
+    y23 = (*(v2h *)&in_y[i + 2]);
+    y45 = (*(v2h *)&in_y[i + 4]);
+    y67 = (*(v2h *)&in_y[i + 6]);
+    y89 = (*(v2h *)&in_y[i + 8]);
+    yab = (*(v2h *)&in_y[i + 10]);
+    ycd = (*(v2h *)&in_y[i + 12]);
+    yef = (*(v2h *)&in_y[i + 14]);
+    asm volatile("vfmac.h %[y01], %[x01], %[aa];"
+                 "vfmac.h %[y23], %[x23], %[aa];"
+                 "vfmac.h %[y45], %[x45], %[aa];"
+                 "vfmac.h %[y67], %[x67], %[aa];"
+                 "vfmac.h %[y89], %[x89], %[aa];"
+                 "vfmac.h %[yab], %[xab], %[aa];"
+                 "vfmac.h %[ycd], %[xcd], %[aa];"
+                 "vfmac.h %[yef], %[xef], %[aa];"
+                 : [y01] "+&r"(y01), [y23] "+&r"(y23), [y45] "+&r"(y45),
+                   [y67] "+&r"(y67), [y89] "+&r"(y89), [yab] "+&r"(yab),
+                   [ycd] "+&r"(ycd), [yef] "+&r"(yef)
+                 : [x01] "r"(x01), [x23] "r"(x23), [x45] "r"(x45),
+                   [x67] "r"(x67), [x89] "r"(x89), [xab] "r"(xab),
+                   [xcd] "r"(xcd), [xef] "r"(xef), [aa] "r"(aa));
+    (*(v2h *)&in_y[i]) = y01;
+    (*(v2h *)&in_y[i + 2]) = y23;
+    (*(v2h *)&in_y[i + 4]) = y45;
+    (*(v2h *)&in_y[i + 6]) = y67;
+    (*(v2h *)&in_y[i + 8]) = y89;
+    (*(v2h *)&in_y[i + 10]) = yab;
+    (*(v2h *)&in_y[i + 12]) = ycd;
+    (*(v2h *)&in_y[i + 14]) = yef;
+  }
+  // mempool_log_barrier(2, core_id);
+
+  return;
+}
+#endif
