@@ -672,6 +672,57 @@
     ]
   },
 
+  // the fills of a GEMM output before its job: a bias row, as the OUT buffers of
+  // the Doppler head, and the window term over one lane's PRB rows
+  "celere_fill_f16": {
+    "type": "float16",
+    "defines": [
+      ("fill_W", 336)
+      ("fill_ROWS", 1092)
+      ("fill_OFF", 1024)
+      ("wterm_EL", 16)
+      ("wterm_PRB", 273)
+      ("wterm_WIN", 24)
+      ("wterm_SPAN", 2)
+      ("wterm_C", 64)
+    ]
+    "arrays": [
+      ("__fp16", "l2_b")
+      ("__fp16", "l2_b_gold")
+      ("__fp16", "l2_h")
+      ("__fp16", "l2_h_gold")
+    ]
+  },
+
+  // blocks repeated: case 1 a bias row over a GEMM output, as in
+  // celere_fill_f16, case 2 rows, case 3 a block of rows, case 4 small blocks,
+  // case 5 two rows over many rows
+  "repeat_f16": {
+    "type": "float16",
+    "defines": [
+      ("r1_N", 1)
+      ("r1_LEN", 336)
+      ("r1_REPS", 1092)
+      ("r1_OFF", 1024)
+      ("r2_N", 2)
+      ("r2_LEN", 256)
+      ("r2_REPS", 12)
+      ("r3_N", 1)
+      ("r3_LEN", 1008)
+      ("r3_REPS", 5)
+      ("r4_N", 1024)
+      ("r4_LEN", 16)
+      ("r4_REPS", 6)
+      ("r5_N", 2)
+      ("r5_LEN", 160)
+      ("r5_REPS", 160)
+    ]
+    "arrays": [
+      ("__fp16", "l2_buf")
+      ("__fp16", "l2_gold")
+    ]
+  },
+
   "ofdm_f16": {
     "type": "float16",
     "defines": [

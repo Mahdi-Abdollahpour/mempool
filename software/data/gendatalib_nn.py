@@ -924,3 +924,69 @@ def generate_fcelere_wterm(my_type=np.float16, defines={}):
             and np.array_equal(np.array([float('%+.4f' % v) for v in a]), a), \
             "fp16 or print round trip is not exact"
     return [h.astype(my_type), h_gold.astype(my_type)], defines
+
+
+# CELERE-Spectral's fills of a GEMM output: celere_fill_f16.
+def generate_fcelere_fill(my_type=np.float16, defines={}):
+    """The fills of a GEMM output before its job, which adds onto them. l2_b is
+    [pad | dst | row], dst at fill_OFF values from a row of banks, as the OUT
+    buffers of the Doppler head: dst[i] = row[i % fill_W] on fill_ROWS rows.
+    l2_h is [y | ys], as h in the app: y[e][r] = ys[e][r // win][r % span], the
+    window term of _add_window_term in celere_spectral.py, on one lane;
+    """
+    W = defines['fill_W']
+    R = defines['fill_ROWS']
+    OFF = defines['fill_OFF']
+    E = defines['wterm_EL']
+    P = defines['wterm_PRB']
+    WN = defines['wterm_WIN']
+    G = defines['wterm_SPAN']
+    C = defines['wterm_C']
+    NS = -(-P // WN) * G
+    defines['wterm_NSUM'] = NS
+
+    rng = np.random.default_rng(2611)
+    b = rng.integers(-64, 64, OFF + R * W + W) / 16.0
+    b_gold = b.copy()
+    b_gold[OFF:OFF + R * W] = np.tile(b[OFF + R * W:], R)
+    y = rng.integers(-64, 64, (E, P, C)) / 16.0
+    ys = rng.integers(-64, 64, (E, NS, C)) / 16.0
+    r = np.arange(P)
+    h = np.concatenate([y.ravel(), ys.ravel()])
+    h_gold = np.concatenate([ys[:, r // WN * G + r % G].ravel(), ys.ravel()])
+    for a in (b, b_gold, h, h_gold):
+        assert np.array_equal(a.astype(np.float16).astype(np.float64), a) \
+            and np.array_equal(np.array([float('%+.4f' % v) for v in a]), a), \
+            "fp16 or print round trip is not exact"
+    return [b.astype(my_type), b_gold.astype(my_type), h.astype(my_type),
+            h_gold.astype(my_type)], defines
+
+
+# Blocks repeated: repeat_f16.
+def generate_frepeat(my_type=np.float16, defines={}):
+    """Case k repeats each of its rk_N blocks of rk_LEN values rk_REPS times in
+    a row, np.repeat on axis 0.
+    l2_buf holds every case as [dst | src], case 1's dst r1_OFF
+    """
+    rng = np.random.default_rng(2611)
+    pos = defines['r1_OFF']
+    buf = [rng.integers(-64, 64, pos) / 16.0]
+    gold = [buf[0]]
+    for k in range(1, 6):
+        N, L, R = (defines['r%d_%s' % (k, x)] for x in ('N', 'LEN', 'REPS'))
+        src = rng.integers(-64, 64, (N, L)) / 16.0
+        dst = rng.integers(-64, 64, N * R * L) / 16.0
+        res = np.repeat(src, R, axis=0)
+        assert np.array_equal(res.ravel(), np.tile(src, (1, R)).ravel())
+        defines['r%d_DST' % k] = pos
+        defines['r%d_SRC' % k] = pos + N * R * L
+        pos += N * R * L + N * L
+        buf += [dst, src.ravel()]
+        gold += [res.ravel(), src.ravel()]
+    defines['BUF_N'] = pos
+    buf, gold = np.concatenate(buf), np.concatenate(gold)
+    for a in (buf, gold):
+        assert np.array_equal(a.astype(np.float16).astype(np.float64), a) \
+            and np.array_equal(np.array([float('%+.4f' % v) for v in a]), a), \
+            "fp16 or print round trip is not exact"
+    return [buf.astype(my_type), gold.astype(my_type)], defines
