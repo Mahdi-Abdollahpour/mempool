@@ -401,6 +401,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define S5_W_HS         (S5_W_HX + CE_RUP(CE_W_HX, CE_LINE))      // W_s [CE_RUN][CE_C_HID]: hidden layer of the summary rows, the window term (OP table H.1)
 #define S5_W_HO         (S5_W_HS + CE_RUP(CE_W_HS, CE_LINE))      // W_h [CE_C_HID][CE_C_OUT], b_h: the output layer (OP table H.4)
 #define S5_W_END        (S5_W_HO + CE_RUP(CE_W_HO, CE_LINE))      // end of the stage 5 weights
+// TODO: b_x and b_h once per group, as the Ll row, so the copy/repeat kernel read them in their own group
 #define S5_B_X          (S5_W_HX + CE_RUN * CE_C_HID)             // b_x, after W_x: y^s starts from it (OP table H.c)
 #define S5_B_H          (S5_W_HO + CE_C_HID * CE_C_OUT)           // b_h, after W_h: each OUT buffer starts from it (OP table H.c)
 // ==== the two buffers ========================================================
@@ -518,8 +519,8 @@ _Static_assert(N_CLUSTERS <= ARCH_NUM_CLUSTER, "the pipeline needs more clusters
 
 
 #include "baremetal/mempool_celere_lhsm_f16.h"
-#include "baremetal/mempool_celere_wterm_f16.h"
-#include "baremetal/mempool_celere_fill_rows_f16.h"
+#include "baremetal/mempool_celere_fill_f16.h"
+#include "baremetal/mempool_repeat_f16.h"
 
 // CE_REGION { ... } marks a benchmarck region
 // set CE_BENCH=1 
@@ -1143,7 +1144,7 @@ static __attribute__((noinline)) void compute_stage_5(uint32_t par, uint32_t ite
         redmule_synch_parallel(x + S5_XR_M * CE_RUN, W_BUF + S5_W_HS, ys, S5_XS_M, CE_RUN, CE_C_HID, GEMM, false, 0);
     }
     CE_REGION {   // OP table H.2 HP
-        celere_wterm_f16(ys, X_BUF + S5_H, S5_EL, CE_N_PRB, CE_WIN_SPANS * CE_SPAN_PRBS, CE_SPAN_PRBS, CE_C_HID);
+        celere_fill_wterm_f16(ys, X_BUF + S5_H, S5_EL, CE_N_PRB, CE_WIN_SPANS * CE_SPAN_PRBS, CE_SPAN_PRBS, CE_C_HID);
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table H.1 HXS
@@ -1151,7 +1152,7 @@ static __attribute__((noinline)) void compute_stage_5(uint32_t par, uint32_t ite
     }
 #if CE_S5_DBUF
     CE_REGION {   // OP table H.4 HO
-        celere_fill_rows_f16(X_BUF + S5_OUT + ((item * CE_S5_TILES) & 1u) * S5_OUT_N, W_BUF + S5_B_H, CE_C_OUT, S5_Y_ROWS);
+        repeat_f16p_local(W_BUF + S5_B_H, X_BUF + S5_OUT + ((item * CE_S5_TILES) & 1u) * S5_OUT_N, 1u, CE_C_OUT, S5_Y_ROWS, cid);
     }
 #endif
     CE_REGION {   // OP table H.1 HXS
@@ -1176,7 +1177,7 @@ static __attribute__((noinline)) void compute_stage_5(uint32_t par, uint32_t ite
         }
         flex_intra_cluster_sync();
         CE_REGION {   // OP table H.4 HO
-            celere_fill_rows_f16(out, W_BUF + S5_B_H, CE_C_OUT, S5_Y_ROWS);
+            repeat_f16p_local(W_BUF + S5_B_H, out, 1u, CE_C_OUT, S5_Y_ROWS, cid);
             flex_intra_cluster_sync();
         }
 #endif
@@ -1197,15 +1198,15 @@ static __attribute__((noinline)) void compute_stage_5(uint32_t par, uint32_t ite
             if (t + 1u < CE_S5_TILES) {
                 while (go[(cid & ~(NUM_CORES_PER_TILE - 1u)) * BANKING_FACTOR] != g + 1u)
                     mempool_wait(64);
-                celere_fill_rows_f16(X_BUF + S5_OUT + ((g + 1u) & 1u) * S5_OUT_N, W_BUF + S5_B_H, CE_C_OUT, S5_Y_ROWS);
+                repeat_f16p_local(W_BUF + S5_B_H, X_BUF + S5_OUT + ((g + 1u) & 1u) * S5_OUT_N, 1u, CE_C_OUT, S5_Y_ROWS, cid);
             } else {
-                celere_fill_rows_f16(ys, W_BUF + S5_B_X, CE_C_HID, S5_XS_M);
+                repeat_f16p_local(W_BUF + S5_B_X, ys, 1u, CE_C_HID, S5_XS_M, cid);
             }
         }
 #else
         if (t + 1u == CE_S5_TILES) {
             CE_REGION {   // OP table H.1 HXS
-                celere_fill_rows_f16(ys, W_BUF + S5_B_X, CE_C_HID, S5_XS_M);
+                repeat_f16p_local(W_BUF + S5_B_X, ys, 1u, CE_C_HID, S5_XS_M, cid);
             }
         }
 #endif
@@ -1240,7 +1241,7 @@ int main(void)
     flex_intra_cluster_sync();
     if (stage == STAGE_5) {
         // b_x into y^s for the first item; later items get it under the last tile of the item before
-        celere_fill_rows_f16(X_BUF + S5_H + S5_HX_N, W_BUF + S5_B_X, CE_C_HID, S5_XS_M);
+        repeat_f16p_local(W_BUF + S5_B_X, X_BUF + S5_H + S5_HX_N, 1u, CE_C_HID, S5_XS_M, mempool_get_core_id());
         flex_intra_cluster_sync();
     }
     if (flex_get_core_id() == 0 && cid == 0) flex_timer_start();
