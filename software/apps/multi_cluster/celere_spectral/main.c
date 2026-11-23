@@ -1067,7 +1067,7 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
 }
 
 // Stage 4, FFN and patch decoder (OP table rows D.1 to D.9)
-static __attribute__((noinline)) void compute_stage_4(uint32_t par)
+static __attribute__((noinline)) void compute_stage_4(uint32_t par, uint32_t lane)
 {
     uint32_t cid = mempool_get_core_id();
     uint32_t nt  = mempool_get_core_count();
@@ -1076,6 +1076,8 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par)
         layernorm_parallel_2x4_f16vec(z, X_BUF + S4_H, S4_ROWS, CE_D_MODEL, cid, nt);
         flex_intra_cluster_sync();
     }
+    if (flex_is_dm_core())   // OP table D.6 BASE, under D.2
+        lpddr_pull(STAGE_4, lane, (uint64_t)(uintptr_t)X_BUF);
     CE_REGION {   // OP table D.2 FF1
         redmule_synch_parallel(X_BUF + S4_H, W_BUF + S4_W_FF1, X_BUF + S4_F1, S4_M, CE_D_MODEL, CE_FFN, GEMM, false, 0);
     }
@@ -1089,8 +1091,6 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par)
     CE_REGION {   // OP table D.5 RES
         axpy_f16vecp_local_unrolled8(0x3C00u, z, X_BUF + S4_F2, S4_Z_N);
         flex_intra_cluster_sync();
-    }
-    CE_REGION {   // OP table D.6 BASE
     }
     CE_REGION {   // OP table D.7 DEC
         redmule_synch_parallel(X_BUF + S4_F2, W_BUF + S4_W_DEC, X_BUF + S4_D, S4_M, CE_D_MODEL, CE_C, GEMM, false, 0);
@@ -1251,15 +1251,11 @@ int main(void)
         uint32_t item   = step - phase;     
         uint32_t par    = item & 1u;        // parity
         if (active) {
-
-            if (flex_is_dm_core())
-                lpddr_pull(stage, lane, (uint64_t)(uintptr_t)X_BUF);
-            flex_intra_cluster_sync();   // wait for the LPDDR load
             switch (stage) {
             case STAGE_1: compute_stage_1(par, lane); break;
             case STAGE_2: compute_stage_2(par); break;
             case STAGE_3: compute_stage_3(par); break;
-            case STAGE_4: compute_stage_4(par); break;
+            case STAGE_4: compute_stage_4(par, lane); break;
             case STAGE_5: compute_stage_5(par, item); break;
             default: break;
             }
