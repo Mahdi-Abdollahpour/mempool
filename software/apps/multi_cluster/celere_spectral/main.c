@@ -364,7 +364,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define S4_XB           (S4_Z + CE_RUP(S4_Z_N, CE_LINE))          // the decoder residual BASE = [X | S], X first (OP table D.6)
 #define S4_WIN          (S4_XB + S4_XB_N)                         // S, right after X, so BASE is one tensor (OP table D.6)
 #define S4_H            (S4_WIN + CE_RUP(S4_WIN_N, CE_LINE))      // layernorm output H [S4_M][CE_D_MODEL] (OP table D.1, read by D.2)
-#define S4_F1           (S4_H + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))       // FFN hidden [S4_M][CE_FFN], GELU in place (OP table D.2, D.3, read by D.4)
+#define S4_F1           CE_RUP(S4_H + S4_M * CE_D_MODEL, CE_BANK_ROW)     // FFN hidden [S4_M][CE_FFN], GELU in place, on a row of banks so D.3 stays local (OP table D.2, D.3, read by D.4)
 #define S4_F2           (S4_F1 + CE_RUP(S4_M * CE_FFN, CE_LINE))          // FFN output [S4_M][CE_D_MODEL], + Z in place (OP table D.4, D.5, read by D.7)
 #define S4_D            (S4_F2 + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))      // decoded patches [S4_M][CE_C], + BASE in place (OP table D.7, D.8, read by D.9)
 #define S4_BLK          (S4_D + CE_RUP(S4_M * CE_C, CE_LINE))             // head input, PRB rows [antenna element][CE_N_PRB][CE_RUN] (OP table D.9, sent by D.10)
@@ -411,6 +411,7 @@ enum { CE_W_ELEMS = CE_RUP(CE_MAX3(CE_MAX(S1_W_END, A1_W_END), CE_MAX(A2_W_END, 
                            CE_LINE) };
 // ==== LPDDR ===================================================================
 // Offsets inside one node. South node j: [ model input | summary patches ] 
+// TODO: F.6 writes over patches D.6 has not read yet; give each item its own slot
 #define LP_IN_OFF       0u                                       // start of the model input in a south node, and of the span patches written over it
 #define LP_IN_B         (CE_IN_ALL * CE_BYTES / CE_LPDDR_SOUTH)  // the node's share of the model input (OP table F.1); then the span patches of its lines, written over it (F.6, read by D.6)
 #define LP_WIN_OFF      CE_RUP(LP_IN_OFF + LP_IN_B, 64u)         // the summary patches, right after the input, on a DMA line
@@ -1077,7 +1078,6 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par)
     }
     CE_REGION {   // OP table D.2 FF1
         redmule_synch_parallel(X_BUF + S4_H, W_BUF + S4_W_FF1, X_BUF + S4_F1, S4_M, CE_D_MODEL, CE_FFN, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table D.3 GELU
         gelu_f16(X_BUF + S4_F1, S4_ROWS * CE_FFN, cid, nt);
@@ -1085,7 +1085,6 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par)
     }
     CE_REGION {   // OP table D.4 FF2
         redmule_synch_parallel(X_BUF + S4_F1, W_BUF + S4_W_FF2, X_BUF + S4_F2, S4_M, CE_FFN, CE_D_MODEL, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table D.5 RES
         axpy_f16vecp_local_unrolled8(0x3C00u, z, X_BUF + S4_F2, S4_Z_N);
@@ -1095,7 +1094,6 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par)
     }
     CE_REGION {   // OP table D.7 DEC
         redmule_synch_parallel(X_BUF + S4_F2, W_BUF + S4_W_DEC, X_BUF + S4_D, S4_M, CE_D_MODEL, CE_C, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table D.8 RES2
         axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + S4_XB, X_BUF + S4_D, S4_BASE_N);
