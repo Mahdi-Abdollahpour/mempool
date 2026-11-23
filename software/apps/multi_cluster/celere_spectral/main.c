@@ -243,7 +243,6 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define S1_TOK          (S1_XR_ROWS + S1_XS_ROWS)                 // tokens: span and summary patches
 #define S1_TOK_M        CE_RUP(S1_TOK, NUM_REDMULE_TILES)         // GEMM rows of the embedding (OP table F.4)
 #define S1_WIN_N        (S1_XS_ROWS * CE_C)                       // elements of the summary patches
-#define S1_TT_N         (S1_TOK * CE_D_MODEL)                     // elements of all tokens (OP table F.5)
 // X_BUF: [ IN | X: span patches, summary patches | Z: span tokens, summary tokens ]
 #define S1_IN           0u                                        // start of the model input of this lane (OP table F.1)
 #define S1_X            (S1_IN + CE_RUP(S1_IN_N, CE_LINE))        // the patch matrix [span | summary] (OP table F.2, F.3)
@@ -471,7 +470,7 @@ _Static_assert(A1_QR >= CE_LG && A2_QR >= CE_N_SPAN && E_KP >= CE_LG, "global pa
 _Static_assert(E_RS_ROWS % 2u == 0u && E_ALL_ROWS % 2u == 0u && S4_ROWS % 2u == 0u, "layernorm: M must be even");
 _Static_assert(CE_D_MODEL % 4u == 0u && E_KP % 4u == 0u, "layernorm, softmax: row length a multiple of 4");
 _Static_assert((E_PAIRS * A1_QR) % 2u == 0u && (E_PAIRS * A2_QR) % 2u == 0u, "softmax: M must be even");
-_Static_assert(S1_TT_N % 16u == 0u && E_ALL_N % 16u == 0u && E_RS_N % 16u == 0u
+_Static_assert(E_ALL_N % 16u == 0u && E_RS_N % 16u == 0u
                && S4_BASE_N % 16u == 0u && (S4_ROWS * CE_FFN) % 16u == 0u && S5_HX_N % 16u == 0u
                && (CE_HEADS * A1_QR * E_KP) % 16u == 0u && (CE_HEADS * A2_QR * E_KP) % 16u == 0u,
                "axpy and gelu: length a multiple of 16, whole slices");
@@ -483,6 +482,8 @@ _Static_assert(CE_C_OUT % 16u == 0u && S5_OUT % 16u == 0u && S5_OUT_N % 16u == 0
                && S5_B_X % 2u == 0u && S5_B_H % 2u == 0u, "H.1, H.4: the bias fills write whole slices");
 _Static_assert(CE_FFN % 16u == 0u && CE_C % 16u == 0u && S4_B_1 % 2u == 0u && S4_B_DEC % 2u == 0u,
                "D.2, D.7: the bias fills write whole slices");
+_Static_assert(CE_D_MODEL % 16u == 0u && S1_Z % 16u == 0u && S1_W_TT % 2u == 0u,
+               "F.5: the bias fills write whole slices");
 _Static_assert(A1_QKV % 16u == 0u && A1_SG % 16u == 0u && A1_UG % 16u == 0u
                && A2_QKV % 16u == 0u && A2_SG % 16u == 0u && A2_UG % 16u == 0u
                && A1_W_GB % 2u == 0u && A2_W_GB % 2u == 0u && A1_B_O % 2u == 0u && A2_B_O % 2u == 0u,
@@ -839,7 +840,7 @@ static inline void probe_reset(__fp16 *dst, const __fp16 *e, uint32_t cid, uint3
 // ==== per-cluster compute: one function per stage ============================
 
 
-// Stage 1, front end: patches, summary patches, embedding and LPDDR transfers.
+// Stage 1,
 static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lane)
 {
     (void)par;   // stage 1 reads from LPDDR: no twin
@@ -851,6 +852,12 @@ static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lan
     if (flex_is_dm_core())   // OP table F.1 IN
         for (uint32_t n = 0; n < S1_NODES; n++)
             dma_2d((uint64_t)(uintptr_t)(X_BUF + S1_IN) + n * LP_IN_B, hbm_south(node + n, LP_IN_OFF), LP_IN_B);
+
+    CE_REGION {   // OP table F.5 TT
+        // under F.1: the tokens start from b_e + t_R and b_e + t_S (already in l1 W_buff), and F.4 adds onto them
+        repeat_f16p_local(W_BUF + S1_W_TT, X_BUF + S1_Z, 1u, CE_D_MODEL, S1_XR_ROWS, cid);
+        repeat_f16p_local(W_BUF + S1_W_TT + CE_D_MODEL, X_BUF + S1_ZS, 1u, CE_D_MODEL, S1_TOK_M - S1_XR_ROWS, cid);
+    }
     flex_intra_cluster_sync();   // the other cores waits for the input
 
 
@@ -886,12 +893,6 @@ static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lan
 
     CE_REGION {   // OP table F.4 EMB
         redmule_synch_parallel(X_BUF + S1_X, W_BUF + S1_W_EMB, X_BUF + S1_Z, S1_TOK_M, CE_C, CE_D_MODEL, GEMM, false, 0);
-        flex_intra_cluster_sync();
-    }
-
-    CE_REGION {   // OP table F.5 TT
-        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + S1_X, X_BUF + S1_Z, S1_TT_N);
-        flex_intra_cluster_sync();
     }
 }
 
