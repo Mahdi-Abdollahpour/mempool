@@ -35,6 +35,8 @@ typedef struct {
 } lhsm_args_t;
 
 
+// VFEXP, off by default: the softmax takes exp from vfexp.h (exp of each fp16
+// lane) instead of 2^n times a cubic. The constants below are for the cubic
 #define LHSM_LOG2E 0x3FB8AA3B // 1.44269504
 #define LHSM_TMIN 0xC2C80000  // -100: lower t, 2^t is far below any weight
 // 2^f, |f| <= 1/2, is the cubic c0 + c1 f + c2 f^2 + c3 f^3.
@@ -44,6 +46,7 @@ typedef struct {
 
 #define LHSM_DEAD (-1.0e30f)
 
+// 1 (the default); 0: the plain loops
 #ifndef LHSM_PIPELINED
 #define LHSM_PIPELINED 1
 #endif
@@ -59,11 +62,11 @@ static inline float lhsm_f32(const __fp16 *h) {
 
 
 // one hub query: its 14 logits, then their softmax, stored at o as 7 fp16 pairs
-static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
-                                    int32_t step, const __fp16 *ks,
-                                    const __fp16 *kl, uint32_t d,
-                                    uint32_t n_live, float gs, float g1,
-                                    float g2, uint16_t *o) {
+// (the words of q and the keys from w0 to the end, then from 0 to w0)
+static inline __attribute__((always_inline)) void
+lhsm_hub_weights(const __fp16 *q, const __fp16 *k, int32_t step,
+                 const __fp16 *ks, const __fp16 *kl, uint32_t d, uint32_t w0,
+                 uint32_t n_live, float gs, float g1, float g2, uint16_t *o) {
   // start at biases
   float s0 = gs;
   float s1 = (n_live > 1) ? gs : LHSM_DEAD;
@@ -83,214 +86,307 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
   // two passes of 7 logits, spans 0 to 6, then spans 7 to 11, S and L: each
   // key has its own register, loaded a step before its use
 
-  // after span 6: back to span 0, one word on (pass A)
+  // after span 6: back to span 0, + a word  (pass A)
   int32_t back_a = 4 - 6 * step;
-  // after span 11: back to span 7, one word on (pass B)
+  // after span 11: back to span 7, + a word (pass B)
   int32_t back_b = 4 - 4 * step;
   // span 7, where pass B starts
-  const __fp16 *k7 = k + 7 * (step / 2);
-  // the rounds stop at the last word but one, two steps finish a pass (d: a
-  // multiple of 4, at least 8)
-  const __fp16 *const end = q + d - 2;
-  // two words of q; p walks q
+  const __fp16 *const k7 = k + 7 * (step / 2);
+  // two words of q
   uint32_t qa, qb;
-  const __fp16 *p = q;
 
-  asm volatile(                   // pass A: spans 0 to 6
-      "p.lw %[qa], 4(%[p]!);"     // q, word 0
-      "p.lw x5, %[step](%[k]!);"  // span 0
-      "p.lw x6, %[step](%[k]!);"  // span 1
-      "p.lw x7, %[step](%[k]!);"  // span 2
-      "p.lw x28, %[step](%[k]!);" // span 3
-      "p.lw x29, %[step](%[k]!);" // span 4
-      "p.lw x30, %[step](%[k]!);" // span 5
-      "p.lw x31, %[back](%[k]!);" // span 6, then back to span 0, one word on
-      ".balign 32;"
-      "1:"                    // two steps a round
-      "p.lw %[qb], 4(%[p]!);" // next word of q
-      "vfdotpex.s.h %[s0], %[qa], x5;"
-      "p.lw x5, %[step](%[k]!);" // span 0, next word
-      "vfdotpex.s.h %[s1], %[qa], x6;"
-      "p.lw x6, %[step](%[k]!);"
-      "vfdotpex.s.h %[s2], %[qa], x7;"
-      "p.lw x7, %[step](%[k]!);"
-      "vfdotpex.s.h %[s3], %[qa], x28;"
-      "p.lw x28, %[step](%[k]!);"
-      "vfdotpex.s.h %[s4], %[qa], x29;"
-      "p.lw x29, %[step](%[k]!);"
-      "vfdotpex.s.h %[s5], %[qa], x30;"
-      "p.lw x30, %[step](%[k]!);"
-      "vfdotpex.s.h %[s6], %[qa], x31;"
-      "p.lw x31, %[back](%[k]!);"
-      "p.lw %[qa], 4(%[p]!);" // the word after
-      "vfdotpex.s.h %[s0], %[qb], x5;"
-      "p.lw x5, %[step](%[k]!);"
-      "vfdotpex.s.h %[s1], %[qb], x6;"
-      "p.lw x6, %[step](%[k]!);"
-      "vfdotpex.s.h %[s2], %[qb], x7;"
-      "p.lw x7, %[step](%[k]!);"
-      "vfdotpex.s.h %[s3], %[qb], x28;"
-      "p.lw x28, %[step](%[k]!);"
-      "vfdotpex.s.h %[s4], %[qb], x29;"
-      "p.lw x29, %[step](%[k]!);"
-      "vfdotpex.s.h %[s5], %[qb], x30;"
-      "p.lw x30, %[step](%[k]!);"
-      "vfdotpex.s.h %[s6], %[qb], x31;"
-      "p.lw x31, %[back](%[k]!);"
-      "bne %[p], %[end], 1b;"
-      // the last two steps
-      "p.lw %[qb], 4(%[p]!);"
-      "vfdotpex.s.h %[s0], %[qa], x5;"
-      "p.lw x5, %[step](%[k]!);"
-      "vfdotpex.s.h %[s1], %[qa], x6;"
-      "p.lw x6, %[step](%[k]!);"
-      "vfdotpex.s.h %[s2], %[qa], x7;"
-      "p.lw x7, %[step](%[k]!);"
-      "vfdotpex.s.h %[s3], %[qa], x28;"
-      "p.lw x28, %[step](%[k]!);"
-      "vfdotpex.s.h %[s4], %[qa], x29;"
-      "p.lw x29, %[step](%[k]!);"
-      "vfdotpex.s.h %[s5], %[qa], x30;"
-      "p.lw x30, %[step](%[k]!);"
-      "vfdotpex.s.h %[s6], %[qa], x31;"
-      "p.lw x31, %[step](%[k]!);"
-      "vfdotpex.s.h %[s0], %[qb], x5;"
-      "vfdotpex.s.h %[s1], %[qb], x6;"
-      "vfdotpex.s.h %[s2], %[qb], x7;"
-      "vfdotpex.s.h %[s3], %[qb], x28;"
-      "vfdotpex.s.h %[s4], %[qb], x29;"
-      "vfdotpex.s.h %[s5], %[qb], x30;"
-      "vfdotpex.s.h %[s6], %[qb], x31;"
-      : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
-        [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [p] "+&r"(p),
-        [k] "+&r"(k), [qa] "=&r"(qa), [qb] "=&r"(qb)
-      : [step] "r"(step), [back] "r"(back_a), [end] "r"(end)
-      : "x5", "x6", "x7", "x28", "x29", "x30", "x31", "memory");
-
-  p = q;
-  asm volatile(                    // pass B: spans 7 to 11, S and L
-      "p.lw %[qa], 4(%[p]!);"      // q, word 0
-      "p.lw x5, %[step](%[k7]!);"  // span 7
-      "p.lw x6, %[step](%[k7]!);"  // span 8
-      "p.lw x7, %[step](%[k7]!);"  // span 9
-      "p.lw x28, %[step](%[k7]!);" // span 10
-      "p.lw x29, %[back](%[k7]!);" // span 11, then back to span 7, one word on
-      "p.lw x30, 4(%[ks]!);"       // S
-      "p.lw x31, 4(%[kl]!);"       // L
-      ".balign 32;"
-      "1:"                    // two steps a round
-      "p.lw %[qb], 4(%[p]!);" // next word of q
-      "vfdotpex.s.h %[s7], %[qa], x5;"
-      "p.lw x5, %[step](%[k7]!);" // span 7, next word
-      "vfdotpex.s.h %[s8], %[qa], x6;"
-      "p.lw x6, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s9], %[qa], x7;"
-      "p.lw x7, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s10], %[qa], x28;"
-      "p.lw x28, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s11], %[qa], x29;"
-      "p.lw x29, %[back](%[k7]!);"
-      "vfdotpex.s.h %[s12], %[qa], x30;"
-      "p.lw x30, 4(%[ks]!);"
-      "vfdotpex.s.h %[s13], %[qa], x31;"
-      "p.lw x31, 4(%[kl]!);"
-      "p.lw %[qa], 4(%[p]!);" // the word after
-      "vfdotpex.s.h %[s7], %[qb], x5;"
-      "p.lw x5, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s8], %[qb], x6;"
-      "p.lw x6, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s9], %[qb], x7;"
-      "p.lw x7, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s10], %[qb], x28;"
-      "p.lw x28, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s11], %[qb], x29;"
-      "p.lw x29, %[back](%[k7]!);"
-      "vfdotpex.s.h %[s12], %[qb], x30;"
-      "p.lw x30, 4(%[ks]!);"
-      "vfdotpex.s.h %[s13], %[qb], x31;"
-      "p.lw x31, 4(%[kl]!);"
-      "bne %[p], %[end], 1b;"
-      // the last two steps
-      "p.lw %[qb], 4(%[p]!);"
-      "vfdotpex.s.h %[s7], %[qa], x5;"
-      "p.lw x5, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s8], %[qa], x6;"
-      "p.lw x6, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s9], %[qa], x7;"
-      "p.lw x7, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s10], %[qa], x28;"
-      "p.lw x28, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s11], %[qa], x29;"
-      "p.lw x29, %[step](%[k7]!);"
-      "vfdotpex.s.h %[s12], %[qa], x30;"
-      "p.lw x30, 4(%[ks]!);"
-      "vfdotpex.s.h %[s13], %[qa], x31;"
-      "p.lw x31, 4(%[kl]!);"
-      "vfdotpex.s.h %[s7], %[qb], x5;"
-      "vfdotpex.s.h %[s8], %[qb], x6;"
-      "vfdotpex.s.h %[s9], %[qb], x7;"
-      "vfdotpex.s.h %[s10], %[qb], x28;"
-      "vfdotpex.s.h %[s11], %[qb], x29;"
-      "vfdotpex.s.h %[s12], %[qb], x30;"
-      "vfdotpex.s.h %[s13], %[qb], x31;"
-      : [s7] "+&r"(s7), [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10),
-        [s11] "+&r"(s11), [s12] "+&r"(s12), [s13] "+&r"(s13), [p] "+&r"(p),
-        [k7] "+&r"(k7), [ks] "+&r"(ks), [kl] "+&r"(kl), [qa] "=&r"(qa),
-        [qb] "=&r"(qb)
-      : [step] "r"(step), [back] "r"(back_b), [end] "r"(end)
-      : "x5", "x6", "x7", "x28", "x29", "x30", "x31", "memory");
+  // not unrolled, so the loop asm stays in one copy
+#pragma clang loop unroll(disable)
+  for (uint32_t a = w0, b = d / 2; a != b; b = a, a = 0) {
+    // p walks q
+    const __fp16 *p = q + 2 * a, *ka = k + 2 * a;
+    const __fp16 *const end = q + 2 * b - 2;
+    asm volatile(                   // pass A: spans 0 to 6
+        "p.lw %[qa], 4(%[p]!);"     // q, word 0
+        "p.lw x5, %[step](%[k]!);"  // span 0
+        "p.lw x6, %[step](%[k]!);"  // span 1
+        "p.lw x7, %[step](%[k]!);"  // span 2
+        "p.lw x28, %[step](%[k]!);" // span 3
+        "p.lw x29, %[step](%[k]!);" // span 4
+        "p.lw x30, %[step](%[k]!);" // span 5
+        "p.lw x31, %[back](%[k]!);" // span 6, then back to span 0, one word on
+        ".balign 32;"
+        "1:"                    // two steps a round
+        "p.lw %[qb], 4(%[p]!);" // next word of q
+        "vfdotpex.s.h %[s0], %[qa], x5;"
+        "p.lw x5, %[step](%[k]!);" // span 0, next word
+        "vfdotpex.s.h %[s1], %[qa], x6;"
+        "p.lw x6, %[step](%[k]!);"
+        "vfdotpex.s.h %[s2], %[qa], x7;"
+        "p.lw x7, %[step](%[k]!);"
+        "vfdotpex.s.h %[s3], %[qa], x28;"
+        "p.lw x28, %[step](%[k]!);"
+        "vfdotpex.s.h %[s4], %[qa], x29;"
+        "p.lw x29, %[step](%[k]!);"
+        "vfdotpex.s.h %[s5], %[qa], x30;"
+        "p.lw x30, %[step](%[k]!);"
+        "vfdotpex.s.h %[s6], %[qa], x31;"
+        "p.lw x31, %[back](%[k]!);"
+        "p.lw %[qa], 4(%[p]!);" // the word after
+        "vfdotpex.s.h %[s0], %[qb], x5;"
+        "p.lw x5, %[step](%[k]!);"
+        "vfdotpex.s.h %[s1], %[qb], x6;"
+        "p.lw x6, %[step](%[k]!);"
+        "vfdotpex.s.h %[s2], %[qb], x7;"
+        "p.lw x7, %[step](%[k]!);"
+        "vfdotpex.s.h %[s3], %[qb], x28;"
+        "p.lw x28, %[step](%[k]!);"
+        "vfdotpex.s.h %[s4], %[qb], x29;"
+        "p.lw x29, %[step](%[k]!);"
+        "vfdotpex.s.h %[s5], %[qb], x30;"
+        "p.lw x30, %[step](%[k]!);"
+        "vfdotpex.s.h %[s6], %[qb], x31;"
+        "p.lw x31, %[back](%[k]!);"
+        "bne %[p], %[end], 1b;"
+        // the last two steps
+        "p.lw %[qb], 4(%[p]!);"
+        "vfdotpex.s.h %[s0], %[qa], x5;"
+        "p.lw x5, %[step](%[k]!);"
+        "vfdotpex.s.h %[s1], %[qa], x6;"
+        "p.lw x6, %[step](%[k]!);"
+        "vfdotpex.s.h %[s2], %[qa], x7;"
+        "p.lw x7, %[step](%[k]!);"
+        "vfdotpex.s.h %[s3], %[qa], x28;"
+        "p.lw x28, %[step](%[k]!);"
+        "vfdotpex.s.h %[s4], %[qa], x29;"
+        "p.lw x29, %[step](%[k]!);"
+        "vfdotpex.s.h %[s5], %[qa], x30;"
+        "p.lw x30, %[step](%[k]!);"
+        "vfdotpex.s.h %[s6], %[qa], x31;"
+        "p.lw x31, %[step](%[k]!);"
+        "vfdotpex.s.h %[s0], %[qb], x5;"
+        "vfdotpex.s.h %[s1], %[qb], x6;"
+        "vfdotpex.s.h %[s2], %[qb], x7;"
+        "vfdotpex.s.h %[s3], %[qb], x28;"
+        "vfdotpex.s.h %[s4], %[qb], x29;"
+        "vfdotpex.s.h %[s5], %[qb], x30;"
+        "vfdotpex.s.h %[s6], %[qb], x31;"
+        : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
+          [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [p] "+&r"(p),
+          [k] "+&r"(ka), [qa] "=&r"(qa), [qb] "=&r"(qb)
+        : [step] "r"(step), [back] "r"(back_a), [end] "r"(end)
+        : "x5", "x6", "x7", "x28", "x29", "x30", "x31", "memory");
+  }
+#pragma clang loop unroll(disable)
+  for (uint32_t a = w0, b = d / 2; a != b; b = a, a = 0) {
+    const __fp16 *p = q + 2 * a, *kb = k7 + 2 * a;
+    const __fp16 *ksa = ks + 2 * a, *kla = kl + 2 * a;
+    const __fp16 *const end = q + 2 * b - 2;
+    asm volatile(                    // pass B: spans 7 to 11, S and L
+        "p.lw %[qa], 4(%[p]!);"      // q, word 0
+        "p.lw x5, %[step](%[k7]!);"  // span 7
+        "p.lw x6, %[step](%[k7]!);"  // span 8
+        "p.lw x7, %[step](%[k7]!);"  // span 9
+        "p.lw x28, %[step](%[k7]!);" // span 10
+        "p.lw x29, %[back](%[k7]!);" // span 11, back to span 7, one word on
+        "p.lw x30, 4(%[ks]!);"       // S
+        "p.lw x31, 4(%[kl]!);"       // L
+        ".balign 32;"
+        "1:"                    // two steps a round
+        "p.lw %[qb], 4(%[p]!);" // next word of q
+        "vfdotpex.s.h %[s7], %[qa], x5;"
+        "p.lw x5, %[step](%[k7]!);" // span 7, next word
+        "vfdotpex.s.h %[s8], %[qa], x6;"
+        "p.lw x6, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s9], %[qa], x7;"
+        "p.lw x7, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s10], %[qa], x28;"
+        "p.lw x28, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s11], %[qa], x29;"
+        "p.lw x29, %[back](%[k7]!);"
+        "vfdotpex.s.h %[s12], %[qa], x30;"
+        "p.lw x30, 4(%[ks]!);"
+        "vfdotpex.s.h %[s13], %[qa], x31;"
+        "p.lw x31, 4(%[kl]!);"
+        "p.lw %[qa], 4(%[p]!);" // the word after
+        "vfdotpex.s.h %[s7], %[qb], x5;"
+        "p.lw x5, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s8], %[qb], x6;"
+        "p.lw x6, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s9], %[qb], x7;"
+        "p.lw x7, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s10], %[qb], x28;"
+        "p.lw x28, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s11], %[qb], x29;"
+        "p.lw x29, %[back](%[k7]!);"
+        "vfdotpex.s.h %[s12], %[qb], x30;"
+        "p.lw x30, 4(%[ks]!);"
+        "vfdotpex.s.h %[s13], %[qb], x31;"
+        "p.lw x31, 4(%[kl]!);"
+        "bne %[p], %[end], 1b;"
+        // the last two steps
+        "p.lw %[qb], 4(%[p]!);"
+        "vfdotpex.s.h %[s7], %[qa], x5;"
+        "p.lw x5, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s8], %[qa], x6;"
+        "p.lw x6, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s9], %[qa], x7;"
+        "p.lw x7, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s10], %[qa], x28;"
+        "p.lw x28, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s11], %[qa], x29;"
+        "p.lw x29, %[step](%[k7]!);"
+        "vfdotpex.s.h %[s12], %[qa], x30;"
+        "p.lw x30, 4(%[ks]!);"
+        "vfdotpex.s.h %[s13], %[qa], x31;"
+        "p.lw x31, 4(%[kl]!);"
+        "vfdotpex.s.h %[s7], %[qb], x5;"
+        "vfdotpex.s.h %[s8], %[qb], x6;"
+        "vfdotpex.s.h %[s9], %[qb], x7;"
+        "vfdotpex.s.h %[s10], %[qb], x28;"
+        "vfdotpex.s.h %[s11], %[qb], x29;"
+        "vfdotpex.s.h %[s12], %[qb], x30;"
+        "vfdotpex.s.h %[s13], %[qb], x31;"
+        : [s7] "+&r"(s7), [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10),
+          [s11] "+&r"(s11), [s12] "+&r"(s12), [s13] "+&r"(s13), [p] "+&r"(p),
+          [k7] "+&r"(kb), [ks] "+&r"(ksa), [kl] "+&r"(kla), [qa] "=&r"(qa),
+          [qb] "=&r"(qb)
+        : [step] "r"(step), [back] "r"(back_b), [end] "r"(end)
+        : "x5", "x6", "x7", "x28", "x29", "x30", "x31", "memory");
+  }
 #else
-  // one pass over the 14 logits: 6 registers for the loaded words, each filled
-  // two or three times a step
-  // after span 11: back to span 0, one word on
+  // one pass over the 14 logits
+  // after span 11: back to span 0, + one word 
   int32_t back = 4 - 11 * step;
-  // where q ends
-  const __fp16 *const end = q + d;
-
-  asm volatile( // logits
-      ".balign 32;"
-      "1:"
-      "p.lw x5, 4(%[q]!);"        // q
-      "p.lw x7, %[step](%[k]!);"  // span 0
-      "p.lw x28, %[step](%[k]!);" // span 1
-      "p.lw x29, %[step](%[k]!);" // span 2
-      "p.lw x30, %[step](%[k]!);" // span 3
-      "p.lw x31, %[step](%[k]!);" // span 4
-      "vfdotpex.s.h %[s0], x5, x7;"
-      "p.lw x7, %[step](%[k]!);" // span 5
-      "vfdotpex.s.h %[s1], x5, x28;"
-      "p.lw x28, %[step](%[k]!);" // span 6
-      "vfdotpex.s.h %[s2], x5, x29;"
-      "p.lw x29, %[step](%[k]!);" // span 7
-      "vfdotpex.s.h %[s3], x5, x30;"
-      "p.lw x30, %[step](%[k]!);" // span 8
-      "vfdotpex.s.h %[s4], x5, x31;"
-      "p.lw x31, %[step](%[k]!);" // span 9
-      "vfdotpex.s.h %[s5], x5, x7;"
-      "p.lw x7, %[step](%[k]!);" // span 10
-      "vfdotpex.s.h %[s6], x5, x28;"
-      "p.lw x28, %[back](%[k]!);" // span 11, then back to span 0
-      "vfdotpex.s.h %[s7], x5, x29;"
-      "p.lw x29, 4(%[ks]!);" // S
-      "vfdotpex.s.h %[s8], x5, x30;"
-      "p.lw x30, 4(%[kl]!);" // L
-      "vfdotpex.s.h %[s9], x5, x31;"
-      "vfdotpex.s.h %[s10], x5, x7;"
-      "vfdotpex.s.h %[s11], x5, x28;"
-      "vfdotpex.s.h %[s12], x5, x29;"
-      "vfdotpex.s.h %[s13], x5, x30;"
-      "bne %[q], %[end], 1b;"
-      : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
-        [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
-        [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
-        [s12] "+&r"(s12), [s13] "+&r"(s13), [q] "+&r"(q), [k] "+&r"(k),
-        [ks] "+&r"(ks), [kl] "+&r"(kl)
-      : [step] "r"(step), [back] "r"(back), [end] "r"(end)
-      : "x5", "x7", "x28", "x29", "x30", "x31", "memory");
+  // words w0 to the end, then 0 to w0
+#pragma clang loop unroll(disable)
+  for (uint32_t a = w0, b = d / 2; a != b; b = a, a = 0) {
+    const __fp16 *qp = q + 2 * a, *ka = k + 2 * a;
+    const __fp16 *ksa = ks + 2 * a, *kla = kl + 2 * a;
+    // where the part ends in q
+    const __fp16 *const end = q + 2 * b;
+    asm volatile( // logits
+        ".balign 32;"
+        "1:"
+        "p.lw x5, 4(%[q]!);"        // q
+        "p.lw x7, %[step](%[k]!);"  // span 0
+        "p.lw x28, %[step](%[k]!);" // span 1
+        "p.lw x29, %[step](%[k]!);" // span 2
+        "p.lw x30, %[step](%[k]!);" // span 3
+        "p.lw x31, %[step](%[k]!);" // span 4
+        "vfdotpex.s.h %[s0], x5, x7;"
+        "p.lw x7, %[step](%[k]!);" // span 5
+        "vfdotpex.s.h %[s1], x5, x28;"
+        "p.lw x28, %[step](%[k]!);" // span 6
+        "vfdotpex.s.h %[s2], x5, x29;"
+        "p.lw x29, %[step](%[k]!);" // span 7
+        "vfdotpex.s.h %[s3], x5, x30;"
+        "p.lw x30, %[step](%[k]!);" // span 8
+        "vfdotpex.s.h %[s4], x5, x31;"
+        "p.lw x31, %[step](%[k]!);" // span 9
+        "vfdotpex.s.h %[s5], x5, x7;"
+        "p.lw x7, %[step](%[k]!);" // span 10
+        "vfdotpex.s.h %[s6], x5, x28;"
+        "p.lw x28, %[back](%[k]!);" // span 11, then back to span 0
+        "vfdotpex.s.h %[s7], x5, x29;"
+        "p.lw x29, 4(%[ks]!);" // S
+        "vfdotpex.s.h %[s8], x5, x30;"
+        "p.lw x30, 4(%[kl]!);" // L
+        "vfdotpex.s.h %[s9], x5, x31;"
+        "vfdotpex.s.h %[s10], x5, x7;"
+        "vfdotpex.s.h %[s11], x5, x28;"
+        "vfdotpex.s.h %[s12], x5, x29;"
+        "vfdotpex.s.h %[s13], x5, x30;"
+        "bne %[q], %[end], 1b;"
+        : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
+          [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
+          [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
+          [s12] "+&r"(s12), [s13] "+&r"(s13), [q] "+&r"(qp), [k] "+&r"(ka),
+          [ks] "+&r"(ksa), [kl] "+&r"(kla)
+        : [step] "r"(step), [back] "r"(back), [end] "r"(end)
+        : "x5", "x7", "x28", "x29", "x30", "x31", "memory");
+  }
 #endif
 
   
   uint32_t u0, u1, u2, u3, u4, u5;
+#ifdef VFEXP
+  asm volatile( // softmax (14 logits), exp from vfexp.h
+      // w = exp(x - max) / sum: x - max in fp32
+      // (a dead slot becomes -inf, so its exp is 0)
+      "fmax.s %[q], %[s0], %[s1];"
+      "fmax.s %[k], %[s2], %[s3];"
+      "fmax.s %[ks], %[s4], %[s5];"
+      "fmax.s %[kl], %[s6], %[s7];"
+      "fmax.s %[q], %[q], %[s8];"
+      "fmax.s %[k], %[k], %[s9];"
+      "fmax.s %[ks], %[ks], %[s10];"
+      "fmax.s %[kl], %[kl], %[s11];"
+      "fmax.s %[q], %[q], %[s12];"
+      "fmax.s %[k], %[k], %[s13];"
+      "fmax.s %[q], %[q], %[k];"
+      "fmax.s %[ks], %[ks], %[kl];"
+      "fmax.s %[q], %[q], %[ks];" // the max
+      "fsub.s %[s0], %[s0], %[q];"
+      "fsub.s %[s1], %[s1], %[q];"
+      "fsub.s %[s2], %[s2], %[q];"
+      "fsub.s %[s3], %[s3], %[q];"
+      "fsub.s %[s4], %[s4], %[q];"
+      "fsub.s %[s5], %[s5], %[q];"
+      "fsub.s %[s6], %[s6], %[q];"
+      "fsub.s %[s7], %[s7], %[q];"
+      "fsub.s %[s8], %[s8], %[q];"
+      "fsub.s %[s9], %[s9], %[q];"
+      "fsub.s %[s10], %[s10], %[q];"
+      "fsub.s %[s11], %[s11], %[q];"
+      "fsub.s %[s12], %[s12], %[q];"
+      "fsub.s %[s13], %[s13], %[q];"
+      "vfcpka.h.s %[s0], %[s0], %[s1];" // the first in the low half
+      "vfcpka.h.s %[s2], %[s2], %[s3];"
+      "vfcpka.h.s %[s4], %[s4], %[s5];"
+      "vfcpka.h.s %[s6], %[s6], %[s7];"
+      "vfcpka.h.s %[s8], %[s8], %[s9];"
+      "vfcpka.h.s %[s10], %[s10], %[s11];"
+      "vfcpka.h.s %[s12], %[s12], %[s13];"
+      "vfexp.h %[s0], %[s0];"
+      "vfexp.h %[s2], %[s2];"
+      "vfexp.h %[s4], %[s4];"
+      "vfexp.h %[s6], %[s6];"
+      "vfexp.h %[s8], %[s8];"
+      "vfexp.h %[s10], %[s10];"
+      "vfexp.h %[s12], %[s12];"
+      // the sum in fp32: vfdotpex.s.h --> adds both lanes;
+      "li %[k], 0x3C003C00;"
+      "li %[step], 0;"
+      "li %[back], 0;"
+      "vfdotpex.s.h %[step], %[s0], %[k];"
+      "vfdotpex.s.h %[back], %[s2], %[k];"
+      "vfdotpex.s.h %[step], %[s4], %[k];"
+      "vfdotpex.s.h %[back], %[s6], %[k];"
+      "vfdotpex.s.h %[step], %[s8], %[k];"
+      "vfdotpex.s.h %[back], %[s10], %[k];"
+      "vfdotpex.s.h %[step], %[s12], %[k];"
+      "fadd.s %[step], %[step], %[back];" // sum
+      "li %[ks], 0x3F800000;"             // 1.0
+      "fdiv.s %[ks], %[ks], %[step];"     // r = 1 / sum
+      "vfcpka.h.s %[ks], %[ks], %[ks];"   // (r, r) in fp16
+      "vfmul.h %[s0], %[s0], %[ks];"      // w, two to a word
+      "vfmul.h %[s2], %[s2], %[ks];"
+      "vfmul.h %[s4], %[s4], %[ks];"
+      "vfmul.h %[s6], %[s6], %[ks];"
+      "vfmul.h %[s8], %[s8], %[ks];"
+      "vfmul.h %[s10], %[s10], %[ks];"
+      "vfmul.h %[s12], %[s12], %[ks];"
+      "sw %[s0], 0(%[o]);" // store as 7 words
+      "sw %[s2], 4(%[o]);"
+      "sw %[s4], 8(%[o]);"
+      "sw %[s6], 12(%[o]);"
+      "sw %[s8], 16(%[o]);"
+      "sw %[s10], 20(%[o]);"
+      "sw %[s12], 24(%[o]);"
+      : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
+        [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
+        [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
+        [s12] "+&r"(s12), [s13] "+&r"(s13), [q] "=&r"(u0), [k] "=&r"(u1),
+        [ks] "=&r"(u2), [kl] "=&r"(u3), [step] "=&r"(u4), [back] "=&r"(u5)
+      : [o] "r"(o)
+      : "memory");
+#else
   register uint16_t *o5 asm("x5") = o;
   asm volatile( // softmax (14 logits)
       "addi sp, sp, -16;"
@@ -552,50 +648,219 @@ static inline void lhsm_hub_weights(const __fp16 *q, const __fp16 *k,
       : [log2e] "i"(LHSM_LOG2E), [tmin] "i"(LHSM_TMIN), [ca] "i"(LHSM_A),
         [cb] "i"(LHSM_B), [cc] "i"(LHSM_C)
       : "x6", "x7", "x28", "x29", "x31", "memory");
+#endif
 }
 
 // 4 span queries
-static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
-                                     const __fp16 *ks, const __fp16 *kl,
-                                     uint32_t d, float g0, float g1, float g2,
-                                     uint32_t skip, __fp16 *o) {
+static inline __attribute__((always_inline)) void
+lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step, const __fp16 *ks,
+                  const __fp16 *kl, uint32_t d, uint32_t w0, float g0, float g1,
+                  float g2, uint32_t skip, __fp16 *o) {
   // from the k of a row to the q of the next
   int32_t nx = step - dm;
   // after the k of row 3: back to the q of row 0, one word on
   int32_t back = 4 - 3 * step - dm;
-  // where the q of row 0 ends
-  const __fp16 *end = p + d;
   // the 12 sums, fp32, start at their biases: row 0 k, S, L, then row 1, 2, 3
   float s0 = g0, s1 = g1, s2 = g2, s3 = g0, s4 = g1, s5 = g2;
   float s6 = g0, s7 = g1, s8 = g2, s9 = g0, s10 = g1, s11 = g2;
-  // 23 instructions a loop step, 12 vfdotpex.s.h: x5, x6 hold S and L, x7 and
-  // x28 to x31 the q and k of the rows, in turn
-  asm volatile(
-      "1:"
-      "p.lw x5, 4(%[ks]!);"     // S
-      "p.lw x6, 4(%[kl]!);"     // L
-      "p.lw x7, %[dm](%[p]!);"  // q, row 0
-      "p.lw x28, %[nx](%[p]!);" // k, row 0
-      "p.lw x29, %[dm](%[p]!);" // q, row 1
-      "p.lw x30, %[nx](%[p]!);" // k, row 1
-      "p.lw x31, %[dm](%[p]!);" // q, row 2
-      "vfdotpex.s.h %[s1], x7, x5;"
-      "vfdotpex.s.h %[s2], x7, x6;"
-      "vfdotpex.s.h %[s0], x7, x28;"
-      "p.lw x7, %[nx](%[p]!);"  // k, row 2
-      "p.lw x28, %[dm](%[p]!);" // q, row 3
-      "vfdotpex.s.h %[s4], x29, x5;"
-      "vfdotpex.s.h %[s5], x29, x6;"
-      "vfdotpex.s.h %[s3], x29, x30;"
-      "p.lw x29, %[back](%[p]!);" // k, row 3, then back to row 0
-      "vfdotpex.s.h %[s7], x31, x5;"
-      "vfdotpex.s.h %[s8], x31, x6;"
-      "vfdotpex.s.h %[s6], x31, x7;"
-      "vfdotpex.s.h %[s10], x28, x5;"
-      "vfdotpex.s.h %[s11], x28, x6;"
-      "vfdotpex.s.h %[s9], x28, x29;"
-      "bne %[p], %[end], 1b;"
+  // words w0 to the end, then 0 to w0 (one part if w0 is 0)
+#pragma clang loop unroll(disable)
+  for (uint32_t a = w0, b = d / 2; a != b; b = a, a = 0) {
+    const __fp16 *pa = p + 2 * a, *ksa = ks + 2 * a, *kla = kl + 2 * a;
+#if LHSM_PIPELINED
+    // the loop leaves pa at the q of row 2, word b (two rows on: step is in
+    // bytes)
+    const __fp16 *const end = p + step + 2 * b;
 
+    asm volatile(
+        "p.lw x7, %[dm](%[p]!);"  // q, row 0
+        "p.lw x28, %[nx](%[p]!);" // k, row 0
+        "p.lw x29, %[dm](%[p]!);" // q, row 1
+        "p.lw x30, %[nx](%[p]!);" // k, row 1
+        "p.lw x5, 4(%[ks]!);"     // S
+        "p.lw x6, 4(%[kl]!);"     // L
+        ".balign 32;"
+        "1:"
+        "vfdotpex.s.h %[s0], x7, x28;"
+        "vfdotpex.s.h %[s1], x7, x5;"
+        "vfdotpex.s.h %[s2], x7, x6;"
+        "p.lw x7, %[dm](%[p]!);"  // q, row 2
+        "p.lw x28, %[nx](%[p]!);" // k, row 2
+        "vfdotpex.s.h %[s3], x29, x30;"
+        "vfdotpex.s.h %[s4], x29, x5;"
+        "vfdotpex.s.h %[s5], x29, x6;"
+        "p.lw x29, %[dm](%[p]!);"   // q, row 3
+        "p.lw x30, %[back](%[p]!);" // k, row 3, then back to row 0, one word on
+        "vfdotpex.s.h %[s6], x7, x28;"
+        "vfdotpex.s.h %[s7], x7, x5;"
+        "vfdotpex.s.h %[s8], x7, x6;"
+        "p.lw x7, %[dm](%[p]!);"  // q, row 0
+        "p.lw x28, %[nx](%[p]!);" // k, row 0
+        "vfdotpex.s.h %[s10], x29, x5;"
+        "p.lw x5, 4(%[ks]!);" // S
+        "vfdotpex.s.h %[s11], x29, x6;"
+        "p.lw x6, 4(%[kl]!);" // L
+        "vfdotpex.s.h %[s9], x29, x30;"
+        "p.lw x29, %[dm](%[p]!);" // q, row 1
+        "p.lw x30, %[nx](%[p]!);" // k, row 1
+        "bne %[p], %[end], 1b;"
+        : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
+          [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
+          [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
+          [p] "+&r"(pa), [ks] "+&r"(ksa), [kl] "+&r"(kla)
+        : [dm] "r"(dm), [nx] "r"(nx), [back] "r"(back), [end] "r"(end)
+        : "x5", "x6", "x7", "x28", "x29", "x30", "memory");
+#else
+    // where the part ends in the q of row 0
+    const __fp16 *const end = p + 2 * b;
+
+    asm volatile(
+        "1:"
+        "p.lw x5, 4(%[ks]!);"     // S
+        "p.lw x6, 4(%[kl]!);"     // L
+        "p.lw x7, %[dm](%[p]!);"  // q, row 0
+        "p.lw x28, %[nx](%[p]!);" // k, row 0
+        "p.lw x29, %[dm](%[p]!);" // q, row 1
+        "p.lw x30, %[nx](%[p]!);" // k, row 1
+        "p.lw x31, %[dm](%[p]!);" // q, row 2
+        "vfdotpex.s.h %[s1], x7, x5;"
+        "vfdotpex.s.h %[s2], x7, x6;"
+        "vfdotpex.s.h %[s0], x7, x28;"
+        "p.lw x7, %[nx](%[p]!);"  // k, row 2
+        "p.lw x28, %[dm](%[p]!);" // q, row 3
+        "vfdotpex.s.h %[s4], x29, x5;"
+        "vfdotpex.s.h %[s5], x29, x6;"
+        "vfdotpex.s.h %[s3], x29, x30;"
+        "p.lw x29, %[back](%[p]!);" // k, row 3, then back to row 0
+        "vfdotpex.s.h %[s7], x31, x5;"
+        "vfdotpex.s.h %[s8], x31, x6;"
+        "vfdotpex.s.h %[s6], x31, x7;"
+        "vfdotpex.s.h %[s10], x28, x5;"
+        "vfdotpex.s.h %[s11], x28, x6;"
+        "vfdotpex.s.h %[s9], x28, x29;"
+        "bne %[p], %[end], 1b;"
+        : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
+          [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
+          [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
+          [p] "+&r"(pa), [ks] "+&r"(ksa), [kl] "+&r"(kla)
+        : [dm] "r"(dm), [nx] "r"(nx), [back] "r"(back), [end] "r"(end)
+        : "x5", "x6", "x7", "x28", "x29", "x30", "x31", "memory");
+#endif
+  }
+  // scratch registers of the softmax
+  uint32_t u0, u1, u2, u3, u4, u5;
+#ifdef VFEXP
+  asm volatile(
+      // softmax, exp from vfexp.h, as in the hub. A row has 3 logits
+
+      "fmax.s x5, %[s0], %[s1];"
+      "fmax.s x6, %[s3], %[s4];"
+      "fmax.s x7, %[s6], %[s7];"
+      "fmax.s x16, %[s9], %[s10];"
+      "fmax.s x5, x5, %[s2];"
+      "fmax.s x6, x6, %[s5];"
+      "fmax.s x7, x7, %[s8];"
+      "fmax.s x16, x16, %[s11];"
+      // x - max, fp32
+      "fsub.s %[s0], %[s0], x5;"
+      "fsub.s %[s1], %[s1], x5;"
+      "fsub.s %[s2], %[s2], x5;"
+      "fsub.s %[s3], %[s3], x6;"
+      "fsub.s %[s4], %[s4], x6;"
+      "fsub.s %[s5], %[s5], x6;"
+      "fsub.s %[s6], %[s6], x7;"
+      "fsub.s %[s7], %[s7], x7;"
+      "fsub.s %[s8], %[s8], x7;"
+      "fsub.s %[s9], %[s9], x16;"
+      "fsub.s %[s10], %[s10], x16;"
+      "fsub.s %[s11], %[s11], x16;"
+      // to fp16, the first in the low half
+      "vfcpka.h.s %[p], %[s0], %[s1];"
+      "vfcpka.h.s %[ks], %[s2], %[s3];"
+      "vfcpka.h.s %[kl], %[s4], %[s5];"
+      "vfcpka.h.s %[dm], %[s6], %[s7];"
+      "vfcpka.h.s %[nx], %[s8], %[s9];"
+      "vfcpka.h.s %[back], %[s10], %[s11];"
+      "vfexp.h %[p], %[p];"
+      "vfexp.h %[ks], %[ks];"
+      "vfexp.h %[kl], %[kl];"
+      "vfexp.h %[dm], %[dm];"
+      "vfexp.h %[nx], %[nx];"
+      "vfexp.h %[back], %[back];"
+      // the row sums S0 to S3 in fp32, in x5, x6, x7, x16: vfdotpex.s.h
+
+      "li x28, 0x3C003C00;"
+      "li x29, 0x3C00;"
+      "li x30, 0x3C000000;"
+      "li x5, 0;"
+      "li x6, 0;"
+      "li x7, 0;"
+      "li x16, 0;"
+      "vfdotpex.s.h x5, %[p], x28;"
+      "vfdotpex.s.h x6, %[kl], x28;"
+      "vfdotpex.s.h x7, %[dm], x28;"
+      "vfdotpex.s.h x16, %[back], x28;"
+      "vfdotpex.s.h x5, %[ks], x29;"
+      "vfdotpex.s.h x6, %[ks], x30;"
+      "vfdotpex.s.h x7, %[nx], x29;"
+      "vfdotpex.s.h x16, %[nx], x30;"
+      // one fdiv.s 
+      "fmul.s x28, x5, x6;"
+      "fmul.s x29, x7, x16;"
+      "li x31, 0x3F800000;"
+      "fmul.s x30, x28, x29;"
+      "fdiv.s x31, x31, x30;"
+      "fmul.s x28, x28, x31;"
+      "fmul.s x29, x29, x31;"
+      "fmul.s x30, x6, x29;"
+      "fmul.s x31, x5, x29;"
+      "fmul.s x5, x16, x28;"
+      "fmul.s x6, x7, x28;"
+
+      "vfcpka.h.s x7, x30, x30;"
+      "vfcpka.h.s x16, x30, x31;"
+      "vfcpka.h.s x30, x31, x31;"
+      "vfcpka.h.s x31, x5, x5;"
+      "vfcpka.h.s x28, x5, x6;"
+      "vfcpka.h.s x29, x6, x6;"
+
+      "vfmul.h %[s0], %[p], x7;"
+      "vfmul.h %[s1], %[ks], x16;"
+      "vfmul.h %[s2], %[kl], x30;"
+      "vfmul.h %[s3], %[dm], x31;"
+      "vfmul.h %[s4], %[nx], x28;"
+      "vfmul.h %[s5], %[back], x29;"
+      : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
+        [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
+        [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
+        [p] "=&r"(u0), [ks] "=&r"(u1), [kl] "=&r"(u2), [dm] "=&r"(u3),
+        [nx] "=&r"(u4), [back] "=&r"(u5)
+      :
+      : "x5", "x6", "x7", "x16", "x28", "x29", "x30", "x31");
+  // rows skip to 3, 3 a row: the low then the high half of s0 to s5
+  if (skip == 0) {
+    o[0] = ((__fp16 *)&s0)[0];
+    o[1] = ((__fp16 *)&s0)[1];
+    o[2] = ((__fp16 *)&s1)[0];
+    o += 3;
+  }
+  if (skip <= 1) {
+    o[0] = ((__fp16 *)&s1)[1];
+    o[1] = ((__fp16 *)&s2)[0];
+    o[2] = ((__fp16 *)&s2)[1];
+    o += 3;
+  }
+  if (skip <= 2) {
+    o[0] = ((__fp16 *)&s3)[0];
+    o[1] = ((__fp16 *)&s3)[1];
+    o[2] = ((__fp16 *)&s4)[0];
+    o += 3;
+  }
+  o[0] = ((__fp16 *)&s4)[1];
+  o[1] = ((__fp16 *)&s5)[0];
+  o[2] = ((__fp16 *)&s5)[1];
+#else
+  asm volatile(
       // softmax, a row at a time: the max of 3, then 3 exps
       // t = max((x - max) log2(e), -100), n = round(t), f = t - n
       // exp(x - max) / c3 = 2^n (((f + A) f + B) f + C)
@@ -820,11 +1085,11 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
       : [s0] "+&r"(s0), [s1] "+&r"(s1), [s2] "+&r"(s2), [s3] "+&r"(s3),
         [s4] "+&r"(s4), [s5] "+&r"(s5), [s6] "+&r"(s6), [s7] "+&r"(s7),
         [s8] "+&r"(s8), [s9] "+&r"(s9), [s10] "+&r"(s10), [s11] "+&r"(s11),
-        [p] "+&r"(p), [ks] "+&r"(ks), [kl] "+&r"(kl), [dm] "+&r"(dm),
-        [nx] "+&r"(nx), [back] "+&r"(back)
-      : [end] "r"(end), [log2e] "i"(LHSM_LOG2E), [tmin] "i"(LHSM_TMIN),
-        [ca] "i"(LHSM_A), [cb] "i"(LHSM_B), [cc] "i"(LHSM_C)
-      : "x5", "x6", "x7", "x16", "x28", "x29", "x30", "x31", "memory");
+        [p] "=&r"(u0), [ks] "=&r"(u1), [kl] "=&r"(u2), [dm] "=&r"(u3),
+        [nx] "=&r"(u4), [back] "=&r"(u5)
+      : [log2e] "i"(LHSM_LOG2E), [tmin] "i"(LHSM_TMIN), [ca] "i"(LHSM_A),
+        [cb] "i"(LHSM_B), [cc] "i"(LHSM_C)
+      : "x5", "x6", "x7", "x16", "x28", "x29", "x30", "x31");
   // rows skip to 3, as fp16, 3 a row
   if (skip == 0) {
     o[0] = *(__fp16 *)&s0;
@@ -847,6 +1112,7 @@ static inline void lhsm_span_weights(const __fp16 *p, int32_t dm, int32_t step,
   o[0] = *(__fp16 *)&s9;
   o[1] = *(__fp16 *)&s10;
   o[2] = *(__fp16 *)&s11;
+#endif
 }
 
 
@@ -890,10 +1156,10 @@ lhsm_span_batch(const lhsm_args_t *a, const __fp16 *lpr, uint32_t b,
   const __fp16 *g = a->bias + h * (1 + a->n_hub) * 3;
   // a_span row of span i0: r = u * n_span + i, 3 slots a row
   __fp16 *o = a->a_span + 3 * (u * a->n_span + w * win + i0);
-  // the 4 rows against their own k, S_w and L_w (biases G[h][0][0..2]); the
-  // batch's own rows, i0 - r0 to 3, to o
+
+  const uint32_t w0 = 21 * b % (d / 2);
   lhsm_span_weights(row + qo, (int32_t)(2 * a->d_model),
-                    (int32_t)(2 * a->span_step), srow + ko, lrow + ko, d,
+                    (int32_t)(2 * a->span_step), srow + ko, lrow + ko, d, w0,
                     lhsm_f32(g), lhsm_f32(g + 1), lhsm_f32(g + 2), i0 - r0, o);
 }
 
@@ -933,9 +1199,11 @@ lhsm_hub_row(const lhsm_args_t *a, const __fp16 *lpr, uint32_t r,
     g_span += lhsm_f32(a->bias + n_heads * (1 + n_hub) * 3 + h);
   }
 
+
+  const uint32_t w0 = 4 * (5 * r % (d / 8));
   lhsm_hub_weights((eta ? lrow : srow) + qo, span0 + ko,
-                   (int32_t)(2 * a->span_step), srow + ko, lrow + ko, d, n_live,
-                   g_span, lhsm_f32(g + 1), lhsm_f32(g + 2),
+                   (int32_t)(2 * a->span_step), srow + ko, lrow + ko, d, w0,
+                   n_live, g_span, lhsm_f32(g + 1), lhsm_f32(g + 2),
                    (uint16_t *)(a->a_hub + r * (win + 2)));
 }
 
