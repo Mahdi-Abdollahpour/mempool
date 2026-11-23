@@ -212,7 +212,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define CE_W_LB1        (CE_HEADS * 3u * 3u + CE_HEADS)           // local bias G, delta (OP table 1.cl)
 #define CE_W_LB2        (CE_HEADS * 2u * 3u + CE_HEADS)           // local bias G, delta (OP table 2.cl)
 #define CE_W_FF1        (CE_D_MODEL * CE_FFN + CE_FFN)            // W_1, b_1
-#define CE_W_FF2        (CE_FFN * CE_D_MODEL + CE_D_MODEL)        // W_2, b_2
+#define CE_W_FF2        (CE_FFN * CE_D_MODEL)                     // W_2
 #define CE_W_DEC        (CE_D_MODEL * CE_C + CE_C)                // W_dec, b_dec
 #define CE_W_HX         (CE_RUN * CE_C_HID + CE_C_HID)            // W_x, b_x
 #define CE_W_HS         (CE_RUN * CE_C_HID)                       // W_s
@@ -348,7 +348,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define A2_W_END        (A2_W_WO + CE_RUP(CE_W_WO, CE_LINE))      // end of the stage 3 weights
 
 // == stage 4: FFN and patch decoder (block D) ===================================
-// X_BUF: [ Z | BASE: X, S | H | F1 | F2 | D | head input: PRB rows, summary rows ]
+// X_BUF: [ Z | BASE: X, S | H | F1 | head input: PRB rows, summary rows | b_dec rows ]
 #define S4_LINES        (CE_NL / CE_S4_LANES)                     // lines a lane
 #define S4_EL           (CE_N_EL / CE_S4_LANES)                   // antenna elements a lane
 #define S4_R_ROWS       (S4_LINES * CE_N_SPAN)                    // span rows
@@ -357,25 +357,27 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define S4_Z_N          (S4_ROWS * CE_D_MODEL)                    // elements of the lattice that arrives from stage 3
 #define S4_XB_N         (S4_R_ROWS * CE_C)                          // X, the lane's span patches from LPDDR, [S4_R_ROWS][CE_C] (OP table D.6)
 #define S4_WIN_N        (CE_WIN_ALL / CE_S4_LANES)                // the lane's summary patches from LPDDR (OP table D.6)
-#define S4_BASE_N       (S4_ROWS * CE_C)                          // the decoder residual [X | S] [S4_ROWS][CE_C] (OP table D.6, D.8)
+#define S4_BASE_N       (S4_ROWS * CE_C)                          // the decoder residual [X | S] [S4_ROWS][CE_C] (OP table D.6, D.7)
 #define S4_HPRB_N       (S4_EL * CE_N_PRB * CE_RUN)               // head input, PRB rows [S4_EL][CE_N_PRB][CE_RUN] (OP table D.9)
 #define S4_HSUM_N       (S4_EL * CE_NSUM_HR * CE_RUN)             // head input, summary rows [S4_EL][CE_NSUM_HR][CE_RUN] (OP table D.9)
 #define S4_Z            0u                                        // the lattice [R | S] [S4_ROWS][CE_D_MODEL]; the landing zone, with its twin at + X_ELEMS
-#define S4_XB           (S4_Z + CE_RUP(S4_Z_N, CE_LINE))          // the decoder residual BASE = [X | S], X first (OP table D.6)
+#define S4_XB           CE_RUP(S4_Z + S4_M * CE_D_MODEL, CE_BANK_ROW)   // the decoder residual BASE = [X | S], X first, past the pad rows D.4 writes on z, on a row of banks for the local axpy (OP table D.6)
 #define S4_WIN          (S4_XB + S4_XB_N)                         // S, right after X, so BASE is one tensor (OP table D.6)
-#define S4_H            (S4_WIN + CE_RUP(S4_WIN_N, CE_LINE))      // layernorm output H [S4_M][CE_D_MODEL] (OP table D.1, read by D.2)
+#define S4_H            (S4_WIN + CE_RUP(S4_WIN_N, CE_LINE))      // layernorm output H [S4_M][CE_D_MODEL], right after BASE: it also takes the pad rows of D.7 (OP table D.1, read by D.2)
 #define S4_F1           CE_RUP(S4_H + S4_M * CE_D_MODEL, CE_BANK_ROW)     // FFN hidden [S4_M][CE_FFN], GELU in place, on a row of banks so D.3 stays local (OP table D.2, D.3, read by D.4)
-#define S4_F2           (S4_F1 + CE_RUP(S4_M * CE_FFN, CE_LINE))          // FFN output [S4_M][CE_D_MODEL], + Z in place (OP table D.4, D.5, read by D.7)
-#define S4_D            (S4_F2 + CE_RUP(S4_M * CE_D_MODEL, CE_LINE))      // decoded patches [S4_M][CE_C], + BASE in place (OP table D.7, D.8, read by D.9)
-#define S4_BLK          (S4_D + CE_RUP(S4_M * CE_C, CE_LINE))             // head input, PRB rows [antenna element][CE_N_PRB][CE_RUN] (OP table D.9, sent by D.10)
+#define S4_BLK          (S4_F1 + CE_RUP(S4_M * CE_FFN, CE_LINE))          // head input, PRB rows [antenna element][CE_N_PRB][CE_RUN] (OP table D.9, sent by D.10)
 #define S4_BLK_S        (S4_BLK + S4_HPRB_N)                              // head input, summary rows [antenna element][CE_NSUM_HR][CE_RUN], right after (OP table D.9, sent by D.10)
-#define S4_END          (S4_BLK_S + CE_RUP(S4_HSUM_N, CE_LINE))           // end of the stage 4 map
+// TODO: a bias add kernel, so b_dec needs one row instead of S4_BDEC
+#define S4_BDEC         CE_RUP(S4_BLK_S + CE_RUP(S4_HSUM_N, CE_LINE), CE_BANK_ROW)   // b_dec repeated over the rows, set once, on a row of banks for the local axpy (OP table D.7)
+#define S4_END          (S4_BDEC + S4_BASE_N)                                         // end of the stage 4 map
 // W_BUF: [ LN | W_1 | W_2 | W_dec ]
 #define S4_W_LN         0u                                        // layernorm gamma, beta (OP table D.1)
-#define S4_W_FF1        (S4_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_1, b_1 (OP table D.2, D.3)
-#define S4_W_FF2        (S4_W_FF1 + CE_RUP(CE_W_FF1, CE_LINE))    // W_2, b_2 (OP table D.4)
+#define S4_W_FF1        (S4_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_1, b_1 (OP table D.2)
+#define S4_W_FF2        (S4_W_FF1 + CE_RUP(CE_W_FF1, CE_LINE))    // W_2 (OP table D.4)
 #define S4_W_DEC        (S4_W_FF2 + CE_RUP(CE_W_FF2, CE_LINE))    // W_dec, b_dec (OP table D.7)
 #define S4_W_END        (S4_W_DEC + CE_RUP(CE_W_DEC, CE_LINE))    // end of the stage 4 weights
+#define S4_B_1          (S4_W_FF1 + CE_D_MODEL * CE_FFN)          // b_1, after W_1: the hidden layer starts from it (OP table D.c)
+#define S4_B_DEC        (S4_W_DEC + CE_D_MODEL * CE_C)            // b_dec + b_2 W_dec, after W_dec; b_2 folds in as only D.7 reads the FFN output (OP table D.c)
 
 // == stage 5: Doppler head (block H) ============================================
 // X_BUF: [ x_in | h | OUT[0] | OUT[1] | go ]
@@ -406,7 +408,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define S5_B_H          (S5_W_HO + CE_C_HID * CE_C_OUT)           // b_h, after W_h: each OUT buffer starts from it (OP table H.c)
 // ==== the two buffers ========================================================
 enum { CE_X_ELEMS = CE_RUP(CE_MAX3(CE_MAX(S1_END, A1_END), CE_MAX(A2_END, S4_END), S5_END), CE_LINE) };
-enum { CE_X_PAR_ELEMS = CE_RUP(CE_MAX3(E_ALL_N, S4_Z_N, S5_X_N), CE_LINE) };
+enum { CE_X_PAR_ELEMS = CE_RUP(CE_MAX3(E_ALL_N, S4_M * CE_D_MODEL, S5_X_N), CE_LINE) };
 enum { CE_W_ELEMS = CE_RUP(CE_MAX3(CE_MAX(S1_W_END, A1_W_END), CE_MAX(A2_W_END, S4_W_END), S5_W_END),
                            CE_LINE) };
 // ==== LPDDR ===================================================================
@@ -465,7 +467,7 @@ _Static_assert(A1_QR >= CE_LG && A2_QR >= CE_N_SPAN && E_KP >= CE_LG, "global pa
 _Static_assert(E_RS_ROWS % 2u == 0u && E_ALL_ROWS % 2u == 0u && S4_ROWS % 2u == 0u, "layernorm: M must be even");
 _Static_assert(CE_D_MODEL % 4u == 0u && E_KP % 4u == 0u, "layernorm, softmax: row length a multiple of 4");
 _Static_assert((E_PAIRS * A1_QR) % 2u == 0u && (E_PAIRS * A2_QR) % 2u == 0u, "softmax: M must be even");
-_Static_assert(S1_TT_N % 16u == 0u && E_ALL_N % 16u == 0u && E_RS_N % 16u == 0u && S4_Z_N % 16u == 0u
+_Static_assert(S1_TT_N % 16u == 0u && E_ALL_N % 16u == 0u && E_RS_N % 16u == 0u
                && S4_BASE_N % 16u == 0u && (S4_ROWS * CE_FFN) % 16u == 0u && S5_HX_N % 16u == 0u
                && (CE_HEADS * A1_QR * E_KP) % 16u == 0u && (CE_HEADS * A2_QR * E_KP) % 16u == 0u,
                "axpy and gelu: length a multiple of 16, whole slices");
@@ -475,6 +477,8 @@ _Static_assert(CE_C_HID % 16u == 0u && CE_BANK_ROW % CE_C_HID == 0u
                "H.2: rows of h must be whole slices within a row of banks, with the summary rows the kernel counts");
 _Static_assert(CE_C_OUT % 16u == 0u && S5_OUT % 16u == 0u && S5_OUT_N % 16u == 0u && (S5_H + S5_HX_N) % 16u == 0u
                && S5_B_X % 2u == 0u && S5_B_H % 2u == 0u, "H.1, H.4: the bias fills write whole slices");
+_Static_assert(CE_FFN % 16u == 0u && CE_C % 16u == 0u && S4_B_1 % 2u == 0u && S4_B_DEC % 2u == 0u,
+               "D.2, D.7: the bias fills write whole slices");
 _Static_assert(S1_TOK_M < 65536u && S5_XR_M < 65536u, "RedMulE: M, N, P below 65,536");
 _Static_assert(CE_D_QKV <= CE_GRP_COPY, "1.4: a copy of the Ll row must stay in the banks of its group");
 
@@ -1086,17 +1090,25 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par, uint32_t lan
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table D.4 FF2
-        redmule_synch_parallel(X_BUF + S4_F1, W_BUF + S4_W_FF2, X_BUF + S4_F2, S4_M, CE_FFN, CE_D_MODEL, GEMM, false, 0);
+        // F lands on z, so D.5 happens in place; b_2 is in b_dec
+        redmule_asynch_parallel(X_BUF + S4_F1, W_BUF + S4_W_FF2, z, S4_M, CE_FFN, CE_D_MODEL, GEMM, false, 0);
     }
-    CE_REGION {   // OP table D.5 RES
-        axpy_f16vecp_local_unrolled8(0x3C00u, z, X_BUF + S4_F2, S4_Z_N);
+    CE_REGION {   // OP table D.7 DEC
+        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + S4_BDEC, X_BUF + S4_XB, S4_BASE_N);
+    }
+    CE_REGION {   // OP table D.4 FF2
+        wait_redmule();
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table D.7 DEC
-        redmule_synch_parallel(X_BUF + S4_F2, W_BUF + S4_W_DEC, X_BUF + S4_D, S4_M, CE_D_MODEL, CE_C, GEMM, false, 0);
+        // the decoded patches land on BASE + b_dec, so D.8 happens in place
+        redmule_asynch_parallel(z, W_BUF + S4_W_DEC, X_BUF + S4_XB, S4_M, CE_D_MODEL, CE_C, GEMM, false, 0);
     }
-    CE_REGION {   // OP table D.8 RES2
-        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + S4_XB, X_BUF + S4_D, S4_BASE_N);
+    CE_REGION {   // OP table D.2 FF1
+        repeat_f16p_local(W_BUF + S4_B_1, X_BUF + S4_F1, 1u, CE_FFN, S4_ROWS, cid);
+    }
+    CE_REGION {   // OP table D.7 DEC
+        wait_redmule();
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table D.9 BLK
@@ -1114,7 +1126,7 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par, uint32_t lan
             { CE_N_WIN,           CE_C,                         CE_SPAN_PRBS * CE_RUN },
             { S4_LINES,           CE_N_WIN * CE_C,              CE_TILE_EL * CE_NSUM_HR * CE_RUN },
         };
-        permute_f16p(X_BUF + S4_D, X_BUF + S4_BLK, CE_RUN, lb, 5u, cid, nt);
+        permute_f16p(X_BUF + S4_XB, X_BUF + S4_BLK, CE_RUN, lb, 5u, cid, nt);
 #if CE_CROP
         static const perm_level_t lt[] = {       // the last span: its PRBs that are not cropped
             { CE_TILE_V,          CE_RUN,                       CE_N_PRB * CE_RUN },
@@ -1122,10 +1134,10 @@ static __attribute__((noinline)) void compute_stage_4(uint32_t par, uint32_t lan
             { CE_SPAN_PRBS - CE_CROP, CE_TILE_EL * CE_RUN,      CE_RUN },
             { S4_LINES,           CE_N_SPAN * CE_C,             CE_TILE_EL * CE_N_PRB * CE_RUN },
         };
-        permute_f16p(X_BUF + S4_D + (CE_N_SPAN - 1u) * CE_C, X_BUF + S4_BLK + (CE_N_SPAN - 1u) * CE_SPAN_PRBS * CE_RUN,
+        permute_f16p(X_BUF + S4_XB + (CE_N_SPAN - 1u) * CE_C, X_BUF + S4_BLK + (CE_N_SPAN - 1u) * CE_SPAN_PRBS * CE_RUN,
                      CE_RUN, lt, 4u, cid, nt);
 #endif
-        permute_f16p(X_BUF + S4_D + S4_R_ROWS * CE_C, X_BUF + S4_BLK_S, CE_RUN, ls, 5u, cid, nt);
+        permute_f16p(X_BUF + S4_WIN, X_BUF + S4_BLK_S, CE_RUN, ls, 5u, cid, nt);
         flex_intra_cluster_sync();
     }
 }
@@ -1237,6 +1249,12 @@ int main(void)
     for (uint32_t i = mempool_get_core_id(); i < X_ELEMS + X_PAR_ELEMS; i += mempool_get_core_count()) X_BUF[i] = (__fp16)1.0f;
     for (uint32_t i = mempool_get_core_id(); i < W_ELEMS; i += mempool_get_core_count()) W_BUF[i] = (__fp16)1.0f;
     flex_intra_cluster_sync();
+    if (stage == STAGE_4) {
+        // b_dec over all rows for the axpy under D.4; b_1 into the hidden layer for the first item, later items get it under D.7 of the item before
+        repeat_f16p_local(W_BUF + S4_B_DEC, X_BUF + S4_BDEC, 1u, CE_C, S4_ROWS, mempool_get_core_id());
+        repeat_f16p_local(W_BUF + S4_B_1, X_BUF + S4_F1, 1u, CE_FFN, S4_ROWS, mempool_get_core_id());
+        flex_intra_cluster_sync();
+    }
     if (stage == STAGE_5) {
         // b_x into y^s for the first item; later items get it under the last tile of the item before
         repeat_f16p_local(W_BUF + S5_B_X, X_BUF + S5_H + S5_HX_N, 1u, CE_C_HID, S5_XS_M, mempool_get_core_id());
