@@ -883,7 +883,6 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
     }
     CE_REGION {   // OP table 1.2 QKV
         redmule_synch_parallel(X_BUF + A1_H, W_BUF + A1_W_QKV, X_BUF + A1_QKV, A1_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.3 SPLIT
     }
@@ -902,11 +901,11 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         };
         permute_f16p(X_BUF + A1_QKV, X_BUF + A1_QG, CE_D_HEAD, lq, 3u, cid, nt);
         permute_f16p(X_BUF + A1_QKV + CE_D_MODEL, X_BUF + A1_KT, CE_D_HEAD, lk, 3u, cid, nt);
+        // Q_g, K_g^T complete before the TEs read them
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.6 ROPE, stand-in
         mempool_wait(A1_ROPE_WAIT);
-        flex_intra_cluster_sync();   // Q_g, K_g^T complete before the TEs read them
     }
     CE_REGION {   // OP table 1.8a GQK
         redmule_grouped_start(X_BUF + A1_QG, X_BUF + A1_KT, X_BUF + A1_SG, E_PAIRS * A1_QR, CE_D_HEAD, E_KP,
@@ -941,7 +940,6 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
     CE_REGION {   // OP table 1.10a GAV
         redmule_grouped_parallel(X_BUF + A1_AG, X_BUF + A1_VG, X_BUF + A1_UG, E_PAIRS * A1_QR, E_KP, CE_D_HEAD,
                                  E_PAIRS, E_KP * CE_D_HEAD);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.11 LAV, stand-in
         mempool_wait(A1_LAV_WAIT);
@@ -949,7 +947,6 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
     }
     CE_REGION {   // OP table 1.12 WO
         redmule_synch_parallel(X_BUF + A1_U, W_BUF + A1_W_WO, X_BUF + A1_WOUT, A1_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.13 RES
         probe_reset(z + E_ROW_LG * CE_D_MODEL, W_BUF + A1_W_PE, cid, nt);
@@ -984,7 +981,6 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
     }
     CE_REGION {   // OP table 2.2 QKV
         redmule_synch_parallel(X_BUF + A2_H, W_BUF + A2_W_QKV, X_BUF + A2_QKV, A2_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.3 SPLIT
     }
@@ -1008,11 +1004,11 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
         permute_f16p(X_BUF + A2_QKV + CE_D_MODEL, X_BUF + A2_KT, CE_D_HEAD, lk, 3u, cid, nt);
         permute_f16p(X_BUF + A2_QKV + E_ROW_LG * CE_D_QKV + CE_D_MODEL, X_BUF + A2_KT + CE_N_SPAN * CE_D_HEAD,
                      CE_D_HEAD, lg, 3u, cid, nt);
+        // Q_g, K_g^T complete before the TEs read them
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.6 ROPE, stand-in
         mempool_wait(A2_ROPE_WAIT);
-        flex_intra_cluster_sync();   // Q_g, K_g^T complete before the TEs read them
     }
     CE_REGION {   // OP table 2.8a GQK
         redmule_grouped_start(X_BUF + A2_QG, X_BUF + A2_KT, X_BUF + A2_SG, E_PAIRS * A2_QR, CE_D_HEAD, E_KP,
@@ -1054,7 +1050,6 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
     CE_REGION {   // OP table 2.10a GAV
         redmule_grouped_parallel(X_BUF + A2_AG, X_BUF + A2_VG, X_BUF + A2_UG, E_PAIRS * A2_QR, E_KP, CE_D_HEAD,
                                  E_PAIRS, E_KP * CE_D_HEAD);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.11 LAV, stand-in
         mempool_wait(A2_LAV_WAIT);
@@ -1062,7 +1057,6 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
     }
     CE_REGION {   // OP table 2.12 WO
         redmule_synch_parallel(X_BUF + A2_U, W_BUF + A2_W_WO, X_BUF + A2_WOUT, A2_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
-        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.13 RES
         axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + A2_WOUT, z, E_RS_N);
