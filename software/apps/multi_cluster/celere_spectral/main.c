@@ -206,7 +206,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define CE_W_QKV        (CE_D_MODEL * CE_D_QKV)                   // W_qkv, no bias
 #define CE_W_WO         (CE_D_MODEL * CE_D_MODEL + CE_D_MODEL)    // W_o, b_o
 #define CE_W_PQKV       (2u * CE_D_QKV)                           // q|k|v of the two probe rows (OP table 1.cp)
-#define CE_W_PE         (2u * CE_D_MODEL)                         // the probe embeddings e_g, e_l (OP table 1.cp)
+#define CE_W_PE         (2u * CE_D_MODEL)                         // the probe rows e_g + b_o, e_l + b_o (OP table 1.cp)
 #define CE_W_ROPE1      (2u * CE_HEADS * CE_N_SPAN * (CE_D_HEAD / 2u))   // cos, sin of the span rows (OP table 1.cr)
 #define CE_W_ROPE2      (2u * CE_HEADS * CE_LG * (CE_D_HEAD / 2u))       // cos, sin of spans, global probes (OP table 2.cr)
 #define CE_W_LB1        (CE_HEADS * 3u * 3u + CE_HEADS)           // local bias G, delta (OP table 1.cl)
@@ -291,37 +291,39 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 
 
 // stage 2 (attention stage 1)
-// X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | WO out ]
-#define A1_Z            0u                                        // the lattice [R | S | Lg | Ll] [E_ALL_ROWS][CE_D_MODEL]; the landing zone, with its twin at + X_ELEMS
+// X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | b_o rows ]
+#define A1_Z            0u                                        // the lattice [R | S | Lg | Ll] [E_ALL_ROWS][CE_D_MODEL], then the pad rows 1.12 writes on it; the landing zone, with its twin at + X_ELEMS
 #define A1_H_M          CE_RUP(E_RS_ROWS, NUM_REDMULE_TILES)      // GEMM rows of the projection, the span and summary rows padded (OP table 1.2)
 #define A1_WO_M         CE_RUP(E_ALL_ROWS, NUM_REDMULE_TILES)     // GEMM rows of the output projection, all rows padded (OP table 1.12)
-#define A1_H            (A1_Z + CE_RUP(E_ALL_N, CE_LINE))         // layernorm output H [A1_H_M][CE_D_MODEL]; the probes' LN is a constant (OP table 1.1, read by 1.2)
+#define A1_H            (A1_Z + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))   // layernorm output H [A1_H_M][CE_D_MODEL]; the probes' LN is a constant (OP table 1.1, read by 1.2)
 #define A1_QKV          (A1_H + CE_RUP(A1_H_M * CE_D_MODEL, CE_LINE))     // q|k|v [A1_H_M][CE_D_QKV], unrotated (OP table 1.2, read by 1.4, 1.6, 1.7)
 #define A1_ASPAN        (A1_QKV + CE_RUP(A1_H_M * CE_D_QKV, CE_LINE))     // local weights of the span queries [pair][CE_N_SPAN][3] (OP table 1.4, read by 1.11)
 #define A1_AHUB         (A1_ASPAN + CE_RUP(E_ASPAN_N, CE_LINE))           // local weights of the hub queries [pair][CE_N_WIN][A1_NHUB][CE_LW] (OP table 1.4, read by 1.11)
 #define A1_QG           (A1_AHUB + CE_RUP(A1_AHUB_N, CE_LINE))            // rotated queries Q_g [pair][A1_QR][CE_D_HEAD] (OP table 1.6, read by 1.8a)
 #define A1_KT           (A1_QG + CE_RUP(E_PAIRS * A1_QR * CE_D_HEAD, CE_LINE))   // rotated keys K_g^T [pair][CE_D_HEAD][E_KP] (OP table 1.6, read by 1.8a)
 #define A1_VG           (A1_KT + CE_RUP(E_PAIRS * CE_D_HEAD * E_KP, CE_LINE))    // values V_g [pair][E_KP][CE_D_HEAD] (OP table 1.7, read by 1.10a)
-#define A1_SG           (A1_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][A1_QR][E_KP], bias added in place (OP table 1.8a, 1.9a)
+#define A1_SG           (A1_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][A1_QR][E_KP], the TEs add onto the bias (OP table 1.8a, 1.9a)
 #define A1_AG           (A1_SG + CE_RUP(E_PAIRS * A1_QR * E_KP, CE_LINE))        // global weights A_g [pair][A1_QR][E_KP] (OP table 1.9a, read by 1.10a)
 #define A1_UG           (A1_AG + CE_RUP(E_PAIRS * A1_QR * E_KP, CE_LINE))        // global output U_g [pair][A1_QR][CE_D_HEAD] (OP table 1.10a, read by 1.11)
 #define A1_U            (A1_UG + CE_RUP(E_PAIRS * A1_QR * CE_D_HEAD, CE_LINE))   // attention output U, heads merged [A1_WO_M][CE_D_MODEL] (OP table 1.11, read by 1.12)
-#define A1_WOUT         (A1_U + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))           // output projection [A1_WO_M][CE_D_MODEL] (OP table 1.12, added into Z by 1.13)
-#define A1_END          (A1_WOUT + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE))        // end of the stage 2 map
+// TODO: a bias add kernel, so b_o needs one row instead of A1_BO
+#define A1_BO           CE_RUP(A1_U + CE_RUP(A1_WO_M * CE_D_MODEL, CE_LINE), CE_BANK_ROW)   // b_o repeated over the span and summary rows, set once, on a row of banks for the local axpy (OP table 1.12)
+#define A1_END          (A1_BO + E_RS_N)                                         // end of the stage 2 map
 // W_BUF: [ LN | W_qkv | probe q|k|v | probe embeddings | cos, sin | B_g | G, delta | W_o | Ll copies ]
 #define A1_W_LN         0u                                        // layernorm gamma, beta (OP table 1.1)
 #define A1_W_QKV        (A1_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [CE_D_MODEL][CE_D_QKV] (OP table 1.2)
 #define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // constant q|k|v of the probes: the Lg row, then the Ll row (OP table 1.cp)
-#define A1_W_PE         (A1_W_PQKV + CE_RUP(CE_W_PQKV, CE_LINE))  // probe embeddings: e_g, then e_l, copied into Z by OP table 1.13 (1.cp)
+#define A1_W_PE         (A1_W_PQKV + CE_RUP(CE_W_PQKV, CE_LINE))  // the probe rows of Z: e_g + b_o, then e_l + b_o, copied into Z under OP table 1.2 (1.cp)
 #define A1_W_ROPE       (A1_W_PE + CE_RUP(CE_W_PE, CE_LINE))      // cos, sin of the span rows; not read while the rotation is a stand-in (OP table 1.cr)
-#define A1_W_GB         (A1_W_ROPE + CE_RUP(CE_W_ROPE1, CE_LINE)) // global bias [h][A1_QR][E_KP], the same for every line, pad keys at -inf (OP table 1.cg, read by 1.9a)
+#define A1_W_GB         (A1_W_ROPE + CE_RUP(CE_W_ROPE1, CE_LINE)) // global bias [h][A1_QR][E_KP], the same for every line, pad keys at -inf (OP table 1.cg, copied into S_g under 1.2)
 #define A1_W_LB         (A1_W_GB + CE_RUP(CE_HEADS * A1_QR * E_KP, CE_LINE))     // local bias G [h][1 + A1_NHUB][3], delta [h] (OP table 1.cl, read by 1.4)
 #define A1_W_WO         (A1_W_LB + CE_RUP(CE_W_LB1, CE_LINE))     // W_o, b_o (OP table 1.12)
 #define A1_W_LLC        CE_RUP(A1_W_WO + CE_RUP(CE_W_WO, CE_LINE), CE_BANK_ROW)   // the Ll row once per group, CE_GRP_COPY apart, on a row of banks: OP table 1.4 reads the copy in its own group (1.cp)
 #define A1_W_END        (A1_W_LLC + CE_BANK_ROW)                  // end of the stage 2 weights
+#define A1_B_O          (A1_W_WO + CE_D_MODEL * CE_D_MODEL)       // b_o, after W_o: z takes it before 1.12 adds onto it (OP table 1.12)
 
 // stage 3 (attention stage 2)
-// X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | WO out ]
+// X_BUF: [ Z | H | QKV | A_span | A_hub | Q_g | K_g^T | V_g | S_g | A_g | U_g | U | b_o rows ]
 #define A2_Z            0u                                        // the lattice [R | S | Lg | Ll] [E_ALL_ROWS][CE_D_MODEL]; the landing zone, with its twin at + X_ELEMS
 #define A2_H_M          CE_RUP(E_ALL_ROWS, NUM_REDMULE_TILES)     // GEMM rows of the projection, all rows padded (OP table 2.2)
 #define A2_WO_M         CE_RUP(E_RS_ROWS, NUM_REDMULE_TILES)      // GEMM rows of the output projection, the span and summary rows padded (OP table 2.12)
@@ -332,20 +334,22 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define A2_QG           (A2_AHUB + CE_RUP(A2_AHUB_N, CE_LINE))            // rotated span queries Q_g [pair][A2_QR][CE_D_HEAD], CE_N_SPAN real (OP table 2.6, read by 2.8a)
 #define A2_KT           (A2_QG + CE_RUP(E_PAIRS * A2_QR * CE_D_HEAD, CE_LINE))   // rotated keys K_g^T [pair][CE_D_HEAD][E_KP]: spans, then global probes (OP table 2.6, read by 2.8a)
 #define A2_VG           (A2_KT + CE_RUP(E_PAIRS * CE_D_HEAD * E_KP, CE_LINE))    // values V_g [pair][E_KP][CE_D_HEAD]: spans, then global probes (OP table 2.7, read by 2.10a)
-#define A2_SG           (A2_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][A2_QR][E_KP], bias added in place (OP table 2.8a, 2.9a)
+#define A2_SG           (A2_VG + CE_RUP(E_PAIRS * E_KP * CE_D_HEAD, CE_LINE))    // global logits S_g [pair][A2_QR][E_KP], the TEs add onto the bias (OP table 2.8a, 2.9a)
 #define A2_AG           (A2_SG + CE_RUP(E_PAIRS * A2_QR * E_KP, CE_LINE))        // global weights A_g [pair][A2_QR][E_KP] (OP table 2.9a, read by 2.10a)
 #define A2_UG           (A2_AG + CE_RUP(E_PAIRS * A2_QR * E_KP, CE_LINE))        // global output U_g [pair][A2_QR][CE_D_HEAD], spans only (OP table 2.10a, read by 2.11)
 #define A2_U            (A2_UG + CE_RUP(E_PAIRS * A2_QR * CE_D_HEAD, CE_LINE))   // attention output U, heads merged: the span and summary rows, sized A2_WO_M (OP table 2.11, read by 2.12)
-#define A2_WOUT         (A2_U + CE_RUP(A2_WO_M * CE_D_MODEL, CE_LINE))           // output projection, sized [A2_WO_M][CE_D_MODEL] (OP table 2.12, added into Z by 2.13)
-#define A2_END          (A2_WOUT + CE_RUP(A2_WO_M * CE_D_MODEL, CE_LINE))        // end of the stage 3 map
+// TODO: a bias add kernel, so b_o needs one row instead of A2_BO
+#define A2_BO           CE_RUP(A2_U + CE_RUP(A2_WO_M * CE_D_MODEL, CE_LINE), CE_BANK_ROW)   // b_o repeated over the span and summary rows, set once, on a row of banks for the local axpy (OP table 2.12)
+#define A2_END          (A2_BO + E_RS_N)                                         // end of the stage 3 map
 // W_BUF: [ LN | W_qkv | cos, sin | B_g | G, delta | W_o ]
 #define A2_W_LN         0u                                        // layernorm gamma, beta (OP table 2.1)
 #define A2_W_QKV        (A2_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [CE_D_MODEL][CE_D_QKV] (OP table 2.2)
 #define A2_W_ROPE       (A2_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // cos, sin of the span and global-probe rows; not read while the rotation is a stand-in (OP table 2.cr)
-#define A2_W_GB         (A2_W_ROPE + CE_RUP(CE_W_ROPE2, CE_LINE)) // global bias [h][A2_QR][E_KP], the same for every line, pad keys at -inf (OP table 2.cg, read by 2.9a)
+#define A2_W_GB         (A2_W_ROPE + CE_RUP(CE_W_ROPE2, CE_LINE)) // global bias [h][A2_QR][E_KP], the same for every line, pad keys at -inf (OP table 2.cg, copied into S_g under 2.2)
 #define A2_W_LB         (A2_W_GB + CE_RUP(CE_HEADS * A2_QR * E_KP, CE_LINE))     // local bias G [h][1 + A2_NHUB][3], delta [h] (OP table 2.cl, read by 2.4)
 #define A2_W_WO         (A2_W_LB + CE_RUP(CE_W_LB2, CE_LINE))     // W_o, b_o (OP table 2.12)
 #define A2_W_END        (A2_W_WO + CE_RUP(CE_W_WO, CE_LINE))      // end of the stage 3 weights
+#define A2_B_O          (A2_W_WO + CE_D_MODEL * CE_D_MODEL)       // b_o, after W_o: z takes it before 2.12 adds onto it (OP table 2.12)
 
 // == stage 4: FFN and patch decoder (block D) ===================================
 // X_BUF: [ Z | BASE: X, S | H | F1 | head input: PRB rows, summary rows | b_dec rows ]
@@ -479,6 +483,11 @@ _Static_assert(CE_C_OUT % 16u == 0u && S5_OUT % 16u == 0u && S5_OUT_N % 16u == 0
                && S5_B_X % 2u == 0u && S5_B_H % 2u == 0u, "H.1, H.4: the bias fills write whole slices");
 _Static_assert(CE_FFN % 16u == 0u && CE_C % 16u == 0u && S4_B_1 % 2u == 0u && S4_B_DEC % 2u == 0u,
                "D.2, D.7: the bias fills write whole slices");
+_Static_assert(A1_QKV % 16u == 0u && A1_SG % 16u == 0u && A1_UG % 16u == 0u
+               && A2_QKV % 16u == 0u && A2_SG % 16u == 0u && A2_UG % 16u == 0u
+               && A1_W_GB % 2u == 0u && A2_W_GB % 2u == 0u && A1_B_O % 2u == 0u && A2_B_O % 2u == 0u,
+               "1.2, 2.2, 1.12, 2.12: the fills write whole slices");
+_Static_assert(CE_X_PAR_ELEMS >= A1_WO_M * CE_D_MODEL, "1.12: the twin of z must hold the pad rows");
 _Static_assert(S1_TOK_M < 65536u && S5_XR_M < 65536u, "RedMulE: M, N, P below 65,536");
 _Static_assert(CE_D_QKV <= CE_GRP_COPY, "1.4: a copy of the Ll row must stay in the banks of its group");
 
@@ -882,7 +891,23 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.2 QKV
-        redmule_synch_parallel(X_BUF + A1_H, W_BUF + A1_W_QKV, X_BUF + A1_QKV, A1_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
+        redmule_asynch_parallel(X_BUF + A1_H, W_BUF + A1_W_QKV, X_BUF + A1_QKV, A1_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
+    }
+    CE_REGION {   // OP table 1.8a GQK
+        // the logits start from the bias, one copy a line
+        repeat_f16p_local(W_BUF + A1_W_GB, X_BUF + A1_SG, 1u, CE_HEADS * A1_QR * E_KP, E_LINES, cid);
+    }
+    CE_REGION {   // OP table 1.10a GAV
+        celere_fill_rows_f16(X_BUF + A1_UG, NULL, CE_D_HEAD, E_PAIRS * A1_QR);
+    }
+    CE_REGION {   // OP table 1.12 WO
+        // z is not read again before 1.12 adds onto it: b_o into the span and summary rows, e_P + b_o into the probe rows
+        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + A1_BO, z, E_RS_N);
+        probe_reset(z + E_ROW_LG * CE_D_MODEL, W_BUF + A1_W_PE, cid, nt);
+    }
+    CE_REGION {   // OP table 1.2 QKV
+        wait_redmule();
+        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.3 SPLIT
     }
@@ -926,13 +951,6 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         wait_redmule();
         flex_intra_cluster_sync();   // S_g, A_span, A_hub, V_g complete
     }
-    CE_REGION {   // OP table 1.9a GSM, 1.cg
-        for (uint32_t l = 0; l < E_LINES; l++)
-            axpy_f16vecp_local_unrolled8(0x3C00u, W_BUF + A1_W_GB, X_BUF + A1_SG + l * CE_HEADS * A1_QR * E_KP,
-                                         CE_HEADS * A1_QR * E_KP);
-        // one barrier for all lines: they write different rows and only read the bias
-        flex_intra_cluster_sync();
-    }
     CE_REGION {   // OP table 1.9a GSM
         softmax_parallel_2x4_f16vec(X_BUF + A1_SG, X_BUF + A1_AG, E_PAIRS * A1_QR, E_KP, cid, nt);
         flex_intra_cluster_sync();
@@ -946,12 +964,15 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 1.12 WO
-        redmule_synch_parallel(X_BUF + A1_U, W_BUF + A1_W_WO, X_BUF + A1_WOUT, A1_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
+        // lands on z, so 1.13 happens in place
+        redmule_asynch_parallel(X_BUF + A1_U, W_BUF + A1_W_WO, z, A1_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
     }
-    CE_REGION {   // OP table 1.13 RES
-        probe_reset(z + E_ROW_LG * CE_D_MODEL, W_BUF + A1_W_PE, cid, nt);
-        flex_intra_cluster_sync();
-        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + A1_WOUT, z, E_ALL_N);
+    CE_REGION {   // OP table 1.2 QKV
+        // the next item's q|k|v start from 0: 1.11 was their last reader
+        celere_fill_rows_f16(X_BUF + A1_QKV, NULL, CE_D_QKV, A1_H_M);
+    }
+    CE_REGION {   // OP table 1.12 WO
+        wait_redmule();
         flex_intra_cluster_sync();
     }
 }
@@ -980,7 +1001,22 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.2 QKV
-        redmule_synch_parallel(X_BUF + A2_H, W_BUF + A2_W_QKV, X_BUF + A2_QKV, A2_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
+        redmule_asynch_parallel(X_BUF + A2_H, W_BUF + A2_W_QKV, X_BUF + A2_QKV, A2_H_M, CE_D_MODEL, CE_D_QKV, GEMM, false, 0);
+    }
+    CE_REGION {   // OP table 2.8a GQK
+        // the logits start from the bias, one copy a line
+        repeat_f16p_local(W_BUF + A2_W_GB, X_BUF + A2_SG, 1u, CE_HEADS * A2_QR * E_KP, E_LINES, cid);
+    }
+    CE_REGION {   // OP table 2.10a GAV
+        celere_fill_rows_f16(X_BUF + A2_UG, NULL, CE_D_HEAD, E_PAIRS * A2_QR);
+    }
+    CE_REGION {   // OP table 2.12 WO
+        // z is not read again before 2.12 adds onto it
+        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + A2_BO, z, E_RS_N);
+    }
+    CE_REGION {   // OP table 2.2 QKV
+        wait_redmule();
+        flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.3 SPLIT
     }
@@ -1036,13 +1072,6 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
         wait_redmule();
         flex_intra_cluster_sync();   // S_g, A_span, A_hub and V_g complete
     }
-    CE_REGION {   // OP table 2.9a GSM, 2.cg
-        for (uint32_t l = 0; l < E_LINES; l++)
-            axpy_f16vecp_local_unrolled8(0x3C00u, W_BUF + A2_W_GB, X_BUF + A2_SG + l * CE_HEADS * A2_QR * E_KP,
-                                         CE_HEADS * A2_QR * E_KP);
-        // one barrier for all lines: they write different rows and only read the bias
-        flex_intra_cluster_sync();
-    }
     CE_REGION {   // OP table 2.9a GSM
         softmax_parallel_2x4_f16vec(X_BUF + A2_SG, X_BUF + A2_AG, E_PAIRS * A2_QR, E_KP, cid, nt);
         flex_intra_cluster_sync();
@@ -1056,10 +1085,15 @@ static __attribute__((noinline)) void compute_stage_3(uint32_t par)
         flex_intra_cluster_sync();
     }
     CE_REGION {   // OP table 2.12 WO
-        redmule_synch_parallel(X_BUF + A2_U, W_BUF + A2_W_WO, X_BUF + A2_WOUT, A2_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
+        // lands on z, so 2.13 happens in place; its pad rows fall on global probes, not read after 2.1
+        redmule_asynch_parallel(X_BUF + A2_U, W_BUF + A2_W_WO, z, A2_WO_M, CE_D_MODEL, CE_D_MODEL, GEMM, false, 0);
     }
-    CE_REGION {   // OP table 2.13 RES
-        axpy_f16vecp_local_unrolled8(0x3C00u, X_BUF + A2_WOUT, z, E_RS_N);
+    CE_REGION {   // OP table 2.2 QKV
+        // the next item's q|k|v start from 0: 2.11 was their last reader
+        celere_fill_rows_f16(X_BUF + A2_QKV, NULL, CE_D_QKV, A2_H_M);
+    }
+    CE_REGION {   // OP table 2.12 WO
+        wait_redmule();
         flex_intra_cluster_sync();
     }
 }
@@ -1243,6 +1277,18 @@ int main(void)
     for (uint32_t i = mempool_get_core_id(); i < X_ELEMS + X_PAR_ELEMS; i += mempool_get_core_count()) X_BUF[i] = (__fp16)1.0f;
     for (uint32_t i = mempool_get_core_id(); i < W_ELEMS; i += mempool_get_core_count()) W_BUF[i] = (__fp16)1.0f;
     flex_intra_cluster_sync();
+    if (stage == STAGE_2) {
+        // q|k|v from 0 for the first item, later items get it under 1.12 of the item before; b_o rows for the axpy under 1.2
+        celere_fill_rows_f16(X_BUF + A1_QKV, NULL, CE_D_QKV, A1_H_M);
+        repeat_f16p_local(W_BUF + A1_B_O, X_BUF + A1_BO, 1u, CE_D_MODEL, E_RS_ROWS, mempool_get_core_id());
+        flex_intra_cluster_sync();
+    }
+    if (stage == STAGE_3) {
+        // the same with 2.12 and 2.2
+        celere_fill_rows_f16(X_BUF + A2_QKV, NULL, CE_D_QKV, A2_H_M);
+        repeat_f16p_local(W_BUF + A2_B_O, X_BUF + A2_BO, 1u, CE_D_MODEL, E_RS_ROWS, mempool_get_core_id());
+        flex_intra_cluster_sync();
+    }
     if (stage == STAGE_4) {
         // b_dec over all rows for the axpy under D.4; b_1 into the hidden layer for the first item, later items get it under D.7 of the item before
         repeat_f16p_local(W_BUF + S4_B_DEC, X_BUF + S4_BDEC, 1u, CE_C, S4_ROWS, mempool_get_core_id());
