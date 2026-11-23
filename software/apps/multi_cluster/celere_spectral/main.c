@@ -205,7 +205,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define CE_W_LN         (2u * CE_D_MODEL)                         // gamma, beta
 #define CE_W_QKV        (CE_D_MODEL * CE_D_QKV)                   // W_qkv, no bias
 #define CE_W_WO         (CE_D_MODEL * CE_D_MODEL + CE_D_MODEL)    // W_o, b_o
-#define CE_W_PQKV       (2u * CE_D_QKV)                           // q|k|v of the two probe rows (OP table 1.cp)
+#define CE_W_PQKV       (CE_HEADS * (2u * CE_N_WIN + 1u) * CE_D_HEAD)   // the global probes, per head: q and k rotated for each window, then v (OP table 1.cp)
 #define CE_W_PE         (2u * CE_D_MODEL)                         // the probe rows e_g + b_o, e_l + b_o (OP table 1.cp)
 #define CE_W_ROPE1      (2u * CE_HEADS * CE_N_SPAN * (CE_D_HEAD / 2u))   // cos, sin of the span rows (OP table 1.cr)
 #define CE_W_ROPE2      (2u * CE_HEADS * CE_LG * (CE_D_HEAD / 2u))       // cos, sin of spans, global probes (OP table 2.cr)
@@ -312,7 +312,7 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 // W_BUF: [ LN | W_qkv | probe q|k|v | probe embeddings | cos, sin | B_g | G, delta | W_o | Ll copies ]
 #define A1_W_LN         0u                                        // layernorm gamma, beta (OP table 1.1)
 #define A1_W_QKV        (A1_W_LN + CE_RUP(CE_W_LN, CE_LINE))      // W_qkv [CE_D_MODEL][CE_D_QKV] (OP table 1.2)
-#define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // constant q|k|v of the probes: the Lg row, then the Ll row (OP table 1.cp)
+#define A1_W_PQKV       (A1_W_QKV + CE_RUP(CE_W_QKV, CE_LINE))    // q, k, v of the global probes, copied once into Q_g, K_g, V_g (OP table 1.cp)
 #define A1_W_PE         (A1_W_PQKV + CE_RUP(CE_W_PQKV, CE_LINE))  // the probe rows of Z: e_g + b_o, then e_l + b_o, copied into Z under OP table 1.2 (1.cp)
 #define A1_W_ROPE       (A1_W_PE + CE_RUP(CE_W_PE, CE_LINE))      // cos, sin of the span rows; not read while the rotation is a stand-in (OP table 1.cr)
 #define A1_W_GB         (A1_W_ROPE + CE_RUP(CE_W_ROPE1, CE_LINE)) // global bias [h][A1_QR][E_KP], the same for every line, pad keys at -inf (OP table 1.cg, copied into S_g under 1.2)
@@ -488,6 +488,9 @@ _Static_assert(A1_QKV % 16u == 0u && A1_SG % 16u == 0u && A1_UG % 16u == 0u
                && A1_W_GB % 2u == 0u && A2_W_GB % 2u == 0u && A1_B_O % 2u == 0u && A2_B_O % 2u == 0u,
                "1.2, 2.2, 1.12, 2.12: the fills write whole slices");
 _Static_assert(CE_X_PAR_ELEMS >= A1_WO_M * CE_D_MODEL, "1.12: the twin of z must hold the pad rows");
+_Static_assert(A1_QG % 16u == 0u && A1_KT % 16u == 0u && A1_VG % 16u == 0u
+               && A2_QG % 16u == 0u && A2_KT % 16u == 0u && A2_VG % 16u == 0u,
+               "the zero fills of Q_g, K_g^T, V_g write whole slices");
 _Static_assert(S1_TOK_M < 65536u && S5_XR_M < 65536u, "RedMulE: M, N, P below 65,536");
 _Static_assert(CE_D_QKV <= CE_GRP_COPY, "1.4: a copy of the Ll row must stay in the banks of its group");
 
@@ -800,6 +803,30 @@ static inline void redmule_grouped_parallel(__fp16 *X, __fp16 *W, __fp16 *Y,
     mempool_barrier(mempool_get_core_count());
 }
 
+// The global probes' rows of Q_g, K_g, V_g, after the spans, the same in every item (OP table 1.cp)
+static inline void probe_consts(uint32_t cid, uint32_t nt)
+{
+    static const perm_level_t lq[] = {
+        { CE_N_WIN,  CE_D_HEAD,                              CE_D_HEAD },                        // window
+        { CE_HEADS,  (2u * CE_N_WIN + 1u) * CE_D_HEAD,       A1_QR * CE_D_HEAD },                // head
+        { E_LINES,   0,                                      CE_HEADS * A1_QR * CE_D_HEAD },     // line
+    };
+    // K_g as the stand-in of 1.6 lays out the span keys; TODO: columns of K_g^T with the real rotation
+    static const perm_level_t lk[] = {
+        { CE_N_WIN,  CE_D_HEAD,                              CE_D_HEAD },
+        { CE_HEADS,  (2u * CE_N_WIN + 1u) * CE_D_HEAD,       E_KP * CE_D_HEAD },
+        { E_LINES,   0,                                      CE_HEADS * E_KP * CE_D_HEAD },
+    };
+    static const perm_level_t lv[] = {
+        { CE_N_WIN,  0,                                      CE_D_HEAD },
+        { CE_HEADS,  (2u * CE_N_WIN + 1u) * CE_D_HEAD,       E_KP * CE_D_HEAD },
+        { E_LINES,   0,                                      CE_HEADS * E_KP * CE_D_HEAD },
+    };
+    permute_f16p(W_BUF + A1_W_PQKV, X_BUF + A1_QG + CE_N_SPAN * CE_D_HEAD, CE_D_HEAD, lq, 3u, cid, nt);
+    permute_f16p(W_BUF + A1_W_PQKV + CE_N_WIN * CE_D_HEAD, X_BUF + A1_KT + CE_N_SPAN * CE_D_HEAD, CE_D_HEAD, lk, 3u, cid, nt);
+    permute_f16p(W_BUF + A1_W_PQKV + 2u * CE_N_WIN * CE_D_HEAD, X_BUF + A1_VG + CE_N_SPAN * CE_D_HEAD, CE_D_HEAD, lv, 3u, cid, nt);
+}
+
 static inline void probe_reset(__fp16 *dst, const __fp16 *e, uint32_t cid, uint32_t nt)
 {
     uint32_t *d = (uint32_t *)dst;
@@ -911,8 +938,6 @@ static __attribute__((noinline)) void compute_stage_2(uint32_t par)
     }
     CE_REGION {   // OP table 1.3 SPLIT
     }
-    // TODO
-
     CE_REGION {   // OP table 1.6 ROPE
         static const perm_level_t lq[] = {
             { CE_N_SPAN, CE_D_QKV,              CE_D_HEAD },                        // span
@@ -1281,12 +1306,21 @@ int main(void)
         // q|k|v from 0 for the first item, later items get it under 1.12 of the item before; b_o rows for the axpy under 1.2
         celere_fill_rows_f16(X_BUF + A1_QKV, NULL, CE_D_QKV, A1_H_M);
         repeat_f16p_local(W_BUF + A1_B_O, X_BUF + A1_BO, 1u, CE_D_MODEL, E_RS_ROWS, mempool_get_core_id());
+        // pad rows at 0: no gather writes them
+        celere_fill_rows_f16(X_BUF + A1_QG, NULL, CE_D_HEAD, E_PAIRS * A1_QR);
+        celere_fill_rows_f16(X_BUF + A1_KT, NULL, CE_D_HEAD, E_PAIRS * E_KP);
+        celere_fill_rows_f16(X_BUF + A1_VG, NULL, CE_D_HEAD, E_PAIRS * E_KP);
+        flex_intra_cluster_sync();
+        probe_consts(mempool_get_core_id(), mempool_get_core_count());
         flex_intra_cluster_sync();
     }
     if (stage == STAGE_3) {
         // the same with 2.12 and 2.2
         celere_fill_rows_f16(X_BUF + A2_QKV, NULL, CE_D_QKV, A2_H_M);
         repeat_f16p_local(W_BUF + A2_B_O, X_BUF + A2_BO, 1u, CE_D_MODEL, E_RS_ROWS, mempool_get_core_id());
+        celere_fill_rows_f16(X_BUF + A2_QG, NULL, CE_D_HEAD, E_PAIRS * A2_QR);
+        celere_fill_rows_f16(X_BUF + A2_KT, NULL, CE_D_HEAD, E_PAIRS * E_KP);
+        celere_fill_rows_f16(X_BUF + A2_VG, NULL, CE_D_HEAD, E_PAIRS * E_KP);
         flex_intra_cluster_sync();
     }
     if (stage == STAGE_4) {
