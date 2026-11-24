@@ -242,6 +242,8 @@ _Static_assert(CE_C % CE_LINE == 0u, "a patch row is not whole 64 B lines");
 #define S1_XS_ROWS      (S1_LINES * CE_N_WIN)                     // summary patches
 #define S1_TOK          (S1_XR_ROWS + S1_XS_ROWS)                 // tokens: span and summary patches
 #define S1_TOK_M        CE_RUP(S1_TOK, NUM_REDMULE_TILES)         // GEMM rows of the embedding (OP table F.4)
+#define S1_FAN          (CE_ENC_LANES / CE_S1_LANES)              // S2 lanes a lane feeds, one hand-off leg each (OP table F.7)
+#define S1_J0_M         CE_RUP((S1_FAN - 1u) * (S1_XR_ROWS / S1_FAN), ARCH_REDMULE_HEIGHT * NUM_REDMULE_TILES)   // GEMM rows of the first embedding job: the span tokens of all S2 lanes but the last, round up to whole TE blocks
 #define S1_WIN_N        (S1_XS_ROWS * CE_C)                       // elements of the summary patches
 // X_BUF: [ IN | X: span patches, summary patches | Z: span tokens, summary tokens ]
 #define S1_IN           0u                                        // start of the model input of this lane (OP table F.1)
@@ -484,6 +486,9 @@ _Static_assert(CE_FFN % 16u == 0u && CE_C % 16u == 0u && S4_B_1 % 2u == 0u && S4
                "D.2, D.7: the bias fills write whole slices");
 _Static_assert(CE_D_MODEL % 16u == 0u && S1_Z % 16u == 0u && S1_W_TT % 2u == 0u,
                "F.5: the bias fills write whole slices");
+_Static_assert(CE_ENC_LANES % CE_S1_LANES == 0u && S1_XR_ROWS % S1_FAN == 0u && S1_J0_M <= S1_XR_ROWS
+               && S1_J0_M % NUM_REDMULE_TILES == 0u && (S1_TOK_M - S1_J0_M) % NUM_REDMULE_TILES == 0u,
+               "F.4, F.7: the first job holds span rows only, and both jobs split evenly over the TEs");
 _Static_assert(A1_QKV % 16u == 0u && A1_SG % 16u == 0u && A1_UG % 16u == 0u
                && A2_QKV % 16u == 0u && A2_SG % 16u == 0u && A2_UG % 16u == 0u
                && A1_W_GB % 2u == 0u && A2_W_GB % 2u == 0u && A1_B_O % 2u == 0u && A2_B_O % 2u == 0u,
@@ -611,23 +616,24 @@ static const uint8_t STAGE_TILES[N_STAGES + 1] = { 0, 1, 1, 1, 1, CE_S5_TILES };
 static const uint8_t STAGE_SRC_PAR[N_STAGES + 1] = { 0, 0, 1, 1, 0, 0 };
 
 // ==== hand-offs ==============================================================
-// One entry per tensor sent to the next stage, in the order of the consumer's
-// landing zone, where the tensors land back to back.
+// One entry per tensor sent to the next stage: where this lane's share starts in the
+// producer, and where the tensor starts in the consumer's landing zone.
 typedef struct {
     uint32_t bytes;    // the whole tensor, all lanes
     uint32_t src_off;  // start of this lane's share in the producer's X_BUF, in bytes
+    uint32_t dst_off;  // start of the tensor in the consumer's X_BUF, in bytes
 } xfer_t;
 static const xfer_t STAGE_XFER[10] = {
-    { CE_ZR_ALL * CE_BYTES,   S1_Z * CE_BYTES },                                   // stage 1: span tokens
-    { CE_ZS_ALL * CE_BYTES,   S1_ZS * CE_BYTES },                                  // stage 1: summary tokens
-    { CE_ZR_ALL * CE_BYTES,   A1_Z * CE_BYTES },                                   // stage 2: span rows
-    { CE_ZS_ALL * CE_BYTES,   (A1_Z + E_ROW_S * CE_D_MODEL) * CE_BYTES },          // stage 2: summary rows
-    { CE_ZS_ALL * CE_BYTES,   (A1_Z + E_ROW_LG * CE_D_MODEL) * CE_BYTES },         // stage 2: global probes
-    { CE_ZS_ALL * CE_BYTES,   (A1_Z + E_ROW_LL * CE_D_MODEL) * CE_BYTES },         // stage 2: local probes
-    { CE_ZR_ALL * CE_BYTES,   A2_Z * CE_BYTES },                                   // stage 3: span rows
-    { CE_ZS_ALL * CE_BYTES,   (A2_Z + E_ROW_S * CE_D_MODEL) * CE_BYTES },          // stage 3: summary rows
-    { CE_HPRB_ALL * CE_BYTES, S4_BLK * CE_BYTES },                                 // stage 4: head input, PRB rows
-    { CE_HSUM_ALL * CE_BYTES, S4_BLK_S * CE_BYTES },                               // stage 4: head input, summary rows
+    { CE_ZR_ALL * CE_BYTES,   S1_Z * CE_BYTES,                             A1_Z * CE_BYTES },                                   // stage 1: span tokens
+    { CE_ZS_ALL * CE_BYTES,   S1_ZS * CE_BYTES,                            (A1_Z + E_ROW_S * CE_D_MODEL) * CE_BYTES },          // stage 1: summary tokens
+    { CE_ZR_ALL * CE_BYTES,   A1_Z * CE_BYTES,                             A2_Z * CE_BYTES },                                   // stage 2: span rows
+    { CE_ZS_ALL * CE_BYTES,   (A1_Z + E_ROW_S * CE_D_MODEL) * CE_BYTES,    (A2_Z + E_ROW_S * CE_D_MODEL) * CE_BYTES },          // stage 2: summary rows
+    { CE_ZS_ALL * CE_BYTES,   (A1_Z + E_ROW_LG * CE_D_MODEL) * CE_BYTES,   (A2_Z + E_ROW_LG * CE_D_MODEL) * CE_BYTES },         // stage 2: global probes
+    { CE_ZS_ALL * CE_BYTES,   (A1_Z + E_ROW_LL * CE_D_MODEL) * CE_BYTES,   (A2_Z + E_ROW_LL * CE_D_MODEL) * CE_BYTES },         // stage 2: local probes
+    { CE_ZR_ALL * CE_BYTES,   A2_Z * CE_BYTES,                             S4_Z * CE_BYTES },                                   // stage 3: span rows
+    { CE_ZS_ALL * CE_BYTES,   (A2_Z + E_ROW_S * CE_D_MODEL) * CE_BYTES,    (S4_Z + S4_R_ROWS * CE_D_MODEL) * CE_BYTES },        // stage 3: summary rows
+    { CE_HPRB_ALL * CE_BYTES, S4_BLK * CE_BYTES,                           S5_X * CE_BYTES },                                   // stage 4: head input, PRB rows
+    { CE_HSUM_ALL * CE_BYTES, S4_BLK_S * CE_BYTES,                         (S5_X + S5_XR_M * CE_RUN) * CE_BYTES },              // stage 4: head input, summary rows
 };
 
 // stage s sends the entries STAGE_XFER_FIRST[s] to STAGE_XFER_FIRST[s + 1] - 1
@@ -710,14 +716,12 @@ static __attribute__((noinline)) void push_to_next(uint32_t stage, uint32_t lane
     uint32_t lanes    = STAGE_LANES[stage];
     uint32_t lanes_nx = STAGE_LANES[next];
     uint32_t base_nx  = STAGE_BASE[next];
-    // The consumer's tensors lie next to each other in table order, so a running
-    // acc (dst_off) reaches each one.
-    uint32_t dst_off  = 0u;
 
     for (uint32_t e = STAGE_XFER_FIRST[stage]; e < STAGE_XFER_FIRST[next]; e++) {
         const xfer_t *x = &STAGE_XFER[e];
         uint32_t own_src = x->bytes / lanes;      // what this cluster holds
         uint32_t own_dst = x->bytes / lanes_nx;   // what one consumer needs
+        uint32_t dst_off = x->dst_off;
 
         if (lanes_nx > lanes) {
             // Fan-out: this lane's share covers r consecutive consumers.
@@ -735,7 +739,6 @@ static __attribute__((noinline)) void push_to_next(uint32_t stage, uint32_t lane
             dma_2d((uint64_t)remote_cid(base_nx + lane, dst_base + dst_off),
                    src_base + (uint64_t)x->src_off, own_src);
         }
-        dst_off += own_dst;
     }
 }
 
@@ -837,13 +840,23 @@ static inline void probe_reset(__fp16 *dst, const __fp16 *e, uint32_t cid, uint3
         d[i] = s[(i / row_w) / E_S_ROWS * row_w + i % row_w];
 }
 
+// legs k0 to k1 - 1 of stage 1's hand-off entry e, one per S2 lane, sent from compute_stage_1 (OP table F.7)
+static void push_s1_legs(uint32_t lane, uint32_t par, uint32_t e, uint32_t k0, uint32_t k1)
+{
+    const xfer_t *x = &STAGE_XFER[STAGE_XFER_FIRST[STAGE_1] + e];
+    uint32_t own = x->bytes / CE_ENC_LANES;
+    uint32_t dst = (uint32_t)(uintptr_t)X_BUF + par * XPAR_B + x->dst_off;
+    for (uint32_t k = k0; k < k1; k++)
+        dma_2d((uint64_t)remote_cid(S2_BASE_CID + lane * S1_FAN + k, dst),
+               (uint64_t)(uintptr_t)X_BUF + x->src_off + k * own, own);
+}
+
 // ==== per-cluster compute: one function per stage ============================
 
 
 // Stage 1,
 static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lane)
 {
-    (void)par;   // stage 1 reads from LPDDR: no twin
     uint32_t cid = mempool_get_core_id();     // in-cluster core id
     uint32_t nt  = mempool_get_core_count();  // cores per cluster
     uint32_t node = lane * S1_NODES;           // the lane's first south node, of its S1_NODES
@@ -874,25 +887,43 @@ static __attribute__((noinline)) void compute_stage_1(uint32_t par, uint32_t lan
         flex_intra_cluster_sync();
     }
 
+    CE_REGION {   // OP table F.4 EMB
+        // first job: the span tokens of all S2 lanes but the last; F.3 runs under it
+        redmule_asynch_parallel(X_BUF + S1_X, W_BUF + S1_W_EMB, X_BUF + S1_Z, S1_J0_M, CE_C, CE_D_MODEL, GEMM, false, 0);
+    }
+
     CE_REGION {   // OP table F.3 WIN
         uint32_t per = nt / S1_LINES;   // cores a line
         uint32_t l   = cid / per;
 
         pool_mean_f16p(X_BUF + S1_X + l * CE_N_SPAN * CE_C, X_BUF + S1_WIN + l * CE_N_WIN * CE_C,
                     CE_N_SPAN, CE_N_WIN, CE_WIN_SPANS, CE_C, cid % per, per);
+    }
+
+    if (flex_is_dm_core())   // OP table F.6 OUT, under F.4
+        for (uint32_t n = 0; n < S1_NODES; n++)
+            dma_2d(hbm_south(node + n, LP_IN_OFF),  (uint64_t)(uintptr_t)(X_BUF + S1_X) + n * LP_IN_B,    LP_IN_B);
+
+    CE_REGION {   // OP table F.4 EMB
+        wait_redmule();
         flex_intra_cluster_sync();
     }
 
-
-    if (flex_is_dm_core())   // OP table F.6 OUT, under F.4
-        for (uint32_t n = 0; n < S1_NODES; n++) {
-            dma_2d(hbm_south(node + n, LP_IN_OFF),  (uint64_t)(uintptr_t)(X_BUF + S1_X) + n * LP_IN_B,    LP_IN_B);
+    if (flex_is_dm_core()) {   // OP table F.6 OUT and F.7, under F.4
+        for (uint32_t n = 0; n < S1_NODES; n++)
             dma_2d(hbm_south(node + n, LP_WIN_OFF), (uint64_t)(uintptr_t)(X_BUF + S1_WIN) + n * LP_WIN_B, LP_WIN_B);
-        }
-
+        push_s1_legs(lane, par, 0u, 0u, S1_FAN - 1u);
+    }
 
     CE_REGION {   // OP table F.4 EMB
-        redmule_synch_parallel(X_BUF + S1_X, W_BUF + S1_W_EMB, X_BUF + S1_Z, S1_TOK_M, CE_C, CE_D_MODEL, GEMM, false, 0);
+        // second job: the other rows, the summary rows with them
+        redmule_synch_parallel(X_BUF + S1_X + S1_J0_M * CE_C, W_BUF + S1_W_EMB, X_BUF + S1_Z + S1_J0_M * CE_D_MODEL,
+                               S1_TOK_M - S1_J0_M, CE_C, CE_D_MODEL, GEMM, false, 0);
+    }
+
+    if (flex_is_dm_core()) {   // OP table F.7
+        push_s1_legs(lane, par, 0u, S1_FAN - 1u, S1_FAN);
+        push_s1_legs(lane, par, 1u, 0u, S1_FAN);
     }
 }
 
@@ -1360,7 +1391,8 @@ int main(void)
                     }
                 }
                 uint64_t out = (uint64_t)(uintptr_t)X_BUF + (uint64_t)(par * STAGE_SRC_PAR[stage]) * XPAR_B;
-                if (stage < N_STAGES && STAGE_TILES[stage] == 1u)
+                // stage 1 hands off inside compute_stage_1, under its embedding
+                if (stage > STAGE_1 && stage < N_STAGES && STAGE_TILES[stage] == 1u)
                     push_to_next(stage, lane, buf_off + par * XPAR_B, out);
             }
         }
